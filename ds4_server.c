@@ -7707,6 +7707,50 @@ typedef struct {
     size_t visible_len;
 } visible_live_state;
 
+typedef struct {
+    char phase[16];
+    bool active;
+    char request_kind[16];
+    char api[16];
+    bool stream;
+    bool has_tools;
+    char cache_source[32];
+    char finish[32];
+    char last_error[160];
+    char model_name[96];
+    char backend_name[16];
+    int ctx_size;
+    int session_pos;
+    int default_tokens;
+    int queue_depth;
+    int clients;
+    uint64_t total_requests;
+    uint64_t completed_requests;
+    uint64_t failed_requests;
+    int prompt_tokens;
+    int cached_tokens;
+    int cache_write_tokens;
+    double server_started_t;
+    double request_started_t;
+    double phase_started_t;
+    double updated_t;
+    int prefill_current;
+    int prefill_total;
+    double prefill_elapsed_s;
+    double prefill_avg_tps;
+    double prefill_chunk_tps;
+    double prefill_eta_s;
+    int prefill_last_current;
+    double prefill_last_t;
+    int decode_generated;
+    int decode_max_tokens;
+    double decode_elapsed_s;
+    double decode_avg_tps;
+    double decode_chunk_tps;
+    int decode_last_generated;
+    double decode_last_t;
+} server_status;
+
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
@@ -7722,6 +7766,8 @@ struct server {
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
+    pthread_mutex_t status_mu;
+    server_status status;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -7746,6 +7792,337 @@ struct job {
     pthread_cond_t cv;
     job *next;
 };
+
+static const char *request_api_name(api_style api) {
+    switch (api) {
+    case API_OPENAI: return "openai";
+    case API_ANTHROPIC: return "anthropic";
+    case API_RESPONSES: return "responses";
+    }
+    return "unknown";
+}
+
+static const char *request_kind_name(req_kind kind) {
+    return kind == REQ_CHAT ? "chat" : "completion";
+}
+
+static void status_copy(char *dst, size_t len, const char *src) {
+    if (!dst || !len) return;
+    snprintf(dst, len, "%s", src ? src : "");
+}
+
+static void server_status_init(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->status_mu);
+    memset(&s->status, 0, sizeof(s->status));
+    status_copy(s->status.phase, sizeof(s->status.phase), "idle");
+    s->status.server_started_t = now_sec();
+    s->status.updated_t = s->status.server_started_t;
+    s->status.default_tokens = s->default_tokens;
+    if (s->engine) {
+        status_copy(s->status.model_name, sizeof(s->status.model_name),
+                    ds4_engine_model_name(s->engine));
+    }
+    if (s->session) {
+        s->status.ctx_size = ds4_session_ctx(s->session);
+        s->status.session_pos = ds4_session_pos(s->session);
+    }
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_set_model(server *s, ds4_backend backend) {
+    if (!s) return;
+    pthread_mutex_lock(&s->status_mu);
+    status_copy(s->status.model_name, sizeof(s->status.model_name),
+                s->engine ? ds4_engine_model_name(s->engine) : "");
+    status_copy(s->status.backend_name, sizeof(s->status.backend_name),
+                ds4_backend_name(backend));
+    s->status.ctx_size = s->session ? ds4_session_ctx(s->session) : 0;
+    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
+    s->status.default_tokens = s->default_tokens;
+    s->status.updated_t = now_sec();
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_set_clients(server *s, int clients) {
+    if (!s) return;
+    pthread_mutex_lock(&s->status_mu);
+    s->status.clients = clients;
+    s->status.updated_t = now_sec();
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_set_queue(server *s, int queue_depth) {
+    if (!s) return;
+    pthread_mutex_lock(&s->status_mu);
+    s->status.queue_depth = queue_depth;
+    s->status.updated_t = now_sec();
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_begin_request(server *s, const request *r,
+                                        int cached_tokens,
+                                        int prompt_tokens,
+                                        const char *cache_source) {
+    if (!s || !r) return;
+    const double now = now_sec();
+    pthread_mutex_lock(&s->status_mu);
+    s->status.active = true;
+    status_copy(s->status.phase, sizeof(s->status.phase), "prefill");
+    status_copy(s->status.request_kind, sizeof(s->status.request_kind),
+                request_kind_name(r->kind));
+    status_copy(s->status.api, sizeof(s->status.api),
+                request_api_name(r->api));
+    s->status.stream = r->stream;
+    s->status.has_tools = r->has_tools;
+    status_copy(s->status.cache_source, sizeof(s->status.cache_source),
+                cache_source ? cache_source : "none");
+    s->status.finish[0] = '\0';
+    s->status.last_error[0] = '\0';
+    s->status.total_requests++;
+    s->status.prompt_tokens = prompt_tokens;
+    s->status.cached_tokens = cached_tokens;
+    s->status.cache_write_tokens = prompt_tokens > cached_tokens ?
+        prompt_tokens - cached_tokens : 0;
+    s->status.request_started_t = now;
+    s->status.phase_started_t = now;
+    int prefill_total = prompt_tokens > cached_tokens ?
+        prompt_tokens - cached_tokens : 0;
+    s->status.prefill_current = 0;
+    s->status.prefill_total = prefill_total;
+    s->status.prefill_elapsed_s = 0.0;
+    s->status.prefill_avg_tps = 0.0;
+    s->status.prefill_chunk_tps = 0.0;
+    s->status.prefill_eta_s = prefill_total > 0 ? -1.0 : 0.0;
+    s->status.prefill_last_current = 0;
+    s->status.prefill_last_t = now;
+    s->status.decode_generated = 0;
+    s->status.decode_max_tokens = 0;
+    s->status.decode_elapsed_s = 0.0;
+    s->status.decode_avg_tps = 0.0;
+    s->status.decode_chunk_tps = 0.0;
+    s->status.decode_last_generated = 0;
+    s->status.decode_last_t = now;
+    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
+    s->status.updated_t = now;
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_update_prefill(server *s, int current, int total,
+                                         int cached_tokens) {
+    if (!s) return;
+    const double now = now_sec();
+    pthread_mutex_lock(&s->status_mu);
+    int display_start = cached_tokens;
+    if (display_start < 0 || display_start > s->status.prompt_tokens)
+        display_start = 0;
+    int display_total = s->status.prompt_tokens - display_start;
+    if (display_total <= 0) {
+        display_start = 0;
+        display_total = total > 0 ? total : s->status.prompt_tokens;
+    }
+    int display_current = current - display_start;
+    if (display_current < 0) display_current = 0;
+    if (display_current > display_total) display_current = display_total;
+    const double elapsed = now - s->status.phase_started_t;
+    const int interval_tokens = display_current - s->status.prefill_last_current;
+    const double interval_s = now - s->status.prefill_last_t;
+    s->status.prefill_current = display_current;
+    s->status.prefill_total = display_total;
+    s->status.prefill_elapsed_s = elapsed > 0.0 ? elapsed : 0.0;
+    s->status.prefill_avg_tps = elapsed > 0.0 ?
+        (double)display_current / elapsed : 0.0;
+    s->status.prefill_chunk_tps = interval_s > 0.0 && interval_tokens > 0 ?
+        (double)interval_tokens / interval_s : 0.0;
+    int remaining = display_total - display_current;
+    s->status.prefill_eta_s =
+        remaining > 0 && s->status.prefill_avg_tps > 0.0 ?
+        (double)remaining / s->status.prefill_avg_tps : 0.0;
+    s->status.prefill_last_current = display_current;
+    s->status.prefill_last_t = now;
+    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
+    s->status.updated_t = now;
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_decode_start(server *s, int max_tokens) {
+    if (!s) return;
+    const double now = now_sec();
+    pthread_mutex_lock(&s->status_mu);
+    status_copy(s->status.phase, sizeof(s->status.phase), "decode");
+    s->status.phase_started_t = now;
+    s->status.decode_generated = 0;
+    s->status.decode_max_tokens = max_tokens;
+    s->status.decode_elapsed_s = 0.0;
+    s->status.decode_avg_tps = 0.0;
+    s->status.decode_chunk_tps = 0.0;
+    s->status.decode_last_generated = 0;
+    s->status.decode_last_t = now;
+    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
+    s->status.updated_t = now;
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_update_decode(server *s, int generated) {
+    if (!s) return;
+    const double now = now_sec();
+    pthread_mutex_lock(&s->status_mu);
+    const double elapsed = now - s->status.phase_started_t;
+    const int interval_tokens = generated - s->status.decode_last_generated;
+    const double interval_s = now - s->status.decode_last_t;
+    s->status.decode_generated = generated;
+    s->status.decode_elapsed_s = elapsed > 0.0 ? elapsed : 0.0;
+    s->status.decode_avg_tps = elapsed > 0.0 ? (double)generated / elapsed : 0.0;
+    s->status.decode_chunk_tps = interval_s > 0.0 && interval_tokens > 0 ?
+        (double)interval_tokens / interval_s : 0.0;
+    s->status.decode_last_generated = generated;
+    s->status.decode_last_t = now;
+    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
+    s->status.updated_t = now;
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_finish_request(server *s, const char *finish,
+                                         const char *err) {
+    if (!s) return;
+    pthread_mutex_lock(&s->status_mu);
+    if (finish && !strcmp(finish, "error")) {
+        s->status.failed_requests++;
+    } else {
+        s->status.completed_requests++;
+    }
+    s->status.active = false;
+    status_copy(s->status.phase, sizeof(s->status.phase), "idle");
+    status_copy(s->status.finish, sizeof(s->status.finish),
+                finish ? finish : "");
+    status_copy(s->status.last_error, sizeof(s->status.last_error),
+                err ? err : "");
+    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
+    s->status.updated_t = now_sec();
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static int server_queue_depth_locked(const server *s) {
+    int n = 0;
+    for (const job *j = s ? s->head : NULL; j; j = j->next) n++;
+    return n;
+}
+
+static const char dashboard_html[] =
+"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+"<title>DS4 Server</title><style>"
+":root{color-scheme:dark;--bg:#101312;--panel:#181d1b;--panel2:#202622;--text:#edf2ee;--muted:#9ca8a1;--line:#303831;--accent:#3ddc97;--warn:#f5b84b;--bad:#ff6b6b;--blue:#65b7ff}"
+"*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}"
+".wrap{max-width:1180px;margin:0 auto;padding:24px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.title h1{font-size:24px;line-height:1.1;margin:0 0 6px}.title p{margin:0;color:var(--muted)}"
+".pill{display:inline-flex;align-items:center;height:32px;padding:0 12px;border:1px solid var(--line);border-radius:6px;background:var(--panel);font-weight:700}.pill.active{border-color:rgba(61,220,151,.6);color:var(--accent)}"
+".grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;min-width:0}.span3{grid-column:span 3}.span4{grid-column:span 4}.span6{grid-column:span 6}.span8{grid-column:span 8}.span12{grid-column:span 12}"
+".label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.value{font-size:28px;font-weight:760;margin-top:6px;white-space:nowrap}.sub{color:var(--muted);margin-top:4px}.bar{height:9px;background:#0d0f0e;border:1px solid var(--line);border-radius:999px;overflow:hidden;margin-top:12px}.fill{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--blue))}"
+".kv{display:grid;grid-template-columns:160px 1fr;gap:8px 12px}.kv div:nth-child(odd){color:var(--muted)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.small{font-size:13px}.bad{color:var(--bad)}.warn{color:var(--warn)}"
+"@media(max-width:820px){.wrap{padding:16px}.top{display:block}.pill{margin-top:12px}.span3,.span4,.span6,.span8{grid-column:span 12}.value{font-size:24px}.kv{grid-template-columns:1fr}}"
+"</style></head><body><main class=\"wrap\"><section class=\"top\"><div class=\"title\"><h1>DS4 Server</h1><p id=\"model\">Loading status</p></div><div id=\"phase\" class=\"pill\">idle</div></section>"
+"<section class=\"grid\"><div class=\"card span3\"><div class=\"label\">Prefill</div><div id=\"prefillSpeed\" class=\"value\">0.0 t/s</div><div id=\"prefillSub\" class=\"sub\">0 / 0 tokens</div><div class=\"bar\"><div id=\"prefillBar\" class=\"fill\"></div></div></div>"
+"<div class=\"card span3\"><div class=\"label\">Prefill ETA</div><div id=\"eta\" class=\"value\">0.0s</div><div id=\"prefillElapsed\" class=\"sub\">elapsed 0.0s</div></div>"
+"<div class=\"card span3\"><div class=\"label\">Decode</div><div id=\"decodeSpeed\" class=\"value\">0.0 t/s</div><div id=\"decodeSub\" class=\"sub\">0 / 0 tokens</div></div>"
+"<div class=\"card span3\"><div class=\"label\">Queue</div><div id=\"queue\" class=\"value\">0</div><div id=\"clients\" class=\"sub\">0 clients</div></div>"
+"<div class=\"card span8\"><div class=\"label\">Current Request</div><div class=\"kv small\" id=\"requestKv\"></div></div>"
+"<div class=\"card span4\"><div class=\"label\">Totals</div><div class=\"kv small\" id=\"totalsKv\"></div></div>"
+"</section></main><script>"
+"const $=id=>document.getElementById(id);const fmt=n=>(Number(n)||0).toFixed(1);const sec=n=>{n=Number(n)||0;if(n<60)return fmt(n)+'s';const m=Math.floor(n/60);return m+'m '+fmt(n%60)+'s'};"
+"function kv(el,rows){el.innerHTML=rows.map(([k,v])=>'<div>'+k+'</div><div class=\"mono\">'+String(v||'')+'</div>').join('')}"
+"function paint(s){$('phase').textContent=s.phase||'idle';$('phase').className='pill '+(s.active?'active':'');$('model').textContent=((s.model&&s.model.name)||'unknown model')+' / '+((s.model&&s.model.backend)||'backend')+' / ctx '+((s.model&&s.model.context_length)||0);"
+"const p=s.prefill||{},d=s.decode||{},r=s.request||{},t=s.totals||{};$('prefillSpeed').textContent=fmt(p.avg_tps)+' t/s';$('prefillSub').textContent=(p.current||0)+' / '+(p.total||0)+' tokens, chunk '+fmt(p.chunk_tps)+' t/s';$('prefillBar').style.width=Math.max(0,Math.min(100,p.percent||0))+'%';$('eta').textContent=sec(p.eta_sec);$('prefillElapsed').textContent='elapsed '+sec(p.elapsed_sec);"
+"$('decodeSpeed').textContent=fmt(d.avg_tps)+' t/s';$('decodeSub').textContent=(d.generated||0)+' / '+(d.max_tokens||0)+' tokens, chunk '+fmt(d.chunk_tps)+' t/s';$('queue').textContent=s.queue_depth||0;$('clients').textContent=(s.clients||0)+' clients';"
+"kv($('requestKv'),[['kind',r.kind],['api',r.api],['stream',r.stream?'yes':'no'],['tools',r.tools?'yes':'no'],['prompt',r.prompt_tokens||0],['cached',r.cached_tokens||0],['cache write',r.cache_write_tokens||0],['cache source',r.cache_source],['finish',r.finish],['error',r.last_error]]);"
+"kv($('totalsKv'),[['requests',t.requests||0],['completed',t.completed||0],['failed',t.failed||0],['session pos',(s.model&&s.model.session_pos)||0],['updated',new Date().toLocaleTimeString()]]);}"
+"async function tick(){try{const r=await fetch('/ds4/status',{cache:'no-store'});paint(await r.json())}catch(e){$('phase').textContent='offline';$('phase').className='pill';}}tick();setInterval(tick,500);"
+"</script></body></html>\n";
+
+static bool send_dashboard_page(int fd, bool enable_cors) {
+    return http_response(fd, enable_cors, 200,
+                         "text/html; charset=utf-8",
+                         dashboard_html);
+}
+
+static void append_status_json(buf *b, const server_status *st) {
+    double prefill_percent = st->prefill_total > 0 ?
+        100.0 * (double)st->prefill_current / (double)st->prefill_total : 100.0;
+    if (prefill_percent < 0.0) prefill_percent = 0.0;
+    if (prefill_percent > 100.0) prefill_percent = 100.0;
+    buf_puts(b, "{\"phase\":");
+    json_escape(b, st->phase);
+    buf_printf(b, ",\"active\":%s,\"queue_depth\":%d,\"clients\":%d",
+               st->active ? "true" : "false",
+               st->queue_depth,
+               st->clients);
+    buf_puts(b, ",\"model\":{\"name\":");
+    json_escape(b, st->model_name);
+    buf_puts(b, ",\"backend\":");
+    json_escape(b, st->backend_name);
+    buf_printf(b, ",\"context_length\":%d,\"session_pos\":%d,\"default_tokens\":%d}",
+               st->ctx_size,
+               st->session_pos,
+               st->default_tokens);
+    buf_puts(b, ",\"request\":{\"kind\":");
+    json_escape(b, st->request_kind);
+    buf_puts(b, ",\"api\":");
+    json_escape(b, st->api);
+    buf_printf(b, ",\"stream\":%s,\"tools\":%s,\"prompt_tokens\":%d,"
+                  "\"cached_tokens\":%d,\"cache_write_tokens\":%d,"
+                  "\"elapsed_sec\":%.3f,\"started_sec\":%.3f,"
+                  "\"cache_source\":",
+               st->stream ? "true" : "false",
+               st->has_tools ? "true" : "false",
+               st->prompt_tokens,
+               st->cached_tokens,
+               st->cache_write_tokens,
+               st->active ? now_sec() - st->request_started_t : 0.0,
+               st->request_started_t);
+    json_escape(b, st->cache_source);
+    buf_puts(b, ",\"finish\":");
+    json_escape(b, st->finish);
+    buf_puts(b, ",\"last_error\":");
+    json_escape(b, st->last_error);
+    buf_putc(b, '}');
+    buf_printf(b, ",\"prefill\":{\"current\":%d,\"total\":%d,"
+                  "\"percent\":%.3f,\"avg_tps\":%.3f,\"chunk_tps\":%.3f,"
+                  "\"elapsed_sec\":%.3f,\"eta_sec\":%.3f}",
+               st->prefill_current,
+               st->prefill_total,
+               prefill_percent,
+               st->prefill_avg_tps,
+               st->prefill_chunk_tps,
+               st->prefill_elapsed_s,
+               st->prefill_eta_s > 0.0 ? st->prefill_eta_s : 0.0);
+    buf_printf(b, ",\"decode\":{\"generated\":%d,\"max_tokens\":%d,"
+                  "\"avg_tps\":%.3f,\"chunk_tps\":%.3f,\"elapsed_sec\":%.3f}",
+               st->decode_generated,
+               st->decode_max_tokens,
+               st->decode_avg_tps,
+               st->decode_chunk_tps,
+               st->decode_elapsed_s);
+    buf_printf(b, ",\"totals\":{\"requests\":%llu,\"completed\":%llu,\"failed\":%llu}",
+               (unsigned long long)st->total_requests,
+               (unsigned long long)st->completed_requests,
+               (unsigned long long)st->failed_requests);
+    buf_puts(b, "}\n");
+}
+
+static bool send_status_json(server *s, int fd) {
+    server_status snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    if (s) {
+        pthread_mutex_lock(&s->status_mu);
+        snapshot = s->status;
+        pthread_mutex_unlock(&s->status_mu);
+    }
+    buf b = {0};
+    append_status_json(&b, &snapshot);
+    bool ok = http_response(fd, s ? s->enable_cors : false, 200,
+                            "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
 
 /* =========================================================================
  * Tool Call Text Memory.
@@ -9680,6 +10057,9 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     p->last_current = current;
     p->last_t = now;
     p->seen = true;
+    if (p->srv) {
+        server_status_update_prefill(p->srv, current, total, p->cached_tokens);
+    }
     char flags[64];
     log_flags(flags, sizeof(flags), p->responses_protocol,
               p->has_tools, false, false, false);
@@ -10190,6 +10570,7 @@ static void generate_job(server *s, job *j) {
                ctx_span,
                req_flags[0] ? " " : "",
                req_flags);
+    server_status_begin_request(s, &j->req, cached, prompt_tokens, cache_source);
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
 
@@ -10235,6 +10616,7 @@ static void generate_job(server *s, job *j) {
             free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+            server_status_finish_request(s, "error", err);
             return;
         }
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
@@ -10258,6 +10640,7 @@ static void generate_job(server *s, job *j) {
         free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+        server_status_finish_request(s, "error", err);
         return;
     }
     free(disk_cache_path);
@@ -10306,6 +10689,7 @@ static void generate_job(server *s, job *j) {
                        req_flags[0] ? " " : "",
                        req_flags);
             ds4_tokens_free(&effective_prompt);
+            server_status_finish_request(s, "error", "stream closed during prefill");
             return;
         }
         /* The prefill progress callback may have already sent the SSE headers
@@ -10319,6 +10703,7 @@ static void generate_job(server *s, job *j) {
                        req_flags[0] ? " " : "",
                        req_flags);
             ds4_tokens_free(&effective_prompt);
+            server_status_finish_request(s, "error", "sse headers failed");
             return;
         }
         progress.headers_sent = true;
@@ -10327,12 +10712,14 @@ static void generate_job(server *s, job *j) {
                                       prompt_tokens, &anthropic_live)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
+            server_status_finish_request(s, "error", "anthropic stream start failed");
             return;
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
+            server_status_finish_request(s, "error", "openai stream start failed");
             return;
         }
         if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
@@ -10347,6 +10734,7 @@ static void generate_job(server *s, job *j) {
                            req_flags);
                 responses_stream_free(&responses_live);
                 ds4_tokens_free(&effective_prompt);
+                server_status_finish_request(s, "error", "responses stream start failed");
                 return;
             }
         }
@@ -10374,6 +10762,7 @@ decode_again:
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
+    server_status_decode_start(s, max_tokens);
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
@@ -10452,6 +10841,7 @@ decode_again:
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
+            server_status_update_decode(s, completion);
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -11026,6 +11416,8 @@ decode_again:
                        now_sec() - t0);
         }
     }
+    server_status_finish_request(s, final_finish,
+                                 !strcmp(final_finish, "error") && err[0] ? err : "");
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -11044,6 +11436,7 @@ static bool enqueue(server *s, job *j) {
     }
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
+    server_status_set_queue(s, server_queue_depth_locked(s));
     pthread_cond_signal(&s->cv);
     pthread_mutex_unlock(&s->mu);
     return true;
@@ -11059,6 +11452,7 @@ static job *dequeue(server *s) {
     job *j = s->head;
     s->head = j->next;
     if (!s->head) s->tail = NULL;
+    server_status_set_queue(s, server_queue_depth_locked(s));
     pthread_mutex_unlock(&s->mu);
     j->next = NULL;
     return j;
@@ -11238,8 +11632,10 @@ static bool send_models(server *s, int fd) {
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
+    int clients = s->clients;
     pthread_cond_broadcast(&s->clients_cv);
     pthread_mutex_unlock(&s->mu);
+    server_status_set_clients(s, clients);
 }
 
 static void set_client_socket_nonblocking(int fd);
@@ -11258,6 +11654,19 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "OPTIONS")) {
         http_response(fd, s->enable_cors, 204, NULL, "");
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/") || !strcmp(hr.path, "/dashboard")))
+    {
+        send_dashboard_page(fd, s->enable_cors);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/ds4/status")) {
+        send_status_json(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -11470,6 +11879,7 @@ static void server_close_resources(server *s) {
     live_tool_state_free(&s->anthropic_live);
     visible_live_free(&s->thinking_live);
     pthread_mutex_destroy(&s->tool_mu);
+    pthread_mutex_destroy(&s->status_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
@@ -11752,7 +12162,10 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.cv, NULL);
     pthread_cond_init(&s.clients_cv, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
+    pthread_mutex_init(&s.status_mu, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
+    server_status_init(&s);
+    server_status_set_model(&s, cfg.engine.backend);
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");
         if (!s.trace) {
@@ -11801,13 +12214,17 @@ int main(int argc, char **argv) {
         ca->fd = fd;
         pthread_mutex_lock(&s.mu);
         s.clients++;
+        int clients = s.clients;
         pthread_mutex_unlock(&s.mu);
+        server_status_set_clients(&s, clients);
         pthread_t th;
         if (pthread_create(&th, NULL, client_main, ca) != 0) {
             pthread_mutex_lock(&s.mu);
             s.clients--;
+            clients = s.clients;
             pthread_cond_broadcast(&s.clients_cv);
             pthread_mutex_unlock(&s.mu);
+            server_status_set_clients(&s, clients);
             free(ca);
             close(fd);
             continue;
@@ -12253,6 +12670,52 @@ static void test_cors_sse_headers(void) {
     free(out);
     close(sv[0]);
     close(sv[1]);
+}
+
+static void test_dashboard_page_is_served_as_html(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    TEST_ASSERT(send_dashboard_page(sv[0], false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "Content-Type: text/html; charset=utf-8") != NULL);
+    TEST_ASSERT(strstr(out, "<title>DS4 Server</title>") != NULL);
+    TEST_ASSERT(strstr(out, "/ds4/status") != NULL);
+
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_status_json_reports_idle_metrics_shape(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.status_mu, NULL);
+    server_status_init(&s);
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(send_status_json(&s, sv[0]));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+        TEST_ASSERT(strstr(out, "Content-Type: application/json") != NULL);
+        TEST_ASSERT(strstr(out, "\"phase\":\"idle\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"model\":") != NULL);
+        TEST_ASSERT(strstr(out, "\"queue_depth\":0") != NULL);
+        TEST_ASSERT(strstr(out, "\"prefill\":{") != NULL);
+        TEST_ASSERT(strstr(out, "\"decode\":{") != NULL);
+        TEST_ASSERT(strstr(out, "\"eta_sec\":0.000") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    pthread_mutex_destroy(&s.status_mu);
 }
 
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
@@ -15782,6 +16245,8 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
+    test_dashboard_page_is_served_as_html();
+    test_status_json_reports_idle_metrics_shape();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
