@@ -40,18 +40,18 @@ case "$PROFILE" in
         DEFAULT_THREADS=8
         DEFAULT_PREFILL_CHUNK=4096
         DEFAULT_KV_DIR="$HOME/.ds4/server-kv"
-        DEFAULT_KV_SPACE=81920
+        DEFAULT_KV_SPACE=163840
         DEFAULT_COLD_MAX=98304
-        # Keep this aligned with DEFAULT_PREFILL_CHUNK. Agent traces showed
-        # dynamic skill/system blocks diverging around 5k-9k tokens; a 4096
-        # continued checkpoint gives disk cache a stable prefix before that.
-        DEFAULT_CONTINUED_INTERVAL=4096
+        # Keep this aligned with DEFAULT_PREFILL_CHUNK. Local 20k-200k context
+        # sweeps showed 2048 improves reusable prefix coverage on this M3 Max,
+        # while the larger disk budget absorbs the extra checkpoint writes.
+        DEFAULT_CONTINUED_INTERVAL=2048
         DEFAULT_CACHE_MIN=1024
         DEFAULT_BOUNDARY_TRIM=64
         DEFAULT_BOUNDARY_ALIGN=2048
         DEFAULT_TOOL_MEMORY_MAX=200000
         DEFAULT_MTP_PATH="gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
-        DEFAULT_MTP_DRAFT=4
+        DEFAULT_MTP_DRAFT=2
         DEFAULT_MTP_MARGIN=3.0
         ;;
     conservative)
