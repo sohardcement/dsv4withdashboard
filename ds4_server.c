@@ -1,6 +1,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_help.h"
+#include "ds4_host_metrics.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
 
@@ -18366,7 +18367,37 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_host_metrics_contract(void) {
+	ds4_host_metrics metrics;
+
+	TEST_ASSERT(!strcmp(ds4_host_pressure_name(DS4_HOST_PRESSURE_NORMAL), "normal"));
+	TEST_ASSERT(!strcmp(ds4_host_pressure_name(DS4_HOST_PRESSURE_WARNING), "warning"));
+	TEST_ASSERT(!strcmp(ds4_host_pressure_name(DS4_HOST_PRESSURE_CRITICAL), "critical"));
+	TEST_ASSERT(!strcmp(ds4_host_pressure_name(DS4_HOST_PRESSURE_UNKNOWN), "unknown"));
+	TEST_ASSERT(!strcmp(ds4_host_pressure_name((ds4_host_pressure)99), "unknown"));
+	TEST_ASSERT(!ds4_host_metrics_sample(NULL));
+
+	memset(&metrics, 0xa5, sizeof(metrics));
+	if (ds4_host_metrics_sample(&metrics)) {
+		TEST_ASSERT(metrics.available);
+		TEST_ASSERT(metrics.memory_total_bytes > 0);
+		TEST_ASSERT(metrics.memory_used_bytes <= metrics.memory_total_bytes);
+		TEST_ASSERT(metrics.memory_available_bytes <= metrics.memory_total_bytes);
+		if (metrics.swap_total_bytes)
+			TEST_ASSERT(metrics.swap_used_bytes <= metrics.swap_total_bytes);
+	} else {
+		TEST_ASSERT(!metrics.available);
+		TEST_ASSERT(metrics.memory_total_bytes == 0);
+		TEST_ASSERT(metrics.memory_used_bytes == 0);
+		TEST_ASSERT(metrics.memory_available_bytes == 0);
+		TEST_ASSERT(metrics.swap_total_bytes == 0);
+		TEST_ASSERT(metrics.swap_used_bytes == 0);
+		TEST_ASSERT(metrics.process_rss_bytes == 0);
+	}
+}
+
 static void ds4_server_unit_tests_run(void) {
+	test_host_metrics_contract();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();
