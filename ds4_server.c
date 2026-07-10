@@ -15671,6 +15671,27 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_stats_snapshot(void) {
+	ds4_kvstore kc = {0};
+	kc.enabled = true;
+	kc.budget_bytes = 1024;
+	kc.entry = calloc(2, sizeof(kc.entry[0]));
+	TEST_ASSERT(kc.entry != NULL);
+	if (!kc.entry) return;
+	kc.len = 2;
+	kc.cap = 2;
+	kc.entry[0].file_size = 100;
+	kc.entry[1].file_size = 250;
+
+	ds4_kvstore_stats stats = ds4_kvstore_get_stats(&kc);
+	TEST_ASSERT(stats.enabled);
+	TEST_ASSERT(stats.budget_bytes == 1024);
+	TEST_ASSERT(stats.used_bytes == 350);
+	TEST_ASSERT(stats.entries == 2);
+
+	ds4_kvstore_clear(&kc);
+}
+
 static void test_kv_cache_eviction_prefers_anchor_reason(void) {
     char tmpl[] = "/tmp/ds4-kv-anchor-reason-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -16314,6 +16335,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
+    test_kv_cache_stats_snapshot();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();

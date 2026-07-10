@@ -382,6 +382,24 @@ void ds4_kvstore_clear(ds4_kvstore *kc) {
     kc->cap = 0;
 }
 
+ds4_kvstore_stats ds4_kvstore_get_stats(const ds4_kvstore *kc) {
+	ds4_kvstore_stats stats = {0};
+	if (!kc) return stats;
+
+	stats.enabled = kc->enabled;
+	stats.budget_bytes = kc->budget_bytes;
+	stats.entries = kc->len > 0 ? (uint64_t)kc->len : 0;
+	for (int i = 0; i < kc->len; i++) {
+		uint64_t file_size = kc->entry[i].file_size;
+		if (UINT64_MAX - stats.used_bytes < file_size) {
+			stats.used_bytes = UINT64_MAX;
+			break;
+		}
+		stats.used_bytes += file_size;
+	}
+	return stats;
+}
+
 static void kv_cache_push(ds4_kvstore *kc, ds4_kvstore_entry e) {
     if (kc->len == kc->cap) {
         kc->cap = kc->cap ? kc->cap * 2 : 16;

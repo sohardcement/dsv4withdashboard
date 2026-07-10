@@ -80,6 +80,13 @@ typedef struct {
 } ds4_kvstore;
 
 typedef struct {
+	bool enabled;
+	uint64_t budget_bytes;
+	uint64_t used_bytes;
+	uint64_t entries;
+} ds4_kvstore_stats;
+
+typedef struct {
     const char *text;
     size_t text_len;
     uint8_t model_id;
@@ -119,6 +126,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
 void ds4_kvstore_close(ds4_kvstore *kc);
 void ds4_kvstore_clear(ds4_kvstore *kc);
 void ds4_kvstore_entry_free(ds4_kvstore_entry *e);
+ds4_kvstore_stats ds4_kvstore_get_stats(const ds4_kvstore *kc);
 
 char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      const ds4_tokens *tokens,
