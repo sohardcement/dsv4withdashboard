@@ -29,6 +29,35 @@ Keep all dry-run paths side-effect free. Perform trace reset only after the dry-
 
 ---
 
+## [ERR-20260710-002] stale_playwright_cli_wrapper
+
+**Logged**: 2026-07-10T00:00:00+08:00
+**Priority**: medium
+**Status**: pending
+**Area**: tests
+
+### Summary
+The bundled Playwright skill wrapper targets a CLI entry point that the current `@playwright/mcp` package no longer exposes.
+
+### Error
+```text
+The wrapper could not launch playwright-cli from the current @playwright/mcp package.
+```
+
+### Context
+- Intended wrapper: `$HOME/.codex/skills/playwright/scripts/playwright_cli.sh`.
+- Dashboard verification required desktop/mobile screenshots and interaction checks.
+- Verification recovered by using the current `@playwright/cli` package with an isolated package cache.
+
+### Suggested Fix
+Update the bundled wrapper to use the current supported Playwright CLI package/entry point, and add a wrapper smoke test that runs `--help`.
+
+### Metadata
+- Reproducible: yes
+- Related Files: `output/playwright/`
+
+---
+
 ## [ERR-20260710-001] nonexistent_server_test_target
 
 **Logged**: 2026-07-10T00:00:00+08:00
