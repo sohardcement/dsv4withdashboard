@@ -2,6 +2,7 @@
 #include "ds4_distributed.h"
 #include "ds4_help.h"
 #include "ds4_host_metrics.h"
+#include "ds4_call_history.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
 
@@ -7784,6 +7785,8 @@ struct server {
     pthread_mutex_t tool_mu;
     pthread_mutex_t status_mu;
     server_status status;
+	pthread_mutex_t call_history_mu;
+	ds4_call_history call_history;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -7823,11 +7826,35 @@ static ds4_kvstore_stats server_kv_get_published_stats(server *s);
 struct job {
     int fd;
     request req;
+	uint64_t call_request_id;
+	char caller[64];
+	double received_at;
     bool done;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
 };
+
+static void server_call_history_update_prompt(server *s, const job *j,
+									int prompt_tokens, int cached_tokens,
+									const char *cache_source) {
+	if (!s || !j || !j->call_request_id) return;
+	pthread_mutex_lock(&s->call_history_mu);
+	ds4_call_history_update_prompt(&s->call_history, j->call_request_id,
+								 prompt_tokens, cached_tokens, cache_source);
+	pthread_mutex_unlock(&s->call_history_mu);
+}
+
+static void server_call_history_finish(server *s, const job *j,
+							  ds4_call_status status, int output_tokens,
+							  const char *cache_source, const char *finish,
+							  const char *error) {
+	if (!s || !j || !j->call_request_id) return;
+	pthread_mutex_lock(&s->call_history_mu);
+	ds4_call_history_finish(&s->call_history, j->call_request_id, status,
+							now_sec(), output_tokens, cache_source, finish, error);
+	pthread_mutex_unlock(&s->call_history_mu);
+}
 
 static const char *request_api_name(api_style api) {
     switch (api) {
@@ -10726,6 +10753,8 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&effective_prompt);
         http_error(j->fd, s->enable_cors, 409,
                    "Responses continuation state is not available; retry by replaying the full input history");
+		server_call_history_finish(s, j, DS4_CALL_FAILED, 0, "none", "error",
+			"Responses continuation state is not available");
         return;
     } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
                j->req.anthropic_requires_live_tool_state)
@@ -10733,6 +10762,8 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&effective_prompt);
         http_error(j->fd, s->enable_cors, 409,
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
+		server_call_history_finish(s, j, DS4_CALL_FAILED, 0, "none", "error",
+			"Anthropic continuation state is not available");
         return;
     } else if (cached == 0) {
         cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
@@ -10801,6 +10832,7 @@ static void generate_job(server *s, job *j) {
      * the live KV cache and can be reused by the next request. */
     j->req.cache_read_tokens = cached;
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
+	server_call_history_update_prompt(s, j, prompt_tokens, cached, cache_source);
 
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
@@ -10902,6 +10934,7 @@ static void generate_job(server *s, job *j) {
             free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+			server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error", err);
             server_status_finish_request(s, "error", err);
             return;
         }
@@ -10926,6 +10959,7 @@ static void generate_job(server *s, job *j) {
         free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+		server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error", err);
         server_status_finish_request(s, "error", err);
         return;
     }
@@ -10975,6 +11009,8 @@ static void generate_job(server *s, job *j) {
                        req_flags[0] ? " " : "",
                        req_flags);
             ds4_tokens_free(&effective_prompt);
+			server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error",
+							 "stream closed during prefill");
             server_status_finish_request(s, "error", "stream closed during prefill");
             return;
         }
@@ -10989,6 +11025,8 @@ static void generate_job(server *s, job *j) {
                        req_flags[0] ? " " : "",
                        req_flags);
             ds4_tokens_free(&effective_prompt);
+			server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error",
+							 "sse headers failed");
             server_status_finish_request(s, "error", "sse headers failed");
             return;
         }
@@ -10998,6 +11036,8 @@ static void generate_job(server *s, job *j) {
                                       prompt_tokens, &anthropic_live)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
+			server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error",
+							 "anthropic stream start failed");
             server_status_finish_request(s, "error", "anthropic stream start failed");
             return;
         }
@@ -11005,6 +11045,8 @@ static void generate_job(server *s, job *j) {
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
+			server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error",
+							 "openai stream start failed");
             server_status_finish_request(s, "error", "openai stream start failed");
             return;
         }
@@ -11020,6 +11062,8 @@ static void generate_job(server *s, job *j) {
                            req_flags);
                 responses_stream_free(&responses_live);
                 ds4_tokens_free(&effective_prompt);
+				server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error",
+								 "responses stream start failed");
                 server_status_finish_request(s, "error", "responses stream start failed");
                 return;
             }
@@ -11702,6 +11746,11 @@ decode_again:
                        now_sec() - t0);
         }
     }
+    server_call_history_finish(s, j,
+                               (!strcmp(final_finish, "error") || !strcmp(final_finish, "cancelled")) ?
+                                   DS4_CALL_FAILED : DS4_CALL_COMPLETED,
+                               completion, cache_source, final_finish,
+                               !strcmp(final_finish, "error") && err[0] ? err : "");
     server_status_finish_request(s, final_finish,
                                  !strcmp(final_finish, "error") && err[0] ? err : "");
     free(parsed_content);
@@ -12160,6 +12209,35 @@ static bool kv_admin_peer_is_loopback(int fd) {
            kv_admin_sockaddr_is_loopback((struct sockaddr *)&ss, len);
 }
 
+static void server_peer_caller_from_sockaddr(const struct sockaddr *sa,
+									  socklen_t salen, char *out, size_t outlen) {
+	if (!out || !outlen) return;
+	snprintf(out, outlen, "unknown");
+	if (!sa) return;
+	if (sa->sa_family == AF_UNIX) {
+		snprintf(out, outlen, "local");
+		return;
+	}
+	if (sa->sa_family == AF_INET && salen >= sizeof(struct sockaddr_in)) {
+		const struct sockaddr_in *v4 = (const struct sockaddr_in *)sa;
+		if (inet_ntop(AF_INET, &v4->sin_addr, out, outlen)) return;
+	} else if (sa->sa_family == AF_INET6 && salen >= sizeof(struct sockaddr_in6)) {
+		const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)sa;
+		if (inet_ntop(AF_INET6, &v6->sin6_addr, out, outlen)) return;
+	}
+	snprintf(out, outlen, "unknown");
+}
+
+static void server_peer_caller(int fd, char *out, size_t outlen) {
+	struct sockaddr_storage ss;
+	socklen_t len = sizeof(ss);
+	if (getpeername(fd, (struct sockaddr *)&ss, &len) != 0) {
+		server_peer_caller_from_sockaddr(NULL, 0, out, outlen);
+		return;
+	}
+	server_peer_caller_from_sockaddr((struct sockaddr *)&ss, len, out, outlen);
+}
+
 #ifdef DS4_SERVER_TEST
 static bool kv_admin_test_fail_chmod;
 static bool kv_admin_test_fail_dir_fsync;
@@ -12566,6 +12644,13 @@ static void *client_main(void *arg) {
     memset(&j, 0, sizeof(j));
     j.fd = fd;
     j.req = req;
+	server_peer_caller(fd, j.caller, sizeof(j.caller));
+	j.received_at = now_sec();
+	pthread_mutex_lock(&s->call_history_mu);
+	j.call_request_id = ds4_call_history_begin(&s->call_history, j.caller,
+		request_api_name(j.req.api), request_kind_name(j.req.kind), j.req.stream,
+		j.req.has_tools, j.received_at);
+	pthread_mutex_unlock(&s->call_history_mu);
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
@@ -12573,6 +12658,8 @@ static void *client_main(void *arg) {
     if (!enqueue(s, &j)) {
         pthread_mutex_unlock(&j.mu);
         http_error(fd, s->enable_cors, 503, "server shutting down");
+		server_call_history_finish(s, &j, DS4_CALL_FAILED, 0, "none", "error",
+						   "server shutting down");
         pthread_cond_destroy(&j.cv);
         pthread_mutex_destroy(&j.mu);
         request_free(&j.req);
@@ -12715,8 +12802,10 @@ static void server_close_resources(server *s) {
     live_tool_state_free(&s->responses_live);
     live_tool_state_free(&s->anthropic_live);
     visible_live_free(&s->thinking_live);
+	ds4_call_history_free(&s->call_history);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->status_mu);
+	pthread_mutex_destroy(&s->call_history_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
@@ -13002,6 +13091,8 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.clients_cv, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
     pthread_mutex_init(&s.status_mu, NULL);
+	pthread_mutex_init(&s.call_history_mu, NULL);
+	ds4_call_history_init(&s.call_history);
     pthread_mutex_init(&s.trace_mu, NULL);
     server_status_init(&s);
     server_status_set_model(&s, cfg.engine.backend);
@@ -14461,6 +14552,89 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
 
     request_free(&r);
     pthread_mutex_destroy(&s.status_mu);
+}
+
+static void test_call_history_capacity_keeps_active_calls(void) {
+    ds4_call_history h = {0};
+    ds4_call_history_init(&h);
+    h.capacity = 2;
+    uint64_t one = ds4_call_history_begin(&h, "one", "openai", "chat", false, false, 1.0);
+    uint64_t two = ds4_call_history_begin(&h, "two", "openai", "chat", false, false, 2.0);
+    TEST_ASSERT(one != 0 && two != 0);
+    ds4_call_history_finish(&h, one, DS4_CALL_COMPLETED, 3.0, 1, "none", "stop", NULL);
+    ds4_call_history_finish(&h, two, DS4_CALL_COMPLETED, 4.0, 1, "none", "stop", NULL);
+    uint64_t three = ds4_call_history_begin(&h, "three", "openai", "chat", false, false, 5.0);
+    TEST_ASSERT(h.len == 2);
+    TEST_ASSERT(h.records[0].request_id == two || h.records[1].request_id == two);
+    TEST_ASSERT(h.records[0].request_id == three || h.records[1].request_id == three);
+    ds4_call_history_free(&h);
+
+    ds4_call_history_init(&h);
+    h.capacity = 2;
+    one = ds4_call_history_begin(&h, "one", "openai", "chat", false, false, 1.0);
+    two = ds4_call_history_begin(&h, "two", "openai", "chat", false, false, 2.0);
+    three = ds4_call_history_begin(&h, "three", "openai", "chat", false, false, 3.0);
+    TEST_ASSERT(h.len == 3);
+    ds4_call_history_finish(&h, one, DS4_CALL_COMPLETED, 4.0, 1, "none", "stop", NULL);
+    TEST_ASSERT(h.len == 2);
+    TEST_ASSERT(h.records[0].request_id == two || h.records[1].request_id == two);
+    TEST_ASSERT(h.records[0].request_id == three || h.records[1].request_id == three);
+    ds4_call_history_free(&h);
+}
+
+static void test_call_history_clamps_tokens_and_aggregates_failures(void) {
+    ds4_call_history h = {0};
+    ds4_call_history_init(&h);
+    uint64_t id = ds4_call_history_begin(&h, "client", "openai", "chat", true, true, 10.0);
+    ds4_call_history_update_prompt(&h, id, -5, 8, "disk");
+    ds4_call_history_update_prompt(&h, id, 10, 99, "disk");
+    ds4_call_history_finish(&h, id, DS4_CALL_FAILED, 14.0, -2, "disk", "error", "failure");
+    ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(&h, 20.0);
+    TEST_ASSERT(snap.records_len == 1);
+    TEST_ASSERT(snap.records[0].prompt_tokens == 10);
+    TEST_ASSERT(snap.records[0].cached_tokens == 10);
+    TEST_ASSERT(snap.records[0].output_tokens == 0);
+    TEST_ASSERT(snap.callers_len == 1);
+    TEST_ASSERT(snap.callers[0].calls == 1 && snap.callers[0].failures == 1);
+    TEST_ASSERT(snap.callers[0].prompt_tokens == 10 && snap.callers[0].cached_tokens == 10);
+    TEST_ASSERT(snap.callers[0].average_terminal_duration == 4.0);
+    TEST_ASSERT(snap.callers[0].recent_activity == 14.0);
+    ds4_call_history_snapshot_free(&snap);
+    ds4_call_history_free(&h);
+}
+
+static void test_call_history_snapshot_owns_copies(void) {
+    ds4_call_history h = {0};
+    ds4_call_history_init(&h);
+    uint64_t id = ds4_call_history_begin(&h, "caller", "openai", "chat", false, false, 1.0);
+    ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(&h, 2.0);
+    TEST_ASSERT(snap.records_len == 1 && !strcmp(snap.records[0].caller, "caller"));
+    ds4_call_history_finish(&h, id, DS4_CALL_COMPLETED, 3.0, 4, "none", "stop", NULL);
+    TEST_ASSERT(snap.records[0].status == DS4_CALL_ACTIVE);
+    ds4_call_history_snapshot_free(&snap);
+    ds4_call_history_snapshot_free(NULL);
+    ds4_call_history_free(&h);
+    ds4_call_history_free(NULL);
+}
+
+static void test_peer_caller_formats_direct_addresses(void) {
+    struct sockaddr_in v4 = {0};
+    v4.sin_family = AF_INET;
+    TEST_ASSERT(inet_pton(AF_INET, "192.0.2.7", &v4.sin_addr) == 1);
+    char caller[64];
+    server_peer_caller_from_sockaddr((struct sockaddr *)&v4, sizeof(v4), caller, sizeof(caller));
+    TEST_ASSERT(!strcmp(caller, "192.0.2.7"));
+    struct sockaddr_in6 v6 = {0};
+    v6.sin6_family = AF_INET6;
+    TEST_ASSERT(inet_pton(AF_INET6, "2001:db8::7", &v6.sin6_addr) == 1);
+    server_peer_caller_from_sockaddr((struct sockaddr *)&v6, sizeof(v6), caller, sizeof(caller));
+    TEST_ASSERT(!strcmp(caller, "2001:db8::7"));
+    struct sockaddr_un un = {0};
+    un.sun_family = AF_UNIX;
+    server_peer_caller_from_sockaddr((struct sockaddr *)&un, sizeof(un), caller, sizeof(caller));
+    TEST_ASSERT(!strcmp(caller, "local"));
+    server_peer_caller_from_sockaddr(NULL, 0, caller, sizeof(caller));
+    TEST_ASSERT(!strcmp(caller, "unknown"));
 }
 
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
@@ -18425,6 +18599,10 @@ static void ds4_server_unit_tests_run(void) {
     test_dashboard_page_is_served_as_html();
     test_status_json_reports_idle_metrics_shape();
     test_status_json_reports_cache_totals_and_capacity();
+    test_call_history_capacity_keeps_active_calls();
+    test_call_history_clamps_tokens_and_aggregates_failures();
+    test_call_history_snapshot_owns_copies();
+    test_peer_caller_formats_direct_addresses();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
