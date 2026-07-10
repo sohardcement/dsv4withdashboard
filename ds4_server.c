@@ -14360,15 +14360,34 @@ static void test_kv_admin_persistence_is_atomic_and_private(void) {
 static char *test_kv_admin_core(server *s, const char *body, const char *path);
 static char *test_context_admin_core(server *s, const char *body, const char *path);
 
+typedef struct {
+	const char *name;
+	bool was_set;
+	char *value;
+} test_env_value;
+
+static void test_env_snapshot(test_env_value *env, const char *name) {
+	const char *value = getenv(name);
+	env->name = name;
+	env->was_set = value != NULL;
+	env->value = value ? xstrdup(value) : NULL;
+}
+
+static void test_env_restore(test_env_value *env) {
+	if (env->was_set) TEST_ASSERT(setenv(env->name, env->value, 1) == 0);
+	else TEST_ASSERT(unsetenv(env->name) == 0);
+	free(env->value);
+	env->value = NULL;
+}
+
 static void test_context_admin_persistence_path_env(void) {
-	const char *old_home_value = getenv("HOME");
-	const char *old_path_value = getenv("DS4_CTX_FILE");
-	char *old_home = old_home_value ? xstrdup(old_home_value) : NULL;
-	char *old_path = old_path_value ? xstrdup(old_path_value) : NULL;
+	test_env_value home = {0}, ctx_file = {0};
+	test_env_snapshot(&home, "HOME");
+	test_env_snapshot(&ctx_file, "DS4_CTX_FILE");
 	char tmpl[] = "/tmp/ds4-context-admin-env.XXXXXX";
 	char *root = mkdtemp(tmpl);
 	TEST_ASSERT(root != NULL);
-	if (!root) goto restore_env;
+	if (!root) goto cleanup;
 	char custom[PATH_MAX], default_path[PATH_MAX];
 	snprintf(custom, sizeof(custom), "%s/custom/context-tokens", root);
 	snprintf(default_path, sizeof(default_path), "%s/.ds4/context-tokens", root);
@@ -14411,11 +14430,9 @@ static void test_context_admin_persistence_path_env(void) {
 	snprintf(custom_dir, sizeof(custom_dir), "%s/custom", root);
 	snprintf(default_dir, sizeof(default_dir), "%s/.ds4", root);
 	rmdir(custom_dir); rmdir(default_dir); rmdir(root);
-restore_env:
-	if (old_home) { TEST_ASSERT(setenv("HOME", old_home, 1) == 0); free(old_home); }
-	else TEST_ASSERT(unsetenv("HOME") == 0);
-	if (old_path) { TEST_ASSERT(setenv("DS4_CTX_FILE", old_path, 1) == 0); free(old_path); }
-	else TEST_ASSERT(unsetenv("DS4_CTX_FILE") == 0);
+cleanup:
+	test_env_restore(&ctx_file);
+	test_env_restore(&home);
 }
 
 static void test_kv_admin_persistence_path_env(void) {
@@ -14748,6 +14765,8 @@ static void test_kv_admin_actual_route_and_peer_auth(void) {
 }
 
 static void test_context_admin_route_auth_and_active_context(void) {
+	test_env_value ctx_file = {0};
+	test_env_snapshot(&ctx_file, "DS4_CTX_FILE");
 	server s = {0};
 	pthread_mutex_init(&s.mu, NULL);
 	pthread_cond_init(&s.clients_cv, NULL);
@@ -14757,6 +14776,7 @@ static void test_context_admin_route_auth_and_active_context(void) {
 	char tmpl[] = "/tmp/ds4-context-admin-route.XXXXXX";
 	char *dir = mkdtemp(tmpl);
 	TEST_ASSERT(dir != NULL);
+	if (!dir) goto cleanup;
 	char path[PATH_MAX];
 	snprintf(path, sizeof(path), "%s/context-tokens", dir);
 	TEST_ASSERT(setenv("DS4_CTX_FILE", path, 1) == 0);
@@ -14788,7 +14808,9 @@ static void test_context_admin_route_auth_and_active_context(void) {
 		"OPTIONS /ds4/admin/context HTTP/1.1\r\nContent-Length: 0\r\n\r\n", true);
 	TEST_ASSERT(strstr(out, "HTTP/1.1 403") != NULL && access(path, F_OK) != 0);
 	free(out);
-	unsetenv("DS4_CTX_FILE"); rmdir(dir);
+cleanup:
+	if (dir) rmdir(dir);
+	test_env_restore(&ctx_file);
 	pthread_mutex_destroy(&s.status_mu);
 	pthread_cond_destroy(&s.clients_cv);
 	pthread_mutex_destroy(&s.mu);
@@ -14805,13 +14827,16 @@ static char *test_start_server_dry_run(void) {
 }
 
 static void test_start_server_context_precedence(void) {
-	const char *old_home_value = getenv("HOME"), *old_ctx_value = getenv("DS4_CTX");
-	char *old_home = old_home_value ? xstrdup(old_home_value) : NULL;
-	char *old_ctx = old_ctx_value ? xstrdup(old_ctx_value) : NULL;
+	test_env_value home = {0}, ctx_file = {0}, ctx = {0}, model = {0}, dry_run = {0};
+	test_env_snapshot(&home, "HOME");
+	test_env_snapshot(&ctx_file, "DS4_CTX_FILE");
+	test_env_snapshot(&ctx, "DS4_CTX");
+	test_env_snapshot(&model, "DS4_MODEL");
+	test_env_snapshot(&dry_run, "DS4_DRY_RUN");
 	char tmpl[] = "/tmp/ds4-context-launcher.XXXXXX";
 	char *root = mkdtemp(tmpl);
 	TEST_ASSERT(root != NULL);
-	if (!root) goto restore;
+	if (!root) goto cleanup;
 	char ds4dir[PATH_MAX], file[PATH_MAX];
 	snprintf(ds4dir, sizeof(ds4dir), "%s/.ds4", root);
 	snprintf(file, sizeof(file), "%s/context-tokens", ds4dir);
@@ -14819,6 +14844,7 @@ static void test_start_server_context_precedence(void) {
 	FILE *fp = fopen(file, "w"); TEST_ASSERT(fp != NULL);
 	if (fp) { fputs("262144\n", fp); fclose(fp); }
 	TEST_ASSERT(setenv("HOME", root, 1) == 0);
+	TEST_ASSERT(unsetenv("DS4_CTX_FILE") == 0);
 	TEST_ASSERT(setenv("DS4_MODEL", "", 1) == 0);
 	TEST_ASSERT(setenv("DS4_DRY_RUN", "1", 1) == 0);
 	TEST_ASSERT(unsetenv("DS4_CTX") == 0);
@@ -14834,10 +14860,30 @@ static void test_start_server_context_precedence(void) {
 	out = test_start_server_dry_run();
 	TEST_ASSERT(strstr(out, "--ctx 204800") != NULL); free(out);
 	rmdir(ds4dir); rmdir(root);
-restore:
-	unsetenv("DS4_MODEL"); unsetenv("DS4_DRY_RUN");
-	if (old_home) { setenv("HOME", old_home, 1); free(old_home); } else unsetenv("HOME");
-	if (old_ctx) { setenv("DS4_CTX", old_ctx, 1); free(old_ctx); } else unsetenv("DS4_CTX");
+cleanup:
+	test_env_restore(&dry_run);
+	test_env_restore(&model);
+	test_env_restore(&ctx);
+	test_env_restore(&ctx_file);
+	test_env_restore(&home);
+}
+
+static void test_context_admin_tests_preserve_environment(void) {
+	const char *names[] = {"HOME", "DS4_CTX_FILE", "DS4_CTX", "DS4_MODEL", "DS4_DRY_RUN"};
+	const char *values[] = {"/tmp/ds4-context-home-sentinel", "/tmp/ds4-context-file-sentinel",
+		"77777", "context-model-sentinel", "context-dry-run-sentinel"};
+	test_env_value saved[sizeof(names) / sizeof(names[0])] = {0};
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		test_env_snapshot(&saved[i], names[i]);
+		TEST_ASSERT(setenv(names[i], values[i], 1) == 0);
+	}
+	test_context_admin_persistence_path_env();
+	test_context_admin_route_auth_and_active_context();
+	test_start_server_context_precedence();
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+		TEST_ASSERT(getenv(names[i]) && !strcmp(getenv(names[i]), values[i]));
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+		test_env_restore(&saved[i]);
 }
 
 static void test_kv_admin_rejects_headers_before_body(void) {
@@ -19381,6 +19427,7 @@ static void ds4_server_unit_tests_run(void) {
 	test_kv_admin_actual_route_and_peer_auth();
 	test_context_admin_route_auth_and_active_context();
 	test_start_server_context_precedence();
+	test_context_admin_tests_preserve_environment();
 	test_kv_admin_rejects_headers_before_body();
 	test_http_content_length_framing_is_strict();
 	test_http_chunked_headers_preserve_normal_route_body();
