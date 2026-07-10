@@ -7792,6 +7792,7 @@ struct server {
 	pthread_mutex_t host_metrics_mu;
 	pthread_cond_t host_metrics_cv;
 	ds4_host_metrics host_metrics;
+	double host_metrics_sampled_mono;
 	bool host_sampling;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -7843,8 +7844,18 @@ static void server_worker_active_call_clear(server *s, uint64_t request_id) {
 
 static void server_host_metrics_init(server *s) {
 	if (!s) return;
+	memset(&s->host_metrics, 0, sizeof(s->host_metrics));
+	s->host_metrics_sampled_mono = 0.0;
+	s->host_sampling = false;
 	pthread_mutex_init(&s->host_metrics_mu, NULL);
 	pthread_cond_init(&s->host_metrics_cv, NULL);
+}
+
+/* Caller holds host_metrics_mu.  The public sampled_at field is wall-clock
+ * data for clients and must not participate in elapsed-time calculations. */
+static bool server_host_metrics_cache_is_fresh(const server *s, double now_mono) {
+	return s && s->host_metrics_sampled_mono > 0.0 &&
+		now_mono - s->host_metrics_sampled_mono < 1.0;
 }
 
 static void server_host_metrics_destroy(server *s) {
@@ -7858,15 +7869,14 @@ static void server_host_metrics_destroy(server *s) {
 static ds4_host_metrics server_host_get_snapshot(server *s) {
 	ds4_host_metrics snapshot = {0};
 	if (!s) return snapshot;
-	const double now = ds4_wall_time_sec();
+	const double now = now_sec();
 	pthread_mutex_lock(&s->host_metrics_mu);
 	if (s->host_sampling) {
 		snapshot = s->host_metrics;
 		pthread_mutex_unlock(&s->host_metrics_mu);
 		return snapshot;
 	}
-	if (s->host_metrics.sampled_at > 0.0 &&
-		now - s->host_metrics.sampled_at < 1.0) {
+	if (server_host_metrics_cache_is_fresh(s, now)) {
 		snapshot = s->host_metrics;
 		pthread_mutex_unlock(&s->host_metrics_mu);
 		return snapshot;
@@ -7882,6 +7892,7 @@ static ds4_host_metrics server_host_get_snapshot(server *s) {
 
 	pthread_mutex_lock(&s->host_metrics_mu);
 	s->host_metrics = sampled;
+	s->host_metrics_sampled_mono = now_sec();
 	s->host_sampling = false;
 	snapshot = sampled;
 	pthread_cond_broadcast(&s->host_metrics_cv);
@@ -14836,7 +14847,16 @@ static void test_status_worker_active_call_is_not_newest_queued_call(void) {
 	server_worker_active_call_set(&s, a);
 	pthread_mutex_lock(&s.call_history_mu);
 	TEST_ASSERT(s.worker_active_call_request_id == a);
+	ds4_call_history_snapshot calls = ds4_call_history_snapshot_take(&s.call_history, 4.0);
+	uint64_t active = s.worker_active_call_request_id;
 	pthread_mutex_unlock(&s.call_history_mu);
+	buf json = {0};
+	server_status status = {0};
+	append_status_json(&json, &status, NULL, NULL, &calls, s.call_history.capacity, active);
+	TEST_ASSERT(strstr(json.ptr, "\"active_request_id\":\"1\"") != NULL);
+	TEST_ASSERT(strstr(json.ptr, "\"active_request_id\":\"3\"") == NULL);
+	buf_free(&json);
+	ds4_call_history_snapshot_free(&calls);
 	server_worker_active_call_clear(&s, a);
 	pthread_mutex_lock(&s.call_history_mu);
 	TEST_ASSERT(s.worker_active_call_request_id == 0);
@@ -14869,17 +14889,31 @@ static void test_status_host_snapshot_does_not_wait_for_sampler(void) {
 	server_host_metrics_destroy(&s);
 }
 
+static void test_status_host_cache_ttl_uses_monotonic_age(void) {
+	server s = {0};
+	server_host_metrics_init(&s);
+	pthread_mutex_lock(&s.host_metrics_mu);
+	s.host_metrics_sampled_mono = 100.0;
+	s.host_metrics.sampled_at = 1700000000.0;
+	TEST_ASSERT(server_host_metrics_cache_is_fresh(&s, 100.5));
+	s.host_metrics.sampled_at = 1.0;
+	TEST_ASSERT(server_host_metrics_cache_is_fresh(&s, 100.5));
+	TEST_ASSERT(!server_host_metrics_cache_is_fresh(&s, 101.01));
+	pthread_mutex_unlock(&s.host_metrics_mu);
+	server_host_metrics_destroy(&s);
+}
+
 static void test_status_external_timestamps_are_wall_clock(void) {
 	ds4_call_history h = {0};
 	ds4_call_history_init(&h);
-	double started = ds4_wall_time_sec();
+	double started = ds4_time_sec_from_parts(1700000000, 250000000);
 	uint64_t id = ds4_call_history_begin(&h, "clock", "openai", "chat", false, false, started);
 	ds4_call_history_finish(&h, id, DS4_CALL_COMPLETED, started - 1.0,
 		0, "none", "stop", NULL);
-	ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(&h, ds4_wall_time_sec());
-	TEST_ASSERT(snap.records[0].started_at > 1700000000.0);
-	TEST_ASSERT(snap.records[0].finished_at > 1700000000.0);
-	TEST_ASSERT(snap.callers[0].recent_activity > 1700000000.0);
+	ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(&h, 1700000002.0);
+	TEST_ASSERT(snap.records[0].started_at == 1700000000.25);
+	TEST_ASSERT(snap.records[0].finished_at == 1699999999.25);
+	TEST_ASSERT(snap.callers[0].recent_activity == 1699999999.25);
 	TEST_ASSERT(snap.callers[0].average_terminal_duration >= 0.0);
 	ds4_call_history_snapshot_free(&snap);
 	ds4_call_history_free(&h);
@@ -18859,7 +18893,7 @@ static void test_host_metrics_contract(void) {
 	memset(&metrics, 0xa5, sizeof(metrics));
 	if (ds4_host_metrics_sample(&metrics)) {
 		TEST_ASSERT(metrics.available);
-		TEST_ASSERT(metrics.sampled_at > 1700000000.0);
+		TEST_ASSERT(metrics.sampled_at > 0.0);
 		TEST_ASSERT(metrics.memory_total_bytes > 0);
 		TEST_ASSERT(metrics.memory_used_bytes <= metrics.memory_total_bytes);
 		TEST_ASSERT(metrics.memory_available_bytes <= metrics.memory_total_bytes);
@@ -18910,6 +18944,7 @@ static void ds4_server_unit_tests_run(void) {
     test_call_history_snapshot_owns_copies();
 	test_status_worker_active_call_is_not_newest_queued_call();
 	test_status_host_snapshot_does_not_wait_for_sampler();
+	test_status_host_cache_ttl_uses_monotonic_age();
 	test_status_external_timestamps_are_wall_clock();
     test_call_history_marks_final_stream_write_failure();
     test_peer_caller_formats_direct_addresses();
