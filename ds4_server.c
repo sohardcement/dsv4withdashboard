@@ -15689,7 +15689,18 @@ static void test_kv_cache_stats_snapshot(void) {
 	TEST_ASSERT(stats.used_bytes == 350);
 	TEST_ASSERT(stats.entries == 2);
 
+	kc.entry[0].file_size = UINT64_MAX - 10;
+	kc.entry[1].file_size = 20;
+	stats = ds4_kvstore_get_stats(&kc);
+	TEST_ASSERT(stats.used_bytes == UINT64_MAX);
+
 	ds4_kvstore_clear(&kc);
+
+	stats = ds4_kvstore_get_stats(NULL);
+	TEST_ASSERT(!stats.enabled);
+	TEST_ASSERT(stats.budget_bytes == 0);
+	TEST_ASSERT(stats.used_bytes == 0);
+	TEST_ASSERT(stats.entries == 0);
 }
 
 static void test_kv_cache_eviction_prefers_anchor_reason(void) {
