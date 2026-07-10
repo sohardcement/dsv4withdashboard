@@ -84,8 +84,8 @@ kv_space_valid() {
     [[ "$value" =~ ^[0-9]+$ ]] || return 1
     normalized=${value#"${value%%[!0]*}"}
     [ -n "$normalized" ] || normalized=0
-    [ ${#normalized} -lt 19 ] || {
-        [ ${#normalized} -eq 19 ] && [[ "$normalized" < 9223372036854775808 ]]
+    [ ${#normalized} -lt 10 ] || {
+        [ ${#normalized} -eq 10 ] && [[ ! "$normalized" > 2147483647 ]]
     } || return 1
     [ "$normalized" -ge 256 ]
 }
