@@ -7801,9 +7801,11 @@ static void server_kv_destroy(server *s);
 static bool server_kv_open(server *s, const char *dir, uint64_t budget_mb,
                            bool reject_different_quant, kv_cache_options opt);
 static void server_kv_close(server *s);
+#ifdef DS4_SERVER_TEST
 static ds4_kvstore_budget_result server_kv_set_budget(server *s,
-                                                       uint64_t budget_bytes,
-                                                       bool apply);
+	                                                   uint64_t budget_bytes,
+	                                                   bool apply);
+#endif
 static ds4_kvstore_budget_result server_kv_set_budget_checked(
 	server *s, uint64_t budget_bytes, bool apply, bool require_revision,
 	uint64_t expected_revision, bool *state_changed);
@@ -9143,11 +9145,13 @@ static void server_kv_close(server *s) {
 	server_kv_publish_stats(s, stats, seq);
 }
 
+#ifdef DS4_SERVER_TEST
 static ds4_kvstore_budget_result server_kv_set_budget(server *s,
                                                        uint64_t budget_bytes,
                                                        bool apply) {
 	return server_kv_set_budget_checked(s, budget_bytes, apply, false, 0, NULL);
 }
+#endif
 
 static ds4_kvstore_budget_result server_kv_set_budget_checked(
 		server *s, uint64_t budget_bytes, bool apply, bool require_revision,
