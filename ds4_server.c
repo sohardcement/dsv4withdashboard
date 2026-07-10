@@ -8329,7 +8329,8 @@ static void append_status_json(buf *b, const server_status *st,
                (unsigned long long)(kv_enabled ? kv->entries : 0),
                (unsigned long long)(kv ? kv->revision : 0));
 	int limit = st->ctx_size > 0 ? st->ctx_size : 0;
-	int current = st->session_pos > 0 ? st->session_pos : 0;
+	int current = limit > 0 && st->session_pos > 0 ? st->session_pos : 0;
+	if (current > limit) current = limit;
 	int remaining = limit > current ? limit - current : 0;
 	double utilization = limit > 0 ? (double)current / (double)limit : 0.0;
 	buf_printf(b, ",\"context\":{\"current_tokens\":%d,\"limit_tokens\":%d,\"remaining\":%d,\"utilization\":%.3f}",
@@ -14696,7 +14697,14 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
     TEST_ASSERT(strstr(b.ptr, "\"kv_cache\":{\"enabled\":false,"
                               "\"budget_bytes\":0,\"used_bytes\":0,"
                               "\"entries\":0,\"revision\":\"0\"}") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"context\":{\"current_tokens\":120,\"limit_tokens\":100,\"remaining\":0,\"utilization\":1.200") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"context\":{\"current_tokens\":100,\"limit_tokens\":100,\"remaining\":0,\"utilization\":1.000") != NULL);
+    buf_free(&b);
+
+    b = (buf){0};
+    s.status.ctx_size = -1;
+    s.status.session_pos = 9;
+    append_status_json(&b, &s.status, NULL, &host, &calls, history.capacity, 0);
+    TEST_ASSERT(strstr(b.ptr, "\"context\":{\"current_tokens\":0,\"limit_tokens\":0,\"remaining\":0,\"utilization\":0.000") != NULL);
     buf_free(&b);
     ds4_call_history_snapshot_free(&calls);
     ds4_call_history_free(&history);
