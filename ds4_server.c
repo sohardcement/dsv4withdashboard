@@ -7804,6 +7804,9 @@ static void server_kv_close(server *s);
 static ds4_kvstore_budget_result server_kv_set_budget(server *s,
                                                        uint64_t budget_bytes,
                                                        bool apply);
+static ds4_kvstore_budget_result server_kv_set_budget_checked(
+	server *s, uint64_t budget_bytes, bool apply, bool require_revision,
+	uint64_t expected_revision, bool *state_changed);
 #ifdef DS4_SERVER_TEST
 static bool server_kv_evict(server *s, const ds4_tokens *live,
                             uint64_t extra_bytes,
@@ -8177,11 +8180,12 @@ static void append_status_json(buf *b, const server_status *st,
                (unsigned long long)st->cache_hit_requests);
     const bool kv_enabled = kv && kv->enabled;
     buf_printf(b, ",\"kv_cache\":{\"enabled\":%s,\"budget_bytes\":%llu,"
-                  "\"used_bytes\":%llu,\"entries\":%llu}",
+                  "\"used_bytes\":%llu,\"entries\":%llu,\"revision\":\"%llu\"}",
                kv_enabled ? "true" : "false",
                (unsigned long long)(kv_enabled ? kv->budget_bytes : 0),
                (unsigned long long)(kv_enabled ? kv->used_bytes : 0),
-               (unsigned long long)(kv_enabled ? kv->entries : 0));
+               (unsigned long long)(kv_enabled ? kv->entries : 0),
+               (unsigned long long)(kv ? kv->revision : 0));
     buf_puts(b, "}\n");
 }
 
@@ -9093,6 +9097,7 @@ static void server_kv_publish_stats(server *s, ds4_kvstore_stats stats,
 	 * checkpoint I/O and intentionally reports the last completed operation. */
 	pthread_mutex_lock(&s->kv_stats_mu);
 	if (seq >= s->kv_stats_published_seq) {
+		stats.revision = seq;
 		s->kv_stats = stats;
 		s->kv_stats_published_seq = seq;
 	}
@@ -9138,12 +9143,27 @@ static void server_kv_close(server *s) {
 static ds4_kvstore_budget_result server_kv_set_budget(server *s,
                                                        uint64_t budget_bytes,
                                                        bool apply) {
+	return server_kv_set_budget_checked(s, budget_bytes, apply, false, 0, NULL);
+}
+
+static ds4_kvstore_budget_result server_kv_set_budget_checked(
+		server *s, uint64_t budget_bytes, bool apply, bool require_revision,
+		uint64_t expected_revision, bool *state_changed) {
 	ds4_kvstore_budget_result result = {0};
+	if (state_changed) *state_changed = false;
 	if (!s) return result;
 	pthread_mutex_lock(&s->kv_mu);
+	uint64_t seq = s->kv_stats_seq;
+	if (require_revision && expected_revision != seq) {
+		result.revision = seq;
+		if (state_changed) *state_changed = true;
+		pthread_mutex_unlock(&s->kv_mu);
+		return result;
+	}
 	result = ds4_kvstore_set_budget(&s->kv, budget_bytes, apply);
 	ds4_kvstore_stats stats = ds4_kvstore_get_stats(&s->kv);
-	uint64_t seq = ++s->kv_stats_seq;
+	if (apply && result.ok && result.applied) seq = ++s->kv_stats_seq;
+	result.revision = seq;
 	pthread_mutex_unlock(&s->kv_mu);
 	server_kv_publish_stats(s, stats, seq);
 	return result;
@@ -12000,6 +12020,8 @@ typedef enum {
 typedef struct {
     uint64_t budget_mb;
     kv_admin_mode mode;
+	uint64_t revision;
+	bool have_revision;
 } kv_admin_request;
 
 typedef struct {
@@ -12033,7 +12055,7 @@ static bool kv_admin_parse_uint(const char **p, uint64_t *out) {
 static bool kv_admin_parse_cstr(const char *json, kv_admin_request *out,
                                 kv_admin_error *err) {
     const char *p = json ? json : "";
-    bool have_budget = false, have_mode = false;
+    bool have_budget = false, have_mode = false, have_revision = false;
     kv_admin_request req = {0};
     json_ws(&p);
     if (*p++ != '{') return kv_admin_fail(err, "invalid_json", "request body must be a JSON object");
@@ -12059,6 +12081,17 @@ static bool kv_admin_parse_cstr(const char *json, kv_admin_request *out,
             else if (!strcmp(mode, "persist")) req.mode = KV_ADMIN_PERSIST;
             else { free(mode); free(key); return kv_admin_fail(err, "invalid_mode", "mode must be dry-run, apply, or persist"); }
             free(mode);
+		} else if (!strcmp(key, "revision")) {
+			if (have_revision) { free(key); return kv_admin_fail(err, "duplicate_field", "duplicate field: revision"); }
+			have_revision = true;
+			char *revision = NULL;
+			if (!json_string(&p, &revision)) { free(key); return kv_admin_fail(err, "invalid_revision", "revision must be a decimal string"); }
+			const char *rp = revision;
+			if (!kv_admin_parse_uint(&rp, &req.revision) || *rp) {
+				free(revision); free(key);
+				return kv_admin_fail(err, "invalid_revision", "revision must be a uint64 decimal string");
+			}
+			free(revision);
         } else {
             free(key);
             return kv_admin_fail(err, "unknown_field", "request contains an unknown field");
@@ -12073,6 +12106,11 @@ static bool kv_admin_parse_cstr(const char *json, kv_admin_request *out,
     if (*p) return kv_admin_fail(err, "invalid_json", "trailing data after JSON object");
     if (!have_budget) return kv_admin_fail(err, "missing_field", "missing required field: budget_mb");
     if (!have_mode) return kv_admin_fail(err, "missing_field", "missing required field: mode");
+	req.have_revision = have_revision;
+	if (req.mode == KV_ADMIN_APPLY && !have_revision)
+		return kv_admin_fail(err, "missing_revision", "apply requires revision from dry-run");
+	if (req.mode != KV_ADMIN_APPLY && have_revision)
+		return kv_admin_fail(err, "unexpected_revision", "revision is accepted only for apply");
     if (req.budget_mb < 256) return kv_admin_fail(err, "budget_too_small", "budget_mb must be at least 256");
     if (req.budget_mb > UINT64_MAX / (1024ull * 1024ull))
         return kv_admin_fail(err, "budget_overflow", "budget_mb is too large");
@@ -12245,17 +12283,21 @@ static bool kv_admin_response_ex(int fd, bool cors, int status,
     buf_puts(&b, ",\"runtime\":{\"attempted\":"); buf_puts(&b, runtime_attempted ? "true" : "false");
     buf_puts(&b, ",\"ok\":"); buf_puts(&b, runtime_attempted && runtime && runtime->ok ? "true" : "false");
     buf_puts(&b, ",\"applied\":"); buf_puts(&b, runtime_attempted && runtime && runtime->applied ? "true" : "false");
-    buf_printf(&b, ",\"old_budget_bytes\":%llu,\"new_budget_bytes\":%llu,\"before_bytes\":%llu,\"after_bytes\":%llu,\"before_entries\":%llu,\"after_entries\":%llu,\"eviction_required\":%s}",
+    buf_printf(&b, ",\"old_budget_bytes\":%llu,\"new_budget_bytes\":%llu,\"before_bytes\":%llu,\"after_bytes\":%llu,\"before_entries\":%llu,\"after_entries\":%llu,\"eviction_required\":%s,\"revision\":\"%llu\"}",
         (unsigned long long)(runtime ? runtime->old_budget_bytes : 0), (unsigned long long)(runtime ? runtime->new_budget_bytes : 0),
         (unsigned long long)(runtime ? runtime->before_bytes : 0), (unsigned long long)(runtime ? runtime->after_bytes : 0),
         (unsigned long long)(runtime ? runtime->before_entries : 0), (unsigned long long)(runtime ? runtime->after_entries : 0),
-        runtime && runtime->eviction_required ? "true" : "false");
+        runtime && runtime->eviction_required ? "true" : "false",
+		(unsigned long long)(runtime ? runtime->revision : 0));
     buf_puts(&b, ",\"persistent\":{\"attempted\":"); buf_puts(&b, persistent_attempted ? "true" : "false");
     buf_puts(&b, ",\"ok\":"); buf_puts(&b, persistent_attempted && persistent_ok ? "true" : "false");
     buf_puts(&b, ",\"committed\":"); buf_puts(&b, persistent_attempted && persistent_committed ? "true" : "false");
     buf_puts(&b, ",\"durable\":"); buf_puts(&b, persistent_attempted && persistent_durable ? "true" : "false");
     buf_puts(&b, ",\"budget_mb\":"); buf_printf(&b, "%llu}", (unsigned long long)(req ? req->budget_mb : 0));
     if (code) { buf_puts(&b, ",\"error\":{\"code\":"); json_escape(&b, code); buf_puts(&b, ",\"message\":"); json_escape(&b, message ? message : ""); buf_putc(&b, '}'); }
+	if (code && !strcmp(code, "kv_state_changed"))
+		buf_printf(&b, ",\"current_revision\":\"%llu\"",
+		           (unsigned long long)(runtime ? runtime->revision : 0));
     buf_puts(&b, "}\n");
     bool sent = http_response(fd, cors, status, "application/json", b.ptr);
     buf_free(&b);
@@ -12304,12 +12346,18 @@ static bool kv_admin_handle_authorized(server *s, int fd, bool cors,
                                  err.code, err.message);
     uint64_t bytes = req.budget_mb * 1024ull * 1024ull;
     if (req.mode == KV_ADMIN_DRY_RUN || req.mode == KV_ADMIN_APPLY) {
-        ds4_kvstore_budget_result result = server_kv_set_budget(s, bytes,
-                                                                req.mode == KV_ADMIN_APPLY);
+		bool state_changed = false;
+        ds4_kvstore_budget_result result = server_kv_set_budget_checked(
+			s, bytes, req.mode == KV_ADMIN_APPLY, req.mode == KV_ADMIN_APPLY,
+			req.revision, &state_changed);
         int status = result.ok ? 200 : 409;
+		const char *code = state_changed ? "kv_state_changed" :
+			(result.ok ? NULL : "kv_cache_disabled");
+		const char *message = state_changed ?
+			"KV cache state changed after dry-run; retry inspection" :
+			(result.ok ? NULL : "KV cache is disabled");
         return kv_admin_response(fd, cors, status, &req, &result, true, false, false,
-                                 result.ok ? NULL : "kv_cache_disabled",
-                                 result.ok ? NULL : "KV cache is disabled");
+		                         code, message);
     }
     char path[PATH_MAX];
     const char *target = kv_admin_persistence_path(persist_path_override,
@@ -13690,11 +13738,22 @@ static void test_kv_admin_parser_is_strict(void) {
 	                                   &req, &err));
 	TEST_ASSERT(req.budget_mb == 8192);
 	TEST_ASSERT(req.mode == KV_ADMIN_DRY_RUN);
+	const char apply_valid[] =
+		"{\"budget_mb\":8192,\"mode\":\"apply\",\"revision\":\"42\"}";
+	TEST_ASSERT(kv_admin_parse_request(apply_valid, sizeof(apply_valid) - 1,
+	                                   &req, &err));
+	TEST_ASSERT(req.revision == 42 && req.have_revision);
 	const char *bad[] = {
 		"Content-Length:\r\n",
 		"{}", "{\"budget_mb\":8192}", "{\"mode\":\"apply\"}",
 		"{\"budget_mb\":8192,\"budget_mb\":9000,\"mode\":\"apply\"}",
 		"{\"budget_mb\":8192,\"mode\":\"apply\",\"extra\":1}",
+		"{\"budget_mb\":8192,\"mode\":\"apply\"}",
+		"{\"budget_mb\":8192,\"mode\":\"dry-run\",\"revision\":\"1\"}",
+		"{\"budget_mb\":8192,\"mode\":\"persist\",\"revision\":\"1\"}",
+		"{\"budget_mb\":8192,\"mode\":\"apply\",\"revision\":1}",
+		"{\"budget_mb\":8192,\"mode\":\"apply\",\"revision\":\"x\"}",
+		"{\"budget_mb\":8192,\"mode\":\"apply\",\"revision\":\"1\",\"revision\":\"2\"}",
 		"{\"budget_mb\":255,\"mode\":\"apply\"}",
 		"{\"budget_mb\":-1,\"mode\":\"apply\"}",
 		"{\"budget_mb\":1.0,\"mode\":\"apply\"}",
@@ -13715,8 +13774,7 @@ static void test_kv_admin_parser_is_strict(void) {
 	TEST_ASSERT(!kv_admin_parse_request(embedded, sizeof(embedded) - 1, &req, &err));
 	const char garbage[] = "{\"budget_mb\":8192,\"mode\":\"apply\"}XYZ";
 	TEST_ASSERT(!kv_admin_parse_request(garbage, sizeof(garbage) - 1, &req, &err));
-	TEST_ASSERT(kv_admin_parse_request(garbage, sizeof(garbage) - 4, &req, &err));
-	TEST_ASSERT(req.budget_mb == 8192 && req.mode == KV_ADMIN_APPLY);
+	TEST_ASSERT(!kv_admin_parse_request(garbage, sizeof(garbage) - 4, &req, &err));
 	const char unterminated[] = {'{','"','b','u','d','g','e','t','_','m','b','"',':','2','5','6',',','"','m','o','d','e','"',':','"','p','e','r','s','i','s','t','"','}'};
 	TEST_ASSERT(kv_admin_parse_request(unterminated, sizeof(unterminated), &req, &err));
 	TEST_ASSERT(req.budget_mb == 256 && req.mode == KV_ADMIN_PERSIST);
@@ -14008,7 +14066,7 @@ static void test_kv_admin_actual_route_and_peer_auth(void) {
 	s.kv.enabled = true;
 	s.kv.dir = xstrdup(dir);
 	s.kv.budget_bytes = 1024ull * 1024 * 1024;
-	const char *body = "{\"budget_mb\":2048,\"mode\":\"apply\"}";
+	const char *body = "{\"budget_mb\":2048,\"mode\":\"apply\",\"revision\":\"0\"}";
 	char request_text[512];
 	snprintf(request_text, sizeof(request_text),
 		"POST /ds4/admin/kv-cache HTTP/1.1\r\nX-DS4-Admin: 1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
@@ -14020,13 +14078,13 @@ static void test_kv_admin_actual_route_and_peer_auth(void) {
 	TEST_ASSERT(s.kv.budget_bytes == 2048ull * 1024 * 1024);
 	free(out);
 
-	const char *split_body = "{\"budget_mb\":3072,\"mode\":\"apply\"}";
+	const char *split_body = "{\"budget_mb\":3072,\"mode\":\"apply\",\"revision\":\"1\"}";
 	char split_first[512];
 	snprintf(split_first, sizeof(split_first),
 		"POST /ds4/admin/kv-cache HTTP/1.1\r\nX-DS4-Admin: 1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n{\"budget_mb\":",
 		strlen(split_body));
 	out = test_kv_admin_split_prebody_route(&s, split_first,
-		"3072,\"mode\":\"apply\"}");
+		"3072,\"mode\":\"apply\",\"revision\":\"1\"}");
 	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
 	TEST_ASSERT(s.kv.budget_bytes == 3072ull * 1024 * 1024);
 	free(out);
@@ -14045,6 +14103,7 @@ static void test_kv_admin_actual_route_and_peer_auth(void) {
 	TEST_ASSERT(strstr(out, "HTTP/1.1 403") != NULL);
 	TEST_ASSERT(s.kv.budget_bytes == 1024ull * 1024 * 1024);
 	free(out);
+	body = "{\"budget_mb\":2048,\"mode\":\"apply\",\"revision\":\"2\"}";
 	snprintf(request_text, sizeof(request_text),
 		"POST /ds4/admin/kv-cache HTTP/1.1\r\nOrigin: http://127.0.0.1:8080\r\nSec-Fetch-Site: cross-site\r\nX-DS4-Admin: 1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
 		strlen(body), body);
@@ -14232,9 +14291,8 @@ static void test_kv_admin_handler_semantics(void) {
 	free(out);
 	out = test_kv_admin_core(&s,
 		"{\"budget_mb\":8192,\"mode\":\"apply\"}", NULL);
-	TEST_ASSERT(strstr(out, "HTTP/1.1 409") != NULL);
-	TEST_ASSERT(strstr(out, "\"mode\":\"apply\"") != NULL);
-	TEST_ASSERT(strstr(out, "\"runtime\":{\"attempted\":true,\"ok\":false") != NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL);
+	TEST_ASSERT(strstr(out, "\"code\":\"missing_revision\"") != NULL);
 	free(out);
 	out = test_kv_admin_core(&s, "{bad", NULL);
 	TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL);
@@ -14249,10 +14307,17 @@ static void test_kv_admin_handler_semantics(void) {
 		s.kv.dir = xstrdup(dir);
 		s.kv.budget_bytes = 1024ull * 1024 * 1024;
 		out = test_kv_admin_core(&s,
-			"{\"budget_mb\":2048,\"mode\":\"apply\"}", NULL);
+			"{\"budget_mb\":2048,\"mode\":\"apply\",\"revision\":\"0\"}", NULL);
 		TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
 		TEST_ASSERT(strstr(out, "\"applied\":true") != NULL);
 		TEST_ASSERT(server_kv_get_published_stats(&s).budget_bytes == 2048ull * 1024 * 1024);
+		free(out);
+		out = test_kv_admin_core(&s,
+			"{\"budget_mb\":1024,\"mode\":\"apply\",\"revision\":\"0\"}", NULL);
+		TEST_ASSERT(strstr(out, "HTTP/1.1 409") != NULL);
+		TEST_ASSERT(strstr(out, "\"code\":\"kv_state_changed\"") != NULL);
+		TEST_ASSERT(strstr(out, "\"current_revision\":\"1\"") != NULL);
+		TEST_ASSERT(s.kv.budget_bytes == 2048ull * 1024 * 1024);
 		free(out);
 		server_kv_close(&s);
 		rmdir(dir);
@@ -14318,6 +14383,7 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
         .budget_bytes = 4096,
         .used_bytes = 1024,
         .entries = 3,
+		.revision = 7,
     };
     buf b = {0};
     append_status_json(&b, &s.status, &kv);
@@ -14326,14 +14392,14 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
                               "\"hit_requests\":1}") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"kv_cache\":{\"enabled\":true,"
                               "\"budget_bytes\":4096,\"used_bytes\":1024,"
-                              "\"entries\":3}") != NULL);
+                              "\"entries\":3,\"revision\":\"7\"}") != NULL);
     buf_free(&b);
 
     b = (buf){0};
     append_status_json(&b, &s.status, NULL);
     TEST_ASSERT(strstr(b.ptr, "\"kv_cache\":{\"enabled\":false,"
                               "\"budget_bytes\":0,\"used_bytes\":0,"
-                              "\"entries\":0}") != NULL);
+                              "\"entries\":0,\"revision\":\"0\"}") != NULL);
     buf_free(&b);
 
     server_status_begin_request(&s, &r, -2, -1, "none");

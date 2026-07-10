@@ -85,6 +85,8 @@ typedef struct {
 	uint64_t budget_bytes;
 	uint64_t used_bytes;
 	uint64_t entries;
+	/* Server-assigned published-state generation; zero for raw store stats. */
+	uint64_t revision;
 } ds4_kvstore_stats;
 
 typedef struct {
@@ -97,6 +99,7 @@ typedef struct {
 	uint64_t after_bytes;
 	uint64_t before_entries;
 	uint64_t after_entries;
+	uint64_t revision;
 } ds4_kvstore_budget_result;
 
 typedef struct {
