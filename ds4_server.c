@@ -4,6 +4,7 @@
 #include "ds4_host_metrics.h"
 #include "ds4_call_history.h"
 #include "ds4_kvstore.h"
+#include "ds4_time.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -7787,6 +7788,7 @@ struct server {
     server_status status;
 	pthread_mutex_t call_history_mu;
 	ds4_call_history call_history;
+	uint64_t worker_active_call_request_id;
 	pthread_mutex_t host_metrics_mu;
 	pthread_cond_t host_metrics_cv;
 	ds4_host_metrics host_metrics;
@@ -7824,6 +7826,21 @@ static bool server_kv_evict(server *s, const ds4_tokens *live,
 #endif
 static ds4_kvstore_stats server_kv_get_published_stats(server *s);
 
+static void server_worker_active_call_set(server *s, uint64_t request_id) {
+	if (!s) return;
+	pthread_mutex_lock(&s->call_history_mu);
+	s->worker_active_call_request_id = request_id;
+	pthread_mutex_unlock(&s->call_history_mu);
+}
+
+static void server_worker_active_call_clear(server *s, uint64_t request_id) {
+	if (!s) return;
+	pthread_mutex_lock(&s->call_history_mu);
+	if (s->worker_active_call_request_id == request_id)
+		s->worker_active_call_request_id = 0;
+	pthread_mutex_unlock(&s->call_history_mu);
+}
+
 static void server_host_metrics_init(server *s) {
 	if (!s) return;
 	pthread_mutex_init(&s->host_metrics_mu, NULL);
@@ -7841,10 +7858,12 @@ static void server_host_metrics_destroy(server *s) {
 static ds4_host_metrics server_host_get_snapshot(server *s) {
 	ds4_host_metrics snapshot = {0};
 	if (!s) return snapshot;
-	const double now = now_sec();
+	const double now = ds4_wall_time_sec();
 	pthread_mutex_lock(&s->host_metrics_mu);
-	while (s->host_sampling) {
-		pthread_cond_wait(&s->host_metrics_cv, &s->host_metrics_mu);
+	if (s->host_sampling) {
+		snapshot = s->host_metrics;
+		pthread_mutex_unlock(&s->host_metrics_mu);
+		return snapshot;
 	}
 	if (s->host_metrics.sampled_at > 0.0 &&
 		now - s->host_metrics.sampled_at < 1.0) {
@@ -7858,7 +7877,7 @@ static ds4_host_metrics server_host_get_snapshot(server *s) {
 	ds4_host_metrics sampled = {0};
 	if (!ds4_host_metrics_sample(&sampled)) {
 		sampled.pressure = DS4_HOST_PRESSURE_UNKNOWN;
-		sampled.sampled_at = now_sec();
+		sampled.sampled_at = ds4_wall_time_sec();
 	}
 
 	pthread_mutex_lock(&s->host_metrics_mu);
@@ -7902,7 +7921,7 @@ static void server_call_history_finish(server *s, const job *j,
 	if (!s || !j || !j->call_request_id) return;
 	pthread_mutex_lock(&s->call_history_mu);
 	ds4_call_history_finish(&s->call_history, j->call_request_id, status,
-							now_sec(), output_tokens, cache_source, finish, error);
+							ds4_wall_time_sec(), output_tokens, cache_source, finish, error);
 	pthread_mutex_unlock(&s->call_history_mu);
 }
 
@@ -8355,7 +8374,6 @@ static bool send_status_json(server *s, int fd) {
 	ds4_call_history_snapshot calls = {0};
 	size_t calls_capacity = 0;
 	uint64_t active_request_id = 0;
-	double active_started_at = -1.0;
     memset(&snapshot, 0, sizeof(snapshot));
     if (s) {
         pthread_mutex_lock(&s->status_mu);
@@ -8366,14 +8384,9 @@ static bool send_status_json(server *s, int fd) {
 		kv = server_kv_get_published_stats(s);
 		host = server_host_get_snapshot(s);
 		pthread_mutex_lock(&s->call_history_mu);
-		calls = ds4_call_history_snapshot_take(&s->call_history, now_sec());
+		calls = ds4_call_history_snapshot_take(&s->call_history, ds4_wall_time_sec());
 		calls_capacity = s->call_history.capacity;
-		for (size_t i = 0; i < s->call_history.len; i++)
-			if (s->call_history.records[i].status == DS4_CALL_ACTIVE &&
-				s->call_history.records[i].started_at >= active_started_at) {
-				active_started_at = s->call_history.records[i].started_at;
-				active_request_id = s->call_history.records[i].request_id;
-			}
+		active_request_id = s->worker_active_call_request_id;
 		pthread_mutex_unlock(&s->call_history_mu);
     }
     buf b = {0};
@@ -11935,10 +11948,12 @@ static job *dequeue(server *s) {
 
 static void *worker_main(void *arg) {
     server *s = arg;
-    for (;;) {
-        job *j = dequeue(s);
-        if (!j) break;
-        generate_job(s, j);
+	for (;;) {
+		job *j = dequeue(s);
+		if (!j) break;
+		server_worker_active_call_set(s, j->call_request_id);
+		generate_job(s, j);
+		server_worker_active_call_clear(s, j->call_request_id);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -12785,7 +12800,7 @@ static void *client_main(void *arg) {
     j.fd = fd;
     j.req = req;
 	server_peer_caller(fd, j.caller, sizeof(j.caller));
-	j.received_at = now_sec();
+	j.received_at = ds4_wall_time_sec();
 	pthread_mutex_lock(&s->call_history_mu);
 	j.call_request_id = ds4_call_history_begin(&s->call_history, j.caller,
 		request_api_name(j.req.api), request_kind_name(j.req.kind), j.req.stream,
@@ -14809,6 +14824,65 @@ static void test_call_history_snapshot_owns_copies(void) {
     ds4_call_history_snapshot_free(NULL);
     ds4_call_history_free(&h);
     ds4_call_history_free(NULL);
+}
+
+static void test_status_worker_active_call_is_not_newest_queued_call(void) {
+	server s = {0};
+	pthread_mutex_init(&s.call_history_mu, NULL);
+	ds4_call_history_init(&s.call_history);
+	uint64_t a = ds4_call_history_begin(&s.call_history, "a", "openai", "chat", false, false, 1.0);
+	uint64_t b = ds4_call_history_begin(&s.call_history, "b", "openai", "chat", false, false, 2.0);
+	uint64_t c = ds4_call_history_begin(&s.call_history, "c", "openai", "chat", false, false, 3.0);
+	server_worker_active_call_set(&s, a);
+	pthread_mutex_lock(&s.call_history_mu);
+	TEST_ASSERT(s.worker_active_call_request_id == a);
+	pthread_mutex_unlock(&s.call_history_mu);
+	server_worker_active_call_clear(&s, a);
+	pthread_mutex_lock(&s.call_history_mu);
+	TEST_ASSERT(s.worker_active_call_request_id == 0);
+	pthread_mutex_unlock(&s.call_history_mu);
+	server_worker_active_call_set(&s, b);
+	pthread_mutex_lock(&s.call_history_mu);
+	TEST_ASSERT(s.worker_active_call_request_id == b);
+	TEST_ASSERT(s.worker_active_call_request_id != c);
+	pthread_mutex_unlock(&s.call_history_mu);
+	ds4_call_history_free(&s.call_history);
+	pthread_mutex_destroy(&s.call_history_mu);
+}
+
+static void test_status_host_snapshot_does_not_wait_for_sampler(void) {
+	server s = {0};
+	server_host_metrics_init(&s);
+	pthread_mutex_lock(&s.host_metrics_mu);
+	s.host_sampling = true;
+	s.host_metrics.available = true;
+	s.host_metrics.memory_total_bytes = 77;
+	s.host_metrics.sampled_at = ds4_wall_time_sec();
+	pthread_mutex_unlock(&s.host_metrics_mu);
+	ds4_host_metrics snapshot = server_host_get_snapshot(&s);
+	TEST_ASSERT(snapshot.available);
+	TEST_ASSERT(snapshot.memory_total_bytes == 77);
+	pthread_mutex_lock(&s.host_metrics_mu);
+	s.host_sampling = false;
+	pthread_cond_broadcast(&s.host_metrics_cv);
+	pthread_mutex_unlock(&s.host_metrics_mu);
+	server_host_metrics_destroy(&s);
+}
+
+static void test_status_external_timestamps_are_wall_clock(void) {
+	ds4_call_history h = {0};
+	ds4_call_history_init(&h);
+	double started = ds4_wall_time_sec();
+	uint64_t id = ds4_call_history_begin(&h, "clock", "openai", "chat", false, false, started);
+	ds4_call_history_finish(&h, id, DS4_CALL_COMPLETED, started - 1.0,
+		0, "none", "stop", NULL);
+	ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(&h, ds4_wall_time_sec());
+	TEST_ASSERT(snap.records[0].started_at > 1700000000.0);
+	TEST_ASSERT(snap.records[0].finished_at > 1700000000.0);
+	TEST_ASSERT(snap.callers[0].recent_activity > 1700000000.0);
+	TEST_ASSERT(snap.callers[0].average_terminal_duration >= 0.0);
+	ds4_call_history_snapshot_free(&snap);
+	ds4_call_history_free(&h);
 }
 
 static void test_call_history_marks_final_stream_write_failure(void) {
@@ -18785,6 +18859,7 @@ static void test_host_metrics_contract(void) {
 	memset(&metrics, 0xa5, sizeof(metrics));
 	if (ds4_host_metrics_sample(&metrics)) {
 		TEST_ASSERT(metrics.available);
+		TEST_ASSERT(metrics.sampled_at > 1700000000.0);
 		TEST_ASSERT(metrics.memory_total_bytes > 0);
 		TEST_ASSERT(metrics.memory_used_bytes <= metrics.memory_total_bytes);
 		TEST_ASSERT(metrics.memory_available_bytes <= metrics.memory_total_bytes);
@@ -18833,7 +18908,10 @@ static void ds4_server_unit_tests_run(void) {
     test_call_history_capacity_keeps_active_calls();
     test_call_history_clamps_tokens_and_aggregates_failures();
     test_call_history_snapshot_owns_copies();
-	test_call_history_marks_final_stream_write_failure();
+	test_status_worker_active_call_is_not_newest_queued_call();
+	test_status_host_snapshot_does_not_wait_for_sampler();
+	test_status_external_timestamps_are_wall_clock();
+    test_call_history_marks_final_stream_write_failure();
     test_peer_caller_formats_direct_addresses();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();

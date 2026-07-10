@@ -1,8 +1,8 @@
 #include "ds4_host_metrics.h"
+#include "ds4_time.h"
 
 #include <limits.h>
 #include <string.h>
-#include <time.h>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -14,14 +14,6 @@
 
 #define DS4_HOST_PRESSURE_WARNING_AVG10 10.0
 #define DS4_HOST_PRESSURE_CRITICAL_AVG10 20.0
-
-static double host_metrics_now(void) {
-	struct timespec ts;
-
-	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-		return 0.0;
-	return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
-}
 
 const char *ds4_host_pressure_name(ds4_host_pressure pressure) {
 	switch (pressure) {
@@ -85,7 +77,7 @@ sampled:
 	if (task_info(mach_task_self(), TASK_BASIC_INFO_64, (task_info_t)&task,
 		&task_count) == KERN_SUCCESS)
 		out->process_rss_bytes = task.resident_size;
-	out->sampled_at = host_metrics_now();
+	out->sampled_at = ds4_wall_time_sec();
 	out->available = true;
 	return true;
 }
@@ -169,7 +161,7 @@ static bool host_metrics_sample_linux(ds4_host_metrics *out) {
 			out->swap_total_bytes - swap_free;
 	host_metrics_process_rss(out);
 	host_metrics_pressure(out);
-	out->sampled_at = host_metrics_now();
+	out->sampled_at = ds4_wall_time_sec();
 	out->available = true;
 	return true;
 }
