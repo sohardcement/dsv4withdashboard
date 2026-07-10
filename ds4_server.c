@@ -9169,7 +9169,8 @@ static ds4_kvstore_budget_result server_kv_set_budget_checked(
 	}
 	result = ds4_kvstore_set_budget(&s->kv, budget_bytes, apply);
 	ds4_kvstore_stats stats = ds4_kvstore_get_stats(&s->kv);
-	if (apply && result.ok && result.applied) seq = ++s->kv_stats_seq;
+	if (apply && ((result.ok && result.applied) || result.changed))
+		seq = ++s->kv_stats_seq;
 	result.revision = seq;
 	pthread_mutex_unlock(&s->kv_mu);
 	server_kv_publish_stats(s, stats, seq);
@@ -12302,7 +12303,8 @@ static bool kv_admin_response_ex(int fd, bool cors, int status,
     buf_puts(&b, ",\"durable\":"); buf_puts(&b, persistent_attempted && persistent_durable ? "true" : "false");
     buf_puts(&b, ",\"budget_mb\":"); buf_printf(&b, "%llu}", (unsigned long long)(req ? req->budget_mb : 0));
     if (code) { buf_puts(&b, ",\"error\":{\"code\":"); json_escape(&b, code); buf_puts(&b, ",\"message\":"); json_escape(&b, message ? message : ""); buf_putc(&b, '}'); }
-	if (code && !strcmp(code, "kv_state_changed"))
+	if (code && (!strcmp(code, "kv_state_changed") ||
+	             !strcmp(code, "kv_eviction_failed")))
 		buf_printf(&b, ",\"current_revision\":\"%llu\"",
 		           (unsigned long long)(runtime ? runtime->revision : 0));
     buf_puts(&b, "}\n");
@@ -12357,12 +12359,17 @@ static bool kv_admin_handle_authorized(server *s, int fd, bool cors,
         ds4_kvstore_budget_result result = server_kv_set_budget_checked(
 			s, bytes, req.mode == KV_ADMIN_APPLY, req.mode == KV_ADMIN_APPLY,
 			req.revision, &state_changed);
-        int status = result.ok ? 200 : 409;
+		bool apply_failed = req.mode == KV_ADMIN_APPLY && result.enabled &&
+		                    !state_changed && !result.ok;
+        int status = result.ok ? 200 : (apply_failed ? 500 : 409);
 		const char *code = state_changed ? "kv_state_changed" :
-			(result.ok ? NULL : "kv_cache_disabled");
+			(result.ok ? NULL : (apply_failed ? "kv_eviction_failed" :
+			 "kv_cache_disabled"));
 		const char *message = state_changed ?
 			"KV cache state changed after dry-run; retry inspection" :
-			(result.ok ? NULL : "KV cache is disabled");
+			(result.ok ? NULL : (apply_failed ?
+			 "KV cache eviction failed; the previous limit was restored" :
+			 "KV cache is disabled"));
         return kv_admin_response(fd, cors, status, &req, &result, true, false, false,
 		                         code, message);
     }
@@ -17588,6 +17595,101 @@ static int test_kv_cache_unlink_fails(const char *path) {
 	return -1;
 }
 
+static int test_kv_cache_unlink_calls;
+
+static int test_kv_cache_second_unlink_fails(const char *path) {
+	test_kv_cache_unlink_calls++;
+	if (test_kv_cache_unlink_calls == 2) {
+		errno = EACCES;
+		return -1;
+	}
+	return unlink(path);
+}
+
+static void test_kv_admin_partial_eviction_failure_advances_revision(void) {
+	char tmpl[] = "/tmp/ds4-kv-admin-partial-eviction.XXXXXX";
+	char *dir = mkdtemp(tmpl);
+	TEST_ASSERT(dir != NULL);
+	if (!dir) return;
+
+	uint64_t now = (uint64_t)time(NULL);
+	const uint64_t payload_bytes = 200ull * 1024 * 1024;
+	for (int i = 1; i <= 3; i++) {
+		char sha[41], name[44];
+		snprintf(sha, sizeof(sha), "%040d", i);
+		test_kv_stub_file(dir, sha, KV_REASON_UNKNOWN, 512, 0,
+		                  now - (uint64_t)(3 - i), 1);
+		snprintf(name, sizeof(name), "%.40s.kv", sha);
+		char *path = path_join(dir, name);
+		FILE *fp = fopen(path, "r+b");
+		TEST_ASSERT(fp != NULL);
+		if (fp) {
+			uint8_t h[KV_CACHE_FIXED_HEADER];
+			kv_fill_header(h, 2, KV_REASON_UNKNOWN, 0, 512, 0, 32768,
+			               100, now - (uint64_t)(3 - i), payload_bytes);
+			TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+			TEST_ASSERT(ftruncate(fileno(fp),
+			                      (off_t)(KV_CACHE_FIXED_HEADER + 4 + payload_bytes)) == 0);
+			TEST_ASSERT(fclose(fp) == 0);
+		}
+		free(path);
+	}
+
+	server s = {0};
+	server_kv_init(&s);
+	s.kv.enabled = true;
+	s.kv.dir = xstrdup(dir);
+	s.kv.opt = kv_cache_default_options();
+	s.kv.budget_bytes = 1024ull * 1024 * 1024;
+	s.kv.unlink_file = test_kv_cache_second_unlink_fails;
+	test_kv_cache_unlink_calls = 0;
+
+	char *out = test_kv_admin_core(&s,
+		"{\"budget_mb\":256,\"mode\":\"apply\",\"revision\":\"0\"}", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 500") != NULL);
+	TEST_ASSERT(strstr(out, "\"code\":\"kv_eviction_failed\"") != NULL);
+	TEST_ASSERT(strstr(out, "\"runtime\":{\"attempted\":true,\"ok\":false,\"applied\":false") != NULL);
+	TEST_ASSERT(strstr(out, "\"before_entries\":3,\"after_entries\":2") != NULL);
+	char expected_bytes[160];
+	snprintf(expected_bytes, sizeof(expected_bytes),
+	         "\"before_bytes\":%llu,\"after_bytes\":%llu",
+	         (unsigned long long)(3 * (KV_CACHE_FIXED_HEADER + 4 + payload_bytes)),
+	         (unsigned long long)(2 * (KV_CACHE_FIXED_HEADER + 4 + payload_bytes)));
+	TEST_ASSERT(strstr(out, expected_bytes) != NULL);
+	TEST_ASSERT(strstr(out, "\"revision\":\"1\"") != NULL);
+	TEST_ASSERT(strstr(out, "\"current_revision\":\"1\"") != NULL);
+	TEST_ASSERT(s.kv.budget_bytes == 1024ull * 1024 * 1024);
+	free(out);
+
+	ds4_kvstore_stats published = server_kv_get_published_stats(&s);
+	TEST_ASSERT(published.entries == 2);
+	TEST_ASSERT(published.used_bytes == 2 * (KV_CACHE_FIXED_HEADER + 4 + payload_bytes));
+	TEST_ASSERT(published.budget_bytes == 1024ull * 1024 * 1024);
+	TEST_ASSERT(published.revision == 1);
+
+	int calls_after_failure = test_kv_cache_unlink_calls;
+	out = test_kv_admin_core(&s,
+		"{\"budget_mb\":256,\"mode\":\"apply\",\"revision\":\"0\"}", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 409") != NULL);
+	TEST_ASSERT(strstr(out, "\"code\":\"kv_state_changed\"") != NULL);
+	TEST_ASSERT(strstr(out, "\"current_revision\":\"1\"") != NULL);
+	TEST_ASSERT(test_kv_cache_unlink_calls == calls_after_failure);
+	TEST_ASSERT(s.kv.len == 2);
+	free(out);
+
+	s.kv.unlink_file = NULL;
+	server_kv_close(&s);
+	server_kv_destroy(&s);
+	for (int i = 1; i <= 3; i++) {
+		char name[44];
+		snprintf(name, sizeof(name), "%040d.kv", i);
+		char *path = path_join(dir, name);
+		unlink(path);
+		free(path);
+	}
+	rmdir(dir);
+}
+
 static void test_kv_cache_budget_reports_unlink_failure(void) {
 	char tmpl[] = "/tmp/ds4-kv-budget-unlink-test.XXXXXX";
 	char *dir = mkdtemp(tmpl);
@@ -18375,6 +18477,7 @@ static void ds4_server_unit_tests_run(void) {
 	test_kv_cache_budget_changes();
 	test_kv_cache_budget_refreshes_external_files();
 	test_kv_cache_budget_reports_unlink_failure();
+	test_kv_admin_partial_eviction_failure_advances_revision();
 	test_kv_cache_store_rejects_failed_eviction();
 	test_kv_cache_open_rejects_failed_initial_eviction();
     test_kv_cache_eviction_values_fresh_snapshots();

@@ -34,5 +34,10 @@ async page => {
   const confirms=await page.evaluate(()=>window.__confirms); assert(confirms.length===1&&confirms[0].includes('90.0 GB'),'retry did not reconfirm changed eviction pressure');
   await cfg({reset:true,mismatch_remaining:2}); await page.reload(); await wait(100); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvApplyNow').click(); await wait(300);
   assert((await page.locator('#adminNotice').innerText()).includes('kept changing'),'revision retry cap was not actionable');
+  await cfg({reset:true,eviction_fail:true}); await page.reload(); await wait(100); await page.locator('#kvBudgetInput').fill('32'); await page.locator('#kvApplyNow').click(); await wait(250);
+  assert((await page.locator('#adminNotice').innerText()).includes('previous limit was restored'),'eviction failure notice was not actionable');
+  assert(!(await page.locator('#kvBudgetInput').isDisabled())&&!(await page.locator('#kvBudgetUnit').isDisabled())&&!(await page.locator('#kvApplyNow').isDisabled())&&!(await page.locator('#kvSaveRestart').isDisabled()),'500 eviction failure disabled controls');
+  s=await fixture(); assert(s.kv.entries===100&&s.kv.used_bytes===(40*2**30)&&s.kv.revision==='2','eviction failure fixture did not publish truthful partial state');
+  await wait(1100); assert((await page.locator('#kvUsed').innerText())==='40.0 GB'&&(await page.locator('#kvEntries').innerText())==='100','next status poll did not paint partial-eviction stats');
   return {ok:true,double_apply:'one transaction',apply_save:'one transaction',poll_max_active:1,revision_sequence:s.admin.map(x=>x.mode),confirm_count:confirms.length};
 }

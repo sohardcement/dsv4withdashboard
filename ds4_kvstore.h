@@ -92,6 +92,8 @@ typedef struct {
 typedef struct {
 	bool ok;
 	bool applied;
+	bool enabled;
+	bool changed;
 	bool eviction_required;
 	uint64_t old_budget_bytes;
 	uint64_t new_budget_bytes;

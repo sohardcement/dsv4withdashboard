@@ -38,7 +38,7 @@ class Handler(BaseHTTPRequestHandler):
         body=json.loads(self.rfile.read(int(self.headers.get("Content-Length","0"))))
         if self.path == "/fixture/config":
             if body.get("reset"):
-                state.update(kv=dict(base_kv), admin=[], status_active=0, status_max=0, status_delay_ms=0, admin_delay_ms=0, forbidden=False, malformed=False, mismatch_once=False, mismatch_remaining=0, mismatch_makes_eviction=False)
+                state.update(kv=dict(base_kv), admin=[], status_active=0, status_max=0, status_delay_ms=0, admin_delay_ms=0, forbidden=False, malformed=False, mismatch_once=False, mismatch_remaining=0, mismatch_makes_eviction=False, eviction_fail=False)
             for key,value in body.items():
                 if key != "reset": state[key]=value
             self.json(state); return
@@ -53,6 +53,9 @@ class Handler(BaseHTTPRequestHandler):
             state["mismatch_once"]=False; state["mismatch_remaining"]=max(0,state["mismatch_remaining"]-1); kv["revision"]=str(int(kv["revision"])+1)
             if state["mismatch_makes_eviction"]: kv["used_bytes"]=90<<30; kv["entries"]=150
             self.json({"ok":False,"runtime":runtime,"current_revision":kv["revision"],"error":{"code":"kv_state_changed","message":"state changed"}},409); return
+        if body["mode"]=="apply" and state.get("eviction_fail"):
+            kv.update(used_bytes=40<<30,entries=100,revision=str(int(kv["revision"])+1)); runtime.update(ok=False,applied=False,after_bytes=kv["used_bytes"],after_entries=kv["entries"],revision=kv["revision"])
+            self.json({"ok":False,"runtime":runtime,"error":{"code":"kv_eviction_failed","message":"KV cache eviction failed; the previous limit was restored"}},500); return
         if body["mode"]=="apply":
             kv.update(budget_bytes=new,used_bytes=runtime["after_bytes"],entries=runtime["after_entries"],revision=str(int(kv["revision"])+1)); runtime["revision"]=kv["revision"]
         persistent={"attempted":body["mode"]=="persist","ok":True,"committed":body["mode"]=="persist","durable":body["mode"]=="persist","budget_mb":mb}

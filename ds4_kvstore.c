@@ -414,6 +414,7 @@ ds4_kvstore_budget_result ds4_kvstore_set_budget(ds4_kvstore *kc,
 	ds4_kvstore_budget_result result = {0};
 	if (kc && kc->enabled) kv_cache_refresh(kc);
 	ds4_kvstore_stats before = ds4_kvstore_get_stats(kc);
+	result.enabled = before.enabled;
 	result.old_budget_bytes = before.budget_bytes;
 	result.new_budget_bytes = budget_bytes;
 	result.before_bytes = before.used_bytes;
@@ -431,12 +432,15 @@ ds4_kvstore_budget_result ds4_kvstore_set_budget(ds4_kvstore *kc,
 	ds4_kvstore_stats after = ds4_kvstore_get_stats(kc);
 	result.after_bytes = after.used_bytes;
 	result.after_entries = after.entries;
+	result.changed = after.used_bytes != before.used_bytes ||
+	                 after.entries != before.entries;
 	if (!enforced) {
 		kc->budget_bytes = result.old_budget_bytes;
 		result.ok = false;
 		return result;
 	}
 	result.applied = true;
+	result.changed = true;
 	return result;
 }
 
