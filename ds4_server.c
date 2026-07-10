@@ -15703,6 +15703,93 @@ static void test_kv_cache_stats_snapshot(void) {
 	TEST_ASSERT(stats.entries == 0);
 }
 
+static void test_kv_cache_budget_changes(void) {
+	char tmpl[] = "/tmp/ds4-kv-budget-test.XXXXXX";
+	char *dir = mkdtemp(tmpl);
+	TEST_ASSERT(dir != NULL);
+	if (!dir) return;
+
+	const char *first_sha = "1111111111111111111111111111111111111111";
+	const char *second_sha = "2222222222222222222222222222222222222222";
+	uint64_t now = (uint64_t)time(NULL);
+	test_kv_stub_file(dir, first_sha, KV_REASON_UNKNOWN, 512, 0, now, 248);
+	test_kv_stub_file(dir, second_sha, KV_REASON_UNKNOWN, 1024, 0, now, 248);
+
+	char first_name[44], second_name[44];
+	snprintf(first_name, sizeof(first_name), "%.40s.kv", first_sha);
+	snprintf(second_name, sizeof(second_name), "%.40s.kv", second_sha);
+	char *first_path = path_join(dir, first_name);
+	char *second_path = path_join(dir, second_name);
+
+	ds4_kvstore kc = {0};
+	kc.enabled = true;
+	kc.dir = xstrdup(dir);
+	kc.opt = kv_cache_default_options();
+	kc.budget_bytes = 1000;
+	ds4_kvstore_evict(&kc, NULL, 0, NULL);
+	TEST_ASSERT(kc.len == 2);
+
+	ds4_kvstore_budget_result dry = ds4_kvstore_set_budget(&kc, 500, false);
+	TEST_ASSERT(dry.ok);
+	TEST_ASSERT(!dry.applied);
+	TEST_ASSERT(dry.eviction_required);
+	TEST_ASSERT(dry.old_budget_bytes == 1000);
+	TEST_ASSERT(dry.new_budget_bytes == 500);
+	TEST_ASSERT(dry.before_bytes == 600);
+	TEST_ASSERT(dry.after_bytes == 600);
+	TEST_ASSERT(dry.before_entries == 2);
+	TEST_ASSERT(dry.after_entries == 2);
+	TEST_ASSERT(kc.budget_bytes == 1000);
+	TEST_ASSERT(kc.len == 2);
+
+	ds4_kvstore_budget_result shrink = ds4_kvstore_set_budget(&kc, 500, true);
+	TEST_ASSERT(shrink.ok);
+	TEST_ASSERT(shrink.applied);
+	TEST_ASSERT(shrink.eviction_required);
+	TEST_ASSERT(shrink.old_budget_bytes == 1000);
+	TEST_ASSERT(shrink.new_budget_bytes == 500);
+	TEST_ASSERT(shrink.before_bytes == 600);
+	TEST_ASSERT(shrink.after_bytes <= 500);
+	TEST_ASSERT(shrink.before_entries == 2);
+	TEST_ASSERT(shrink.after_entries < shrink.before_entries);
+	TEST_ASSERT(kc.budget_bytes == 500);
+	TEST_ASSERT((uint64_t)kc.len == shrink.after_entries);
+
+	uint64_t entries_after_shrink = shrink.after_entries;
+	ds4_kvstore_budget_result growth = ds4_kvstore_set_budget(&kc, 2000, true);
+	TEST_ASSERT(growth.ok);
+	TEST_ASSERT(growth.applied);
+	TEST_ASSERT(!growth.eviction_required);
+	TEST_ASSERT(growth.old_budget_bytes == 500);
+	TEST_ASSERT(growth.new_budget_bytes == 2000);
+	TEST_ASSERT(growth.before_bytes == shrink.after_bytes);
+	TEST_ASSERT(growth.after_bytes == growth.before_bytes);
+	TEST_ASSERT(growth.before_entries == entries_after_shrink);
+	TEST_ASSERT(growth.after_entries == entries_after_shrink);
+	TEST_ASSERT(kc.budget_bytes == 2000);
+
+	ds4_kvstore_budget_result rejected = ds4_kvstore_set_budget(&kc, 0, true);
+	TEST_ASSERT(!rejected.ok);
+	TEST_ASSERT(!rejected.applied);
+	TEST_ASSERT(kc.budget_bytes == 2000);
+	TEST_ASSERT((uint64_t)kc.len == entries_after_shrink);
+
+	kc.enabled = false;
+	rejected = ds4_kvstore_set_budget(&kc, 3000, true);
+	TEST_ASSERT(!rejected.ok);
+	TEST_ASSERT(!rejected.applied);
+	TEST_ASSERT(kc.budget_bytes == 2000);
+	TEST_ASSERT((uint64_t)kc.len == entries_after_shrink);
+	TEST_ASSERT(!ds4_kvstore_set_budget(NULL, 3000, true).ok);
+
+	ds4_kvstore_close(&kc);
+	unlink(first_path);
+	unlink(second_path);
+	free(first_path);
+	free(second_path);
+	rmdir(dir);
+}
+
 static void test_kv_cache_eviction_prefers_anchor_reason(void) {
     char tmpl[] = "/tmp/ds4-kv-anchor-reason-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -16347,6 +16434,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_stats_snapshot();
+	test_kv_cache_budget_changes();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();

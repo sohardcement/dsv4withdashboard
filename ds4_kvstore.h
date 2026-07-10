@@ -87,6 +87,18 @@ typedef struct {
 } ds4_kvstore_stats;
 
 typedef struct {
+	bool ok;
+	bool applied;
+	bool eviction_required;
+	uint64_t old_budget_bytes;
+	uint64_t new_budget_bytes;
+	uint64_t before_bytes;
+	uint64_t after_bytes;
+	uint64_t before_entries;
+	uint64_t after_entries;
+} ds4_kvstore_budget_result;
+
+typedef struct {
     const char *text;
     size_t text_len;
     uint8_t model_id;
@@ -127,6 +139,9 @@ void ds4_kvstore_close(ds4_kvstore *kc);
 void ds4_kvstore_clear(ds4_kvstore *kc);
 void ds4_kvstore_entry_free(ds4_kvstore_entry *e);
 ds4_kvstore_stats ds4_kvstore_get_stats(const ds4_kvstore *kc);
+ds4_kvstore_budget_result ds4_kvstore_set_budget(ds4_kvstore *kc,
+												 uint64_t budget_bytes,
+												 bool apply);
 
 char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      const ds4_tokens *tokens,

@@ -400,6 +400,33 @@ ds4_kvstore_stats ds4_kvstore_get_stats(const ds4_kvstore *kc) {
 	return stats;
 }
 
+ds4_kvstore_budget_result ds4_kvstore_set_budget(ds4_kvstore *kc,
+												 uint64_t budget_bytes,
+												 bool apply) {
+	ds4_kvstore_budget_result result = {0};
+	ds4_kvstore_stats before = ds4_kvstore_get_stats(kc);
+	result.old_budget_bytes = before.budget_bytes;
+	result.new_budget_bytes = budget_bytes;
+	result.before_bytes = before.used_bytes;
+	result.after_bytes = before.used_bytes;
+	result.before_entries = before.entries;
+	result.after_entries = before.entries;
+	if (!kc || !kc->enabled || budget_bytes == 0) return result;
+
+	result.ok = true;
+	result.eviction_required = before.used_bytes > budget_bytes;
+	if (!apply) return result;
+
+	kc->budget_bytes = budget_bytes;
+	if (result.eviction_required)
+		ds4_kvstore_evict(kc, NULL, 0, NULL);
+	ds4_kvstore_stats after = ds4_kvstore_get_stats(kc);
+	result.applied = true;
+	result.after_bytes = after.used_bytes;
+	result.after_entries = after.entries;
+	return result;
+}
+
 static void kv_cache_push(ds4_kvstore *kc, ds4_kvstore_entry e) {
     if (kc->len == kc->cap) {
         kc->cap = kc->cap ? kc->cap * 2 : 16;
