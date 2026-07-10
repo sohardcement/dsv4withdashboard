@@ -8013,9 +8013,10 @@ static void server_status_finish_request(server *s, const char *finish,
     if (!s) return;
     pthread_mutex_lock(&s->status_mu);
     if (finish && !strcmp(finish, "error")) {
-        s->status.failed_requests++;
+        s->status.failed_requests = status_sat_inc(s->status.failed_requests);
     } else {
-        s->status.completed_requests++;
+        s->status.completed_requests = status_sat_inc(
+            s->status.completed_requests);
     }
     s->status.active = false;
     status_copy(s->status.phase, sizeof(s->status.phase), "idle");
@@ -12795,6 +12796,22 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
                               "\"entries\":0}") != NULL);
     buf_free(&b);
 
+    server_status_begin_request(&s, &r, -2, -1, "none");
+    TEST_ASSERT(s.status.prompt_tokens == 0);
+    TEST_ASSERT(s.status.cached_tokens == 0);
+    TEST_ASSERT(s.status.total_prompt_tokens == 150);
+    TEST_ASSERT(s.status.total_cached_tokens == 75);
+    TEST_ASSERT(s.status.prompt_requests == 2);
+    TEST_ASSERT(s.status.cache_hit_requests == 1);
+
+    server_status_begin_request(&s, &r, 20, 10, "disk");
+    TEST_ASSERT(s.status.prompt_tokens == 10);
+    TEST_ASSERT(s.status.cached_tokens == 10);
+    TEST_ASSERT(s.status.total_prompt_tokens == 160);
+    TEST_ASSERT(s.status.total_cached_tokens == 85);
+    TEST_ASSERT(s.status.prompt_requests == 3);
+    TEST_ASSERT(s.status.cache_hit_requests == 2);
+
     s.status.total_requests = UINT64_MAX;
     s.status.total_prompt_tokens = UINT64_MAX - 5;
     s.status.total_cached_tokens = UINT64_MAX - 2;
@@ -12806,6 +12823,13 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
     TEST_ASSERT(s.status.total_cached_tokens == UINT64_MAX);
     TEST_ASSERT(s.status.prompt_requests == UINT64_MAX);
     TEST_ASSERT(s.status.cache_hit_requests == UINT64_MAX);
+
+    s.status.completed_requests = UINT64_MAX;
+    server_status_finish_request(&s, "stop", NULL);
+    TEST_ASSERT(s.status.completed_requests == UINT64_MAX);
+    s.status.failed_requests = UINT64_MAX;
+    server_status_finish_request(&s, "error", "test error");
+    TEST_ASSERT(s.status.failed_requests == UINT64_MAX);
 
     request_free(&r);
     pthread_mutex_destroy(&s.status_mu);
