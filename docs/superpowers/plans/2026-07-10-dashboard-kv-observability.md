@@ -54,7 +54,7 @@ Register the test in the server test runner.
 
 - [ ] **Step 2: Run the focused test and verify RED**
 
-Run: `make ds4_server_test && ./ds4_server_test`
+Run: `make ds4_test && ./ds4_test --server`
 
 Expected: compilation fails because `ds4_kvstore_stats` and `ds4_kvstore_get_stats` do not exist.
 
@@ -93,7 +93,7 @@ ds4_kvstore_stats ds4_kvstore_get_stats(const ds4_kvstore *kc) {
 
 - [ ] **Step 4: Run the test and verify GREEN**
 
-Run: `make ds4_server_test && ./ds4_server_test`
+Run: `make ds4_test && ./ds4_test --server`
 
 Expected: all server unit tests pass.
 
@@ -152,7 +152,7 @@ Use an existing KV fixture helper if one already creates valid cache files; othe
 
 - [ ] **Step 2: Run the focused test and verify RED**
 
-Run: `make ds4_server_test && ./ds4_server_test`
+Run: `make ds4_test && ./ds4_test --server`
 
 Expected: compilation fails because the budget result and setter do not exist.
 
@@ -181,7 +181,7 @@ Implement it by taking a stats snapshot, rejecting disabled stores and zero budg
 
 - [ ] **Step 4: Run tests and verify GREEN**
 
-Run: `make ds4_server_test && ./ds4_server_test`
+Run: `make ds4_test && ./ds4_test --server`
 
 Expected: all server unit tests pass, including actual file eviction.
 
@@ -232,7 +232,7 @@ Also assert that an empty-prompt request does not increase either request denomi
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `make ds4_server_test && ./ds4_server_test`
+Run: `make ds4_test && ./ds4_test --server`
 
 Expected: test fails because totals JSON lacks cache counters.
 
@@ -268,7 +268,7 @@ When disabled, emit zeros with `enabled:false`. In `send_status_json`, lock `sta
 
 - [ ] **Step 5: Run tests and verify GREEN**
 
-Run: `make ds4_server_test && ./ds4_server_test`
+Run: `make ds4_test && ./ds4_test --server`
 
 Expected: all server unit tests pass.
 
@@ -308,7 +308,7 @@ static void test_server_kv_snapshot_serializes_budget_changes(void) {
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `make ds4_server_test && ./ds4_server_test`
+Run: `make ds4_test && ./ds4_test --server`
 
 Expected: compilation fails because `kv_mu` and server KV wrappers do not exist.
 
@@ -320,14 +320,14 @@ Use a strict rule: callers invoke `server_kv_*` wrappers and never take `kv_mu` 
 
 - [ ] **Step 4: Run tests under ThreadSanitizer where available**
 
-Run: `make ds4_server_test && ./ds4_server_test`
+Run: `make ds4_test && ./ds4_test --server`
 
 Then on clang:
 
 ```bash
 make clean
-make ds4_server_test CFLAGS='-std=c99 -O1 -g -Wall -Wextra -fsanitize=thread'
-./ds4_server_test
+make ds4_test CFLAGS='-std=c99 -O1 -g -Wall -Wextra -fsanitize=thread'
+./ds4_test --server
 ```
 
 Expected: normal tests pass; the sanitizer run reports no race in the new snapshot/budget test. If the platform runtime cannot launch ThreadSanitizer, record that limitation and retain the deterministic locking test.
@@ -384,7 +384,7 @@ static void test_persist_kv_budget_atomic_file(void) {
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `make ds4_server_test && ./ds4_server_test`
+Run: `make ds4_test && ./ds4_test --server`
 
 Expected: compilation fails because the request type and helpers do not exist.
 
@@ -427,7 +427,7 @@ Use HTTP 400 for malformed input, 403 for non-loopback peers, 409 for a disabled
 
 Use `socketpair` for JSON response formatting and direct helper injection for loopback authorization because Unix-domain socket pairs are not loopback TCP peers. Assert status codes and response fields for dry-run, apply-disabled, malformed sizes, and persistence failure.
 
-Run: `make ds4_server_test && ./ds4_server_test`
+Run: `make ds4_test && ./ds4_test --server`
 
 Expected: all server unit tests pass.
 
@@ -525,7 +525,7 @@ TEST_ASSERT(strstr(out, "/ds4/admin/kv-cache") != NULL);
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `make ds4_server_test && ./ds4_server_test`
+Run: `make ds4_test && ./ds4_test --server`
 
 Expected: assertions fail because the current dashboard lacks these elements.
 
@@ -572,7 +572,7 @@ Disable both buttons when status says disk KV is disabled. On HTTP 403, explain 
 
 - [ ] **Step 6: Run tests and inspect in a browser**
 
-Run: `make ds4_server_test && ./ds4_server_test`
+Run: `make ds4_test && ./ds4_test --server`
 
 Start a lightweight test instance only if an existing model-backed server is not already running; otherwise use the existing server. Inspect `/dashboard` at 1440x900 and 390x844, verify no horizontal overflow, confirm the capacity editor keeps its input during polling, and exercise dry-run without accepting an eviction.
 
@@ -603,7 +603,7 @@ Expected: no whitespace errors; only intentional changes are present.
 
 - [ ] **Step 2: Run focused server tests**
 
-Run: `make ds4_server_test && ./ds4_server_test`
+Run: `make ds4_test && ./ds4_test --server`
 
 Expected: zero failures.
 
