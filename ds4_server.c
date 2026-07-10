@@ -4800,6 +4800,7 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
                          code == 403 ? "Forbidden" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
+                         code == 413 ? "Payload Too Large" :
                          code == 500 ? "Internal Server Error" : "Error";
     const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
@@ -11722,6 +11723,10 @@ typedef struct {
     char method[8];
     char path[256];
     char content_type[128];
+    char admin_header[16];
+    char origin[256];
+    char sec_fetch_site[64];
+    size_t content_length;
     char *body;
     size_t body_len;
 } http_request;
@@ -11732,30 +11737,26 @@ static void http_request_free(http_request *r) {
 }
 
 static ssize_t header_end(const char *p, size_t n) {
-    for (size_t i = 3; i < n; i++) {
-        if (p[i - 3] == '\r' && p[i - 2] == '\n' && p[i - 1] == '\r' && p[i] == '\n') return (ssize_t)(i + 1);
-    }
-    for (size_t i = 1; i < n; i++) {
-        if (p[i - 1] == '\n' && p[i] == '\n') return (ssize_t)(i + 1);
-    }
+    /* Headers are read one byte at a time so the body remains untouched until
+     * route authorization.  The first terminator can therefore only be the
+     * current suffix; checking it directly avoids quadratic rescanning. */
+    if (n >= 4 && p[n - 4] == '\r' && p[n - 3] == '\n' &&
+        p[n - 2] == '\r' && p[n - 1] == '\n') return (ssize_t)n;
+    if (n >= 2 && p[n - 2] == '\n' && p[n - 1] == '\n') return (ssize_t)n;
     return -1;
 }
 
-static long content_length(const char *h, size_t n) {
-    const char *p = h, *end = h + n;
-    while (p < end) {
-        const char *line = p;
-        while (p < end && *p != '\n') p++;
-        size_t len = (size_t)(p - line);
-        if (len && line[len - 1] == '\r') len--;
-        if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
-            const char *v = line + 15;
-            while (v < line + len && isspace((unsigned char)*v)) v++;
-            return strtol(v, NULL, 10);
-        }
-        if (p < end) p++;
+static bool parse_content_length_ascii(const char *s, size_t len, size_t *out) {
+    if (!len) return false;
+    size_t v = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        unsigned digit = (unsigned)(s[i] - '0');
+        if (v > (SIZE_MAX - digit) / 10) return false;
+        v = v * 10 + digit;
     }
-    return 0;
+    *out = v;
+    return true;
 }
 
 static bool header_value(const char *h, size_t n, const char *name,
@@ -11785,18 +11786,17 @@ static bool header_value(const char *h, size_t n, const char *name,
     return false;
 }
 
-static bool read_http_request(int fd, http_request *r) {
+static bool read_http_headers(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
-    const size_t max_body = 64 * 1024 * 1024;
 
     while (hend < 0 && b.len < max_header) {
-        char tmp[4096];
-        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+        char byte;
+        ssize_t n = recv(fd, &byte, 1, 0);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) goto fail;
-        buf_append(&b, tmp, (size_t)n);
+        buf_append(&b, &byte, 1);
         hend = header_end(b.ptr, b.len);
     }
     if (hend < 0) goto fail;
@@ -11812,27 +11812,70 @@ static bool read_http_request(int fd, http_request *r) {
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
 
-    long clen = content_length(b.ptr, (size_t)hend);
-    if (clen < 0 || (size_t)clen > max_body) goto fail;
-    while (b.len < (size_t)hend + (size_t)clen) {
-        char tmp[8192];
-        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) goto fail;
-        buf_append(&b, tmp, (size_t)n);
-    }
-
-    r->body_len = (size_t)clen;
     (void)header_value(b.ptr, (size_t)hend, "Content-Type",
                        r->content_type, sizeof(r->content_type));
-    r->body = xmalloc(r->body_len + 1);
-    memcpy(r->body, b.ptr + hend, r->body_len);
-    r->body[r->body_len] = '\0';
+    (void)header_value(b.ptr, (size_t)hend, "X-DS4-Admin",
+                       r->admin_header, sizeof(r->admin_header));
+    (void)header_value(b.ptr, (size_t)hend, "Origin",
+                       r->origin, sizeof(r->origin));
+    (void)header_value(b.ptr, (size_t)hend, "Sec-Fetch-Site",
+                       r->sec_fetch_site, sizeof(r->sec_fetch_site));
+    bool saw_cl = false, saw_admin = false, saw_origin = false;
+    bool saw_fetch_site = false, saw_content_type = false;
+    const char *p = b.ptr, *end = b.ptr + hend;
+    while (p < end && *p != '\n') p++;
+    if (p < end) p++;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len == 0) break;
+        if (len >= 15 && !strncasecmp(line, "Content-Length:", 15)) {
+            if (saw_cl) goto fail;
+            saw_cl = true;
+            const char *v = line + 15, *vend = line + len;
+            while (v < vend && (*v == ' ' || *v == '\t')) v++;
+            while (vend > v && (vend[-1] == ' ' || vend[-1] == '\t')) vend--;
+            if (!parse_content_length_ascii(v, (size_t)(vend - v), &r->content_length)) goto fail;
+        } else if (len >= 18 && !strncasecmp(line, "Transfer-Encoding:", 18)) {
+            goto fail;
+        } else if (len >= 12 && !strncasecmp(line, "X-DS4-Admin:", 12)) {
+            if (saw_admin) goto fail;
+            saw_admin = true;
+        } else if (len >= 7 && !strncasecmp(line, "Origin:", 7)) {
+            if (saw_origin) goto fail;
+            saw_origin = true;
+        } else if (len >= 15 && !strncasecmp(line, "Sec-Fetch-Site:", 15)) {
+            if (saw_fetch_site) goto fail;
+            saw_fetch_site = true;
+        } else if (len >= 13 && !strncasecmp(line, "Content-Type:", 13)) {
+            if (saw_content_type) goto fail;
+            saw_content_type = true;
+        }
+        if (p < end) p++;
+    }
+    r->body = NULL;
+    r->body_len = 0;
     buf_free(&b);
     return true;
 fail:
     buf_free(&b);
     return false;
+}
+
+static bool read_http_body(int fd, http_request *r, size_t max_body) {
+    if (r->content_length > max_body) return false;
+    r->body = xrealloc(r->body, r->content_length + 1);
+    while (r->body_len < r->content_length) {
+        ssize_t n = recv(fd, r->body + r->body_len,
+                         r->content_length - r->body_len, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        r->body_len += (size_t)n;
+    }
+    r->body[r->body_len] = '\0';
+    return true;
 }
 
 typedef struct {
@@ -12032,27 +12075,34 @@ static bool kv_admin_test_fail_chmod;
 static bool kv_admin_test_fail_dir_fsync;
 #endif
 
-static bool kv_admin_persist_budget(const char *path, uint64_t budget_mb,
-                                    char *detail, size_t detail_len) {
+typedef struct {
+    bool ok;
+    bool committed;
+    bool durable;
+} kv_admin_persist_result;
+
+static kv_admin_persist_result kv_admin_persist_budget_ex(
+        const char *path, uint64_t budget_mb, char *detail, size_t detail_len) {
+    kv_admin_persist_result result = {0};
     char *copy = xstrdup(path ? path : "");
     char *slash = strrchr(copy, '/');
     if (!slash || slash == copy) {
         snprintf(detail, detail_len, "invalid persistence path");
         free(copy);
-        return false;
+        return result;
     }
     *slash = '\0';
     const char *parent = copy;
     if (mkdir(parent, 0700) != 0 && errno != EEXIST) {
         snprintf(detail, detail_len, "create parent: %s", strerror(errno));
         free(copy);
-        return false;
+        return result;
     }
     struct stat st;
     if (stat(parent, &st) != 0 || !S_ISDIR(st.st_mode)) {
         snprintf(detail, detail_len, "persistence parent is not a directory");
         free(copy);
-        return false;
+        return result;
     }
     int chmod_ok;
 #ifdef DS4_SERVER_TEST
@@ -12064,7 +12114,7 @@ static bool kv_admin_persist_budget(const char *path, uint64_t budget_mb,
     if (chmod_ok != 0) {
         snprintf(detail, detail_len, "secure parent permissions: %s", strerror(errno));
         free(copy);
-        return false;
+        return result;
     }
     char temp[PATH_MAX];
     unsigned char nonce[8];
@@ -12074,33 +12124,38 @@ static bool kv_admin_persist_budget(const char *path, uint64_t budget_mb,
     if (n < 0 || (size_t)n >= sizeof(temp)) {
         snprintf(detail, detail_len, "persistence path is too long");
         free(copy);
-        return false;
+        return result;
     }
     int fd = open(temp, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0) {
         snprintf(detail, detail_len, "create temporary file: %s", strerror(errno));
         free(copy);
-        return false;
+        return result;
     }
     FILE *fp = fdopen(fd, "w");
-    bool ok = fp && fprintf(fp, "%llu\n", (unsigned long long)budget_mb) > 0 &&
-              fflush(fp) == 0 && fsync(fd) == 0;
+    int saved = 0;
+    bool ok = fp != NULL;
+    if (!fp) saved = errno;
+    if (ok && fprintf(fp, "%llu\n", (unsigned long long)budget_mb) <= 0) { saved = errno; ok = false; }
+    if (ok && fflush(fp) != 0) { saved = errno; ok = false; }
+    if (ok && fsync(fd) != 0) { saved = errno; ok = false; }
     if (fp) {
-        if (fclose(fp) != 0) ok = false;
+        if (fclose(fp) != 0 && ok) { saved = errno; ok = false; }
     } else close(fd);
-    if (ok && rename(temp, path) != 0) ok = false;
+    if (ok && rename(temp, path) != 0) { saved = errno; ok = false; }
     if (!ok) {
-        int saved = errno;
         unlink(temp);
         snprintf(detail, detail_len, "persist budget: %s", strerror(saved ? saved : EIO));
         free(copy);
-        return false;
+        return result;
     }
+    result.committed = true;
     int dfd = open(parent, O_RDONLY);
     if (dfd < 0) {
-        snprintf(detail, detail_len, "open persistence directory: %s", strerror(errno));
+        saved = errno;
+        snprintf(detail, detail_len, "open persistence directory: %s", strerror(saved));
         free(copy);
-        return false;
+        return result;
     }
 #ifdef DS4_SERVER_TEST
     if (kv_admin_test_fail_dir_fsync) errno = EIO;
@@ -12111,25 +12166,35 @@ static bool kv_admin_persist_budget(const char *path, uint64_t budget_mb,
     int sync_errno = errno;
     int close_ok = close(dfd);
     if (sync_ok != 0 || close_ok != 0) {
-        int saved = sync_ok != 0 ? sync_errno : errno;
+        saved = sync_ok != 0 ? sync_errno : errno;
         snprintf(detail, detail_len, "sync persistence directory: %s", strerror(saved));
         free(copy);
-        return false;
+        return result;
     }
+    result.ok = true;
+    result.durable = true;
     free(copy);
-    return true;
+    return result;
 }
+
+#ifdef DS4_SERVER_TEST
+static bool kv_admin_persist_budget(const char *path, uint64_t budget_mb,
+                                    char *detail, size_t detail_len) {
+    return kv_admin_persist_budget_ex(path, budget_mb, detail, detail_len).ok;
+}
+#endif
 
 static const char *kv_admin_mode_name(kv_admin_mode mode) {
     return mode == KV_ADMIN_APPLY ? "apply" : mode == KV_ADMIN_PERSIST ? "persist" : "dry-run";
 }
 
-static bool kv_admin_response(int fd, bool cors, int status,
-                              const kv_admin_request *req,
-                              const ds4_kvstore_budget_result *runtime,
-                              bool runtime_attempted, bool persistent_attempted,
-                              bool persistent_ok, const char *code,
-                              const char *message) {
+static bool kv_admin_response_ex(int fd, bool cors, int status,
+                                 const kv_admin_request *req,
+                                 const ds4_kvstore_budget_result *runtime,
+                                 bool runtime_attempted, bool persistent_attempted,
+                                 bool persistent_ok, bool persistent_committed,
+                                 bool persistent_durable, const char *code,
+                                 const char *message) {
     buf b = {0};
     bool ok = status == 200;
     buf_puts(&b, "{\"ok\":"); buf_puts(&b, ok ? "true" : "false");
@@ -12144,12 +12209,25 @@ static bool kv_admin_response(int fd, bool cors, int status,
         runtime && runtime->eviction_required ? "true" : "false");
     buf_puts(&b, ",\"persistent\":{\"attempted\":"); buf_puts(&b, persistent_attempted ? "true" : "false");
     buf_puts(&b, ",\"ok\":"); buf_puts(&b, persistent_attempted && persistent_ok ? "true" : "false");
+    buf_puts(&b, ",\"committed\":"); buf_puts(&b, persistent_attempted && persistent_committed ? "true" : "false");
+    buf_puts(&b, ",\"durable\":"); buf_puts(&b, persistent_attempted && persistent_durable ? "true" : "false");
     buf_puts(&b, ",\"budget_mb\":"); buf_printf(&b, "%llu}", (unsigned long long)(req ? req->budget_mb : 0));
     if (code) { buf_puts(&b, ",\"error\":{\"code\":"); json_escape(&b, code); buf_puts(&b, ",\"message\":"); json_escape(&b, message ? message : ""); buf_putc(&b, '}'); }
     buf_puts(&b, "}\n");
     bool sent = http_response(fd, cors, status, "application/json", b.ptr);
     buf_free(&b);
     return sent;
+}
+
+static bool kv_admin_response(int fd, bool cors, int status,
+                              const kv_admin_request *req,
+                              const ds4_kvstore_budget_result *runtime,
+                              bool runtime_attempted, bool persistent_attempted,
+                              bool persistent_ok, const char *code,
+                              const char *message) {
+    return kv_admin_response_ex(fd, cors, status, req, runtime, runtime_attempted,
+                                persistent_attempted, persistent_ok, persistent_ok,
+                                persistent_ok, code, message);
 }
 
 static bool kv_admin_handle_authorized(server *s, int fd, bool cors,
@@ -12183,10 +12261,13 @@ static bool kv_admin_handle_authorized(server *s, int fd, bool cors,
         target = path;
     }
     char detail[160] = {0};
-    bool persisted = kv_admin_persist_budget(target, req.budget_mb, detail, sizeof(detail));
-    return kv_admin_response(fd, cors, persisted ? 200 : 500, &req, NULL, false, true,
-                             persisted, persisted ? NULL : "persistence_failed",
-                             persisted ? NULL : detail);
+    kv_admin_persist_result persisted =
+        kv_admin_persist_budget_ex(target, req.budget_mb, detail, sizeof(detail));
+    return kv_admin_response_ex(fd, cors, persisted.ok ? 200 : 500, &req, NULL,
+                                false, true, persisted.ok, persisted.committed,
+                                persisted.durable,
+                                persisted.ok ? NULL : "persistence_failed",
+                                persisted.ok ? NULL : detail);
 }
 
 static void client_done(server *s) {
@@ -12200,6 +12281,20 @@ static void client_done(server *s) {
 
 static void set_client_socket_nonblocking(int fd);
 
+static bool kv_admin_origin_is_local(const char *origin) {
+    if (!origin || !origin[0]) return true;
+    const char *host = strstr(origin, "://");
+    if (!host) return false;
+    host += 3;
+    if (!strncmp(host, "127.0.0.1", 9) &&
+        (host[9] == '\0' || host[9] == ':' || host[9] == '/')) return true;
+    if (!strncmp(host, "localhost", 9) &&
+        (host[9] == '\0' || host[9] == ':' || host[9] == '/')) return true;
+    if (!strncmp(host, "[::1]", 5) &&
+        (host[5] == '\0' || host[5] == ':' || host[5] == '/')) return true;
+    return false;
+}
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -12207,8 +12302,71 @@ static void *client_main(void *arg) {
     free(ca);
 
     http_request hr = {0};
-    if (!read_http_request(fd, &hr)) {
+    if (!read_http_headers(fd, &hr)) {
+        bool admin = !strcmp(hr.path, "/ds4/admin/kv-cache");
+        http_error(fd, admin ? false : s->enable_cors, 400, "bad HTTP request");
+        goto done;
+    }
+
+    bool admin_path = !strcmp(hr.path, "/ds4/admin/kv-cache");
+    if (admin_path) {
+        /* This mutation route intentionally never opts into the server's
+         * wildcard CORS policy.  The non-simple header blocks browser form
+         * CSRF, and rejecting preflight prevents hostile origins from gaining
+         * permission to send it.  Peer authorization still remains mandatory
+         * for non-browser clients that can set arbitrary headers. */
+        if (!strcmp(hr.method, "OPTIONS")) {
+            http_error(fd, false, 403, "admin CORS preflight is forbidden");
+            http_request_free(&hr);
+            goto done;
+        }
+        if (strcmp(hr.method, "POST")) {
+            http_error(fd, false, 404, "unknown endpoint");
+            http_request_free(&hr);
+            goto done;
+        }
+        if (!kv_admin_peer_is_loopback(fd)) {
+            kv_admin_response(fd, false, 403, NULL, NULL, false, false, false,
+                              "loopback_required",
+                              "KV cache administration is restricted to 127.0.0.1 or ::1");
+            http_request_free(&hr);
+            goto done;
+        }
+        if (strcmp(hr.admin_header, "1") || !kv_admin_origin_is_local(hr.origin) ||
+            !strcasecmp(hr.sec_fetch_site, "cross-site")) {
+            kv_admin_response(fd, false, 403, NULL, NULL, false, false, false,
+                              "admin_request_forbidden",
+                              "required admin header or same-origin policy failed");
+            http_request_free(&hr);
+            goto done;
+        }
+        if (strcasecmp(hr.content_type, "application/json")) {
+            kv_admin_response(fd, false, 400, NULL, NULL, false, false, false,
+                              "invalid_content_type", "Content-Type must be application/json");
+            http_request_free(&hr);
+            goto done;
+        }
+        if (hr.content_length > 4096) {
+            kv_admin_response(fd, false, 413, NULL, NULL, false, false, false,
+                              "request_too_large", "admin request body exceeds 4096 bytes");
+            http_request_free(&hr);
+            goto done;
+        }
+        if (!read_http_body(fd, &hr, 4096)) {
+            kv_admin_response(fd, false, 400, NULL, NULL, false, false, false,
+                              "invalid_body", "incomplete admin request body");
+            http_request_free(&hr);
+            goto done;
+        }
+        kv_admin_handle_authorized(s, fd, false, hr.content_type,
+                                   hr.body, hr.body_len, NULL);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (!read_http_body(fd, &hr, 64 * 1024 * 1024)) {
         http_error(fd, s->enable_cors, 400, "bad HTTP request");
+        http_request_free(&hr);
         goto done;
     }
 
@@ -12230,24 +12388,6 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/ds4/admin/kv-cache")) {
-        if (!kv_admin_peer_is_loopback(fd)) {
-            kv_admin_response(fd, s->enable_cors, 403, NULL, NULL, false,
-                              false, false, "loopback_required",
-                              "KV cache administration is restricted to 127.0.0.1 or ::1");
-        } else {
-            kv_admin_handle_authorized(s, fd, s->enable_cors, hr.content_type,
-                                       hr.body, hr.body_len, NULL);
-        }
-        http_request_free(&hr);
-        goto done;
-    }
-    if (!strcmp(hr.path, "/ds4/admin/kv-cache")) {
-        http_error(fd, s->enable_cors, 404, "unknown endpoint");
-        http_request_free(&hr);
-        goto done;
-    }
-
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
         http_request_free(&hr);
@@ -13469,6 +13609,7 @@ static void test_kv_admin_parser_is_strict(void) {
 	TEST_ASSERT(req.budget_mb == 8192);
 	TEST_ASSERT(req.mode == KV_ADMIN_DRY_RUN);
 	const char *bad[] = {
+		"Content-Length:\r\n",
 		"{}", "{\"budget_mb\":8192}", "{\"mode\":\"apply\"}",
 		"{\"budget_mb\":8192,\"budget_mb\":9000,\"mode\":\"apply\"}",
 		"{\"budget_mb\":8192,\"mode\":\"apply\",\"extra\":1}",
@@ -13555,7 +13696,15 @@ static void test_kv_admin_persistence_is_atomic_and_private(void) {
 	TEST_ASSERT(!kv_admin_persist_budget(path, 4096, detail, sizeof(detail)));
 	kv_admin_test_fail_chmod = false;
 	kv_admin_test_fail_dir_fsync = true;
-	TEST_ASSERT(!kv_admin_persist_budget(path, 4096, detail, sizeof(detail)));
+	kv_admin_persist_result persist_result =
+		kv_admin_persist_budget_ex(path, 4096, detail, sizeof(detail));
+	TEST_ASSERT(!persist_result.ok && persist_result.committed && !persist_result.durable);
+	FILE *committed = fopen(path, "rb");
+	TEST_ASSERT(committed != NULL);
+	memset(textbuf, 0, sizeof(textbuf));
+	TEST_ASSERT(committed && fgets(textbuf, sizeof(textbuf), committed) != NULL);
+	if (committed) fclose(committed);
+	TEST_ASSERT(!strcmp(textbuf, "4096\n"));
 	kv_admin_test_fail_dir_fsync = false;
 
 	char impossible[PATH_MAX];
@@ -13624,6 +13773,46 @@ static char *test_kv_admin_route(server *s, const char *request_text,
 	return out;
 }
 
+static char *test_kv_admin_headers_only_route(server *s, const char *headers,
+	                                          bool loopback_tcp) {
+	int client_fd, server_fd;
+	if (loopback_tcp) {
+		int listener = socket(AF_INET, SOCK_STREAM, 0);
+		TEST_ASSERT(listener >= 0);
+		struct sockaddr_in addr = {0};
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		TEST_ASSERT(bind(listener, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+		TEST_ASSERT(listen(listener, 1) == 0);
+		socklen_t len = sizeof(addr);
+		TEST_ASSERT(getsockname(listener, (struct sockaddr *)&addr, &len) == 0);
+		client_fd = socket(AF_INET, SOCK_STREAM, 0);
+		TEST_ASSERT(connect(client_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+		server_fd = accept(listener, NULL, NULL);
+		close(listener);
+	} else {
+		int sv[2];
+		TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+		client_fd = sv[0]; server_fd = sv[1];
+	}
+	struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+	TEST_ASSERT(setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+	                       &timeout, sizeof(timeout)) == 0);
+	TEST_ASSERT(send_all(client_fd, headers, strlen(headers)));
+	client_arg *ca = xmalloc(sizeof(*ca));
+	ca->srv = s; ca->fd = server_fd;
+	s->clients = 1;
+	pthread_t thread;
+	TEST_ASSERT(pthread_create(&thread, NULL, client_main, ca) == 0);
+	char *out = read_socket_text(client_fd);
+	/* Release a broken implementation after the timeout so the test reports an
+	 * assertion instead of deadlocking the whole suite. */
+	shutdown(client_fd, SHUT_WR);
+	TEST_ASSERT(pthread_join(thread, NULL) == 0);
+	close(client_fd);
+	return out;
+}
+
 static void test_kv_admin_actual_route_and_peer_auth(void) {
 	server s = {0};
 	pthread_mutex_init(&s.mu, NULL);
@@ -13640,7 +13829,7 @@ static void test_kv_admin_actual_route_and_peer_auth(void) {
 	const char *body = "{\"budget_mb\":2048,\"mode\":\"apply\"}";
 	char request_text[512];
 	snprintf(request_text, sizeof(request_text),
-		"POST /ds4/admin/kv-cache HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+		"POST /ds4/admin/kv-cache HTTP/1.1\r\nX-DS4-Admin: 1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
 		strlen(body), body);
 	char *out = test_kv_admin_route(&s, request_text, true);
 	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
@@ -13652,12 +13841,20 @@ static void test_kv_admin_actual_route_and_peer_auth(void) {
 	TEST_ASSERT(strstr(out, "HTTP/1.1 403") != NULL);
 	TEST_ASSERT(s.kv.budget_bytes == 1024ull * 1024 * 1024);
 	free(out);
+	snprintf(request_text, sizeof(request_text),
+		"POST /ds4/admin/kv-cache HTTP/1.1\r\nOrigin: http://127.0.0.1:8080\r\nSec-Fetch-Site: cross-site\r\nX-DS4-Admin: 1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+		strlen(body), body);
+	out = test_kv_admin_route(&s, request_text, true);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 403") != NULL);
+	TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin") == NULL);
+	TEST_ASSERT(s.kv.budget_bytes == 1024ull * 1024 * 1024);
+	free(out);
 	const char *old_home_value = getenv("HOME");
 	char *old_home = old_home_value ? xstrdup(old_home_value) : NULL;
 	TEST_ASSERT(setenv("HOME", dir, 1) == 0);
 	const char *persist_body = "{\"budget_mb\":4096,\"mode\":\"persist\"}";
 	snprintf(request_text, sizeof(request_text),
-		"POST /ds4/admin/kv-cache HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+		"POST /ds4/admin/kv-cache HTTP/1.1\r\nX-DS4-Admin: 1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
 		strlen(persist_body), persist_body);
 	out = test_kv_admin_route(&s, request_text, false);
 	TEST_ASSERT(strstr(out, "HTTP/1.1 403") != NULL);
@@ -13677,16 +13874,48 @@ static void test_kv_admin_actual_route_and_peer_auth(void) {
 	free(out);
 
 	snprintf(request_text, sizeof(request_text),
-		"POST /ds4/admin/kv-cache HTTP/1.1\r\nContent-Length: %zu\r\n\r\n%s",
+		"POST /ds4/admin/kv-cache HTTP/1.1\r\nX-DS4-Admin: 1\r\nContent-Length: %zu\r\n\r\n%s",
 		strlen(body), body);
 	out = test_kv_admin_route(&s, request_text, true);
 	TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL);
 	free(out);
 	snprintf(request_text, sizeof(request_text),
-		"POST /ds4/admin/kv-cache HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n%s",
+		"POST /ds4/admin/kv-cache HTTP/1.1\r\nX-DS4-Admin: 1\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n%s",
 		strlen(body), body);
 	out = test_kv_admin_route(&s, request_text, true);
 	TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL);
+	free(out);
+
+	s.enable_cors = true;
+	s.kv.budget_bytes = 1024ull * 1024 * 1024;
+	snprintf(request_text, sizeof(request_text),
+		"POST /ds4/admin/kv-cache HTTP/1.1\r\nOrigin: https://evil.example\r\nX-DS4-Admin: 1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+		strlen(body), body);
+	out = test_kv_admin_route(&s, request_text, true);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 403") != NULL);
+	TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin") == NULL);
+	TEST_ASSERT(s.kv.budget_bytes == 1024ull * 1024 * 1024);
+	free(out);
+	snprintf(request_text, sizeof(request_text),
+		"POST /ds4/admin/kv-cache HTTP/1.1\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+		strlen(body), body);
+	out = test_kv_admin_route(&s, request_text, true);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 403") != NULL);
+	TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin") == NULL);
+	TEST_ASSERT(s.kv.budget_bytes == 1024ull * 1024 * 1024);
+	free(out);
+	out = test_kv_admin_route(&s,
+		"OPTIONS /ds4/admin/kv-cache HTTP/1.1\r\nOrigin: https://evil.example\r\nAccess-Control-Request-Headers: X-DS4-Admin\r\nContent-Length: 0\r\n\r\n", true);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 403") != NULL);
+	TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin") == NULL);
+	TEST_ASSERT(s.kv.budget_bytes == 1024ull * 1024 * 1024);
+	free(out);
+	snprintf(request_text, sizeof(request_text),
+		"POST /ds4/admin/kv-cache HTTP/1.1\r\nX-DS4-Admin: 1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+		strlen(body), body);
+	out = test_kv_admin_route(&s, request_text, true);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+	TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin") == NULL);
 	free(out);
 
 	server_kv_close(&s);
@@ -13695,6 +13924,62 @@ static void test_kv_admin_actual_route_and_peer_auth(void) {
 	pthread_cond_destroy(&s.clients_cv);
 	pthread_mutex_destroy(&s.mu);
 	rmdir(dir);
+}
+
+static void test_kv_admin_rejects_headers_before_body(void) {
+	server s = {0};
+	pthread_mutex_init(&s.mu, NULL);
+	pthread_cond_init(&s.clients_cv, NULL);
+	pthread_mutex_init(&s.status_mu, NULL);
+	server_status_init(&s);
+	server_kv_init(&s);
+	const char *huge =
+		"POST /ds4/admin/kv-cache HTTP/1.1\r\n"
+		"X-DS4-Admin: 1\r\nContent-Type: application/json\r\n"
+		"Content-Length: 999999\r\n\r\n";
+	char *out = test_kv_admin_headers_only_route(&s, huge, false);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 403") != NULL);
+	free(out);
+	out = test_kv_admin_headers_only_route(&s, huge, true);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 413") != NULL);
+	free(out);
+	server_kv_destroy(&s);
+	pthread_mutex_destroy(&s.status_mu);
+	pthread_cond_destroy(&s.clients_cv);
+	pthread_mutex_destroy(&s.mu);
+}
+
+static void test_http_content_length_framing_is_strict(void) {
+	server s = {0};
+	pthread_mutex_init(&s.mu, NULL);
+	pthread_cond_init(&s.clients_cv, NULL);
+	pthread_mutex_init(&s.status_mu, NULL);
+	server_status_init(&s);
+	server_kv_init(&s);
+	const char *bad[] = {
+		"Content-Length: 1x\r\n",
+		"Content-Length: +1\r\n",
+		"Content-Length: 184467440737095516160\r\n",
+		"Content-Length: 0\r\nContent-Length: 0\r\n",
+		"Content-Length: 0\r\nContent-Length: 1\r\n",
+		"Transfer-Encoding: chunked\r\n",
+		"Transfer-Encoding: chunked\r\nContent-Length: 0\r\n",
+		"X-DS4-Admin: 1\r\nX-DS4-Admin: 1\r\nContent-Length: 0\r\n",
+	};
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		char request_text[512];
+		snprintf(request_text, sizeof(request_text),
+			"POST /ds4/admin/kv-cache HTTP/1.1\r\nX-DS4-Admin: 1\r\nContent-Type: application/json\r\n%s\r\n",
+			bad[i]);
+		char *out = test_kv_admin_route(&s, request_text, true);
+		TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL);
+		TEST_ASSERT(strstr(out, "bad HTTP request") != NULL);
+		free(out);
+	}
+	server_kv_destroy(&s);
+	pthread_mutex_destroy(&s.status_mu);
+	pthread_cond_destroy(&s.clients_cv);
+	pthread_mutex_destroy(&s.mu);
 }
 
 static void test_kv_admin_handler_semantics(void) {
@@ -13752,7 +14037,27 @@ static void test_kv_admin_handler_semantics(void) {
 		kv_admin_test_fail_chmod = false;
 		TEST_ASSERT(strstr(out, "HTTP/1.1 500") != NULL);
 		TEST_ASSERT(strstr(out, "\"persistent\":{\"attempted\":true,\"ok\":false") != NULL);
+		TEST_ASSERT(strstr(out, "\"committed\":false,\"durable\":false") != NULL);
 		free(out);
+		rmdir(persist_dir);
+	}
+	if (persist_dir) {
+		char persist_path[PATH_MAX];
+		snprintf(persist_path, sizeof(persist_path), "%s/kv-space-mb", persist_dir);
+		kv_admin_test_fail_dir_fsync = true;
+		out = test_kv_admin_core(&s,
+			"{\"budget_mb\":4096,\"mode\":\"persist\"}", persist_path);
+		kv_admin_test_fail_dir_fsync = false;
+		TEST_ASSERT(strstr(out, "HTTP/1.1 500") != NULL);
+		TEST_ASSERT(strstr(out, "\"committed\":true,\"durable\":false") != NULL);
+		free(out);
+		FILE *committed_fp = fopen(persist_path, "rb");
+		char committed_text[32] = {0};
+		TEST_ASSERT(committed_fp != NULL);
+		TEST_ASSERT(committed_fp && fgets(committed_text, sizeof(committed_text), committed_fp));
+		if (committed_fp) fclose(committed_fp);
+		TEST_ASSERT(!strcmp(committed_text, "4096\n"));
+		unlink(persist_path);
 		rmdir(persist_dir);
 	}
 	server_kv_destroy(&s);
@@ -17745,6 +18050,8 @@ static void ds4_server_unit_tests_run(void) {
 	test_kv_admin_persistence_is_atomic_and_private();
 	test_kv_admin_handler_semantics();
 	test_kv_admin_actual_route_and_peer_auth();
+	test_kv_admin_rejects_headers_before_body();
+	test_http_content_length_framing_is_strict();
 	test_kv_cache_budget_changes();
 	test_kv_cache_budget_refreshes_external_files();
 	test_kv_cache_budget_reports_unlink_failure();
