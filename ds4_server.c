@@ -36,6 +36,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -4796,6 +4797,7 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
+                         code == 403 ? "Forbidden" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
                          code == 500 ? "Internal Server Error" : "Error";
@@ -7798,10 +7800,10 @@ static void server_kv_destroy(server *s);
 static bool server_kv_open(server *s, const char *dir, uint64_t budget_mb,
                            bool reject_different_quant, kv_cache_options opt);
 static void server_kv_close(server *s);
-#ifdef DS4_SERVER_TEST
 static ds4_kvstore_budget_result server_kv_set_budget(server *s,
                                                        uint64_t budget_bytes,
                                                        bool apply);
+#ifdef DS4_SERVER_TEST
 static bool server_kv_evict(server *s, const ds4_tokens *live,
                             uint64_t extra_bytes,
                             const ds4_kvstore_eviction_context *incoming);
@@ -9122,7 +9124,6 @@ static void server_kv_close(server *s) {
 	server_kv_publish_stats(s, stats, seq);
 }
 
-#ifdef DS4_SERVER_TEST
 static ds4_kvstore_budget_result server_kv_set_budget(server *s,
                                                        uint64_t budget_bytes,
                                                        bool apply) {
@@ -9137,6 +9138,7 @@ static ds4_kvstore_budget_result server_kv_set_budget(server *s,
 	return result;
 }
 
+#ifdef DS4_SERVER_TEST
 static bool server_kv_evict(server *s, const ds4_tokens *live,
                             uint64_t extra_bytes,
                             const ds4_kvstore_eviction_context *incoming) {
@@ -11719,6 +11721,7 @@ static void *worker_main(void *arg) {
 typedef struct {
     char method[8];
     char path[256];
+    char content_type[128];
     char *body;
     size_t body_len;
 } http_request;
@@ -11753,6 +11756,33 @@ static long content_length(const char *h, size_t n) {
         if (p < end) p++;
     }
     return 0;
+}
+
+static bool header_value(const char *h, size_t n, const char *name,
+                         char *out, size_t outlen) {
+    const size_t namelen = strlen(name);
+    const char *p = h, *end = h + n;
+    if (outlen) out[0] = '\0';
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > namelen && !strncasecmp(line, name, namelen) &&
+            line[namelen] == ':') {
+            const char *v = line + namelen + 1;
+            const char *vend = line + len;
+            while (v < vend && isspace((unsigned char)*v)) v++;
+            while (vend > v && isspace((unsigned char)vend[-1])) vend--;
+            size_t vlen = (size_t)(vend - v);
+            if (!outlen || vlen >= outlen) return false;
+            memcpy(out, v, vlen);
+            out[vlen] = '\0';
+            return true;
+        }
+        if (p < end) p++;
+    }
+    return false;
 }
 
 static bool read_http_request(int fd, http_request *r) {
@@ -11793,6 +11823,8 @@ static bool read_http_request(int fd, http_request *r) {
     }
 
     r->body_len = (size_t)clen;
+    (void)header_value(b.ptr, (size_t)hend, "Content-Type",
+                       r->content_type, sizeof(r->content_type));
     r->body = xmalloc(r->body_len + 1);
     memcpy(r->body, b.ptr + hend, r->body_len);
     r->body[r->body_len] = '\0';
@@ -11873,6 +11905,243 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+typedef enum {
+    KV_ADMIN_DRY_RUN,
+    KV_ADMIN_APPLY,
+    KV_ADMIN_PERSIST,
+} kv_admin_mode;
+
+typedef struct {
+    uint64_t budget_mb;
+    kv_admin_mode mode;
+} kv_admin_request;
+
+typedef struct {
+    const char *code;
+    const char *message;
+} kv_admin_error;
+
+static bool kv_admin_fail(kv_admin_error *err, const char *code,
+                          const char *message) {
+    if (err) {
+        err->code = code;
+        err->message = message;
+    }
+    return false;
+}
+
+static bool kv_admin_parse_uint(const char **p, uint64_t *out) {
+    if (!isdigit((unsigned char)**p)) return false;
+    uint64_t v = 0;
+    do {
+        unsigned digit = (unsigned)(**p - '0');
+        if (v > (UINT64_MAX - digit) / 10) return false;
+        v = v * 10 + digit;
+        (*p)++;
+    } while (isdigit((unsigned char)**p));
+    if (**p == '.' || **p == 'e' || **p == 'E') return false;
+    *out = v;
+    return true;
+}
+
+static bool kv_admin_parse_request(const char *json, kv_admin_request *out,
+                                   kv_admin_error *err) {
+    const char *p = json ? json : "";
+    bool have_budget = false, have_mode = false;
+    kv_admin_request req = {0};
+    json_ws(&p);
+    if (*p++ != '{') return kv_admin_fail(err, "invalid_json", "request body must be a JSON object");
+    json_ws(&p);
+    if (*p == '}') p++;
+    else for (;;) {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return kv_admin_fail(err, "invalid_json", "malformed JSON object");
+        json_ws(&p);
+        if (*p++ != ':') { free(key); return kv_admin_fail(err, "invalid_json", "expected ':' after field name"); }
+        json_ws(&p);
+        if (!strcmp(key, "budget_mb")) {
+            if (have_budget) { free(key); return kv_admin_fail(err, "duplicate_field", "duplicate field: budget_mb"); }
+            have_budget = true;
+            if (!kv_admin_parse_uint(&p, &req.budget_mb)) { free(key); return kv_admin_fail(err, "invalid_budget_mb", "budget_mb must be a non-negative integer"); }
+        } else if (!strcmp(key, "mode")) {
+            if (have_mode) { free(key); return kv_admin_fail(err, "duplicate_field", "duplicate field: mode"); }
+            have_mode = true;
+            char *mode = NULL;
+            if (!json_string(&p, &mode)) { free(key); return kv_admin_fail(err, "invalid_mode", "mode must be a string"); }
+            if (!strcmp(mode, "dry-run")) req.mode = KV_ADMIN_DRY_RUN;
+            else if (!strcmp(mode, "apply")) req.mode = KV_ADMIN_APPLY;
+            else if (!strcmp(mode, "persist")) req.mode = KV_ADMIN_PERSIST;
+            else { free(mode); free(key); return kv_admin_fail(err, "invalid_mode", "mode must be dry-run, apply, or persist"); }
+            free(mode);
+        } else {
+            free(key);
+            return kv_admin_fail(err, "unknown_field", "request contains an unknown field");
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == '}') { p++; break; }
+        if (*p++ != ',') return kv_admin_fail(err, "invalid_json", "expected ',' or '}'");
+        json_ws(&p);
+    }
+    json_ws(&p);
+    if (*p) return kv_admin_fail(err, "invalid_json", "trailing data after JSON object");
+    if (!have_budget) return kv_admin_fail(err, "missing_field", "missing required field: budget_mb");
+    if (!have_mode) return kv_admin_fail(err, "missing_field", "missing required field: mode");
+    if (req.budget_mb < 256) return kv_admin_fail(err, "budget_too_small", "budget_mb must be at least 256");
+    if (req.budget_mb > UINT64_MAX / (1024ull * 1024ull))
+        return kv_admin_fail(err, "budget_overflow", "budget_mb is too large");
+    if (out) *out = req;
+    return true;
+}
+
+static bool kv_admin_sockaddr_is_loopback(const struct sockaddr *sa,
+                                          socklen_t salen) {
+    if (!sa) return false;
+    if (sa->sa_family == AF_INET && salen >= sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in *v4 = (const struct sockaddr_in *)sa;
+        return ntohl(v4->sin_addr.s_addr) == 0x7f000001u;
+    }
+    if (sa->sa_family == AF_INET6 && salen >= sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)sa;
+        return IN6_IS_ADDR_LOOPBACK(&v6->sin6_addr);
+    }
+    return false;
+}
+
+static bool kv_admin_peer_is_loopback(int fd) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    return getpeername(fd, (struct sockaddr *)&ss, &len) == 0 &&
+           kv_admin_sockaddr_is_loopback((struct sockaddr *)&ss, len);
+}
+
+static bool kv_admin_persist_budget(const char *path, uint64_t budget_mb,
+                                    char *detail, size_t detail_len) {
+    char *copy = xstrdup(path ? path : "");
+    char *slash = strrchr(copy, '/');
+    if (!slash || slash == copy) {
+        snprintf(detail, detail_len, "invalid persistence path");
+        free(copy);
+        return false;
+    }
+    *slash = '\0';
+    const char *parent = copy;
+    if (mkdir(parent, 0700) != 0 && errno != EEXIST) {
+        snprintf(detail, detail_len, "create parent: %s", strerror(errno));
+        free(copy);
+        return false;
+    }
+    struct stat st;
+    if (stat(parent, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        snprintf(detail, detail_len, "persistence parent is not a directory");
+        free(copy);
+        return false;
+    }
+    (void)chmod(parent, 0700);
+    char temp[PATH_MAX];
+    unsigned char nonce[8];
+    if (!random_bytes(nonce, sizeof(nonce))) memset(nonce, 0, sizeof(nonce));
+    int n = snprintf(temp, sizeof(temp), "%s/.kv-space-mb.tmp.%ld.%02x%02x%02x%02x",
+                     parent, (long)getpid(), nonce[0], nonce[1], nonce[2], nonce[3]);
+    if (n < 0 || (size_t)n >= sizeof(temp)) {
+        snprintf(detail, detail_len, "persistence path is too long");
+        free(copy);
+        return false;
+    }
+    int fd = open(temp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        snprintf(detail, detail_len, "create temporary file: %s", strerror(errno));
+        free(copy);
+        return false;
+    }
+    FILE *fp = fdopen(fd, "w");
+    bool ok = fp && fprintf(fp, "%llu\n", (unsigned long long)budget_mb) > 0 &&
+              fflush(fp) == 0 && fsync(fd) == 0;
+    if (fp) {
+        if (fclose(fp) != 0) ok = false;
+    } else close(fd);
+    if (ok && rename(temp, path) != 0) ok = false;
+    if (!ok) {
+        int saved = errno;
+        unlink(temp);
+        snprintf(detail, detail_len, "persist budget: %s", strerror(saved ? saved : EIO));
+        free(copy);
+        return false;
+    }
+    int dfd = open(parent, O_RDONLY);
+    if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
+    free(copy);
+    return true;
+}
+
+static const char *kv_admin_mode_name(kv_admin_mode mode) {
+    return mode == KV_ADMIN_APPLY ? "apply" : mode == KV_ADMIN_PERSIST ? "persist" : "dry-run";
+}
+
+static bool kv_admin_response(int fd, bool cors, int status,
+                              const kv_admin_request *req,
+                              const ds4_kvstore_budget_result *runtime,
+                              bool runtime_attempted, bool persistent_attempted,
+                              bool persistent_ok, const char *code,
+                              const char *message) {
+    buf b = {0};
+    bool ok = status == 200;
+    buf_puts(&b, "{\"ok\":"); buf_puts(&b, ok ? "true" : "false");
+    buf_puts(&b, ",\"mode\":"); json_escape(&b, req ? kv_admin_mode_name(req->mode) : "");
+    buf_puts(&b, ",\"runtime\":{\"attempted\":"); buf_puts(&b, runtime_attempted ? "true" : "false");
+    buf_puts(&b, ",\"ok\":"); buf_puts(&b, runtime_attempted && runtime && runtime->ok ? "true" : "false");
+    buf_puts(&b, ",\"applied\":"); buf_puts(&b, runtime_attempted && runtime && runtime->applied ? "true" : "false");
+    buf_printf(&b, ",\"old_budget_bytes\":%llu,\"new_budget_bytes\":%llu,\"before_bytes\":%llu,\"after_bytes\":%llu,\"before_entries\":%llu,\"after_entries\":%llu,\"eviction_required\":%s}",
+        (unsigned long long)(runtime ? runtime->old_budget_bytes : 0), (unsigned long long)(runtime ? runtime->new_budget_bytes : 0),
+        (unsigned long long)(runtime ? runtime->before_bytes : 0), (unsigned long long)(runtime ? runtime->after_bytes : 0),
+        (unsigned long long)(runtime ? runtime->before_entries : 0), (unsigned long long)(runtime ? runtime->after_entries : 0),
+        runtime && runtime->eviction_required ? "true" : "false");
+    buf_puts(&b, ",\"persistent\":{\"attempted\":"); buf_puts(&b, persistent_attempted ? "true" : "false");
+    buf_puts(&b, ",\"ok\":"); buf_puts(&b, persistent_attempted && persistent_ok ? "true" : "false");
+    buf_puts(&b, ",\"budget_mb\":"); buf_printf(&b, "%llu}", (unsigned long long)(req ? req->budget_mb : 0));
+    if (code) { buf_puts(&b, ",\"error\":{\"code\":"); json_escape(&b, code); buf_puts(&b, ",\"message\":"); json_escape(&b, message ? message : ""); buf_putc(&b, '}'); }
+    buf_puts(&b, "}\n");
+    bool sent = http_response(fd, cors, status, "application/json", b.ptr);
+    buf_free(&b);
+    return sent;
+}
+
+static bool kv_admin_handle_authorized(server *s, int fd, bool cors,
+                                       const char *content_type, const char *body,
+                                       const char *persist_path_override) {
+    kv_admin_request req = {0};
+    kv_admin_error err = {0};
+    if (!content_type || strcasecmp(content_type, "application/json"))
+        return kv_admin_response(fd, cors, 400, NULL, NULL, false, false, false,
+                                 "invalid_content_type", "Content-Type must be application/json");
+    if (!kv_admin_parse_request(body, &req, &err))
+        return kv_admin_response(fd, cors, 400, NULL, NULL, false, false, false,
+                                 err.code, err.message);
+    uint64_t bytes = req.budget_mb * 1024ull * 1024ull;
+    if (req.mode == KV_ADMIN_DRY_RUN || req.mode == KV_ADMIN_APPLY) {
+        ds4_kvstore_budget_result result = server_kv_set_budget(s, bytes,
+                                                                req.mode == KV_ADMIN_APPLY);
+        int status = result.ok ? 200 : 409;
+        return kv_admin_response(fd, cors, status, &req, &result, true, false, false,
+                                 result.ok ? NULL : "kv_cache_disabled",
+                                 result.ok ? NULL : "KV cache is disabled");
+    }
+    char path[PATH_MAX];
+    const char *target = persist_path_override;
+    if (!target) {
+        const char *home = getenv("HOME");
+        if (!home || snprintf(path, sizeof(path), "%s/.ds4/kv-space-mb", home) >= (int)sizeof(path))
+            return kv_admin_response(fd, cors, 500, &req, NULL, false, true, false,
+                                     "persistence_path_error", "cannot resolve persistence path");
+        target = path;
+    }
+    char detail[160] = {0};
+    bool persisted = kv_admin_persist_budget(target, req.budget_mb, detail, sizeof(detail));
+    return kv_admin_response(fd, cors, persisted ? 200 : 500, &req, NULL, false, true,
+                             persisted, persisted ? NULL : "persistence_failed",
+                             persisted ? NULL : detail);
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -11911,6 +12180,18 @@ static void *client_main(void *arg) {
     }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/ds4/status")) {
         send_status_json(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/ds4/admin/kv-cache")) {
+        if (!kv_admin_peer_is_loopback(fd)) {
+            kv_admin_response(fd, s->enable_cors, 403, NULL, NULL, false,
+                              false, false, "loopback_required",
+                              "KV cache administration is restricted to 127.0.0.1 or ::1");
+        } else {
+            kv_admin_handle_authorized(s, fd, s->enable_cors, hr.content_type,
+                                       hr.body, NULL);
+        }
         http_request_free(&hr);
         goto done;
     }
@@ -13125,6 +13406,167 @@ static void test_server_kv_discard_publishes_refreshed_stats(void) {
 	server_kv_destroy(&s);
 	free(path);
 	rmdir(dir);
+}
+
+static void test_kv_admin_parser_is_strict(void) {
+	kv_admin_request req = {0};
+	kv_admin_error err = {0};
+	TEST_ASSERT(kv_admin_parse_request("{\"budget_mb\":8192,\"mode\":\"dry-run\"}",
+	                                   &req, &err));
+	TEST_ASSERT(req.budget_mb == 8192);
+	TEST_ASSERT(req.mode == KV_ADMIN_DRY_RUN);
+	const char *bad[] = {
+		"{}", "{\"budget_mb\":8192}", "{\"mode\":\"apply\"}",
+		"{\"budget_mb\":8192,\"budget_mb\":9000,\"mode\":\"apply\"}",
+		"{\"budget_mb\":8192,\"mode\":\"apply\",\"extra\":1}",
+		"{\"budget_mb\":255,\"mode\":\"apply\"}",
+		"{\"budget_mb\":-1,\"mode\":\"apply\"}",
+		"{\"budget_mb\":1.0,\"mode\":\"apply\"}",
+		"{\"budget_mb\":1e3,\"mode\":\"apply\"}",
+		"{\"budget_mb\":\"8192\",\"mode\":\"apply\"}",
+		"{\"budget_mb\":17592186044416,\"mode\":\"apply\"}",
+		"{\"budget_mb\":8192,\"mode\":\"nope\"}",
+		"{\"budget_mb\":8192,\"mode\":\"persist\"} trailing",
+		"{\"budget_mb\":8192,\"mode\":\"apply\"",
+	};
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		memset(&req, 0, sizeof(req));
+		memset(&err, 0, sizeof(err));
+		TEST_ASSERT(!kv_admin_parse_request(bad[i], &req, &err));
+		TEST_ASSERT(err.code != NULL && err.message != NULL);
+	}
+}
+
+static void test_kv_admin_loopback_sockaddrs(void) {
+	struct sockaddr_in v4 = {0};
+	v4.sin_family = AF_INET;
+	inet_pton(AF_INET, "127.0.0.1", &v4.sin_addr);
+	TEST_ASSERT(kv_admin_sockaddr_is_loopback((struct sockaddr *)&v4, sizeof(v4)));
+	inet_pton(AF_INET, "127.0.0.2", &v4.sin_addr);
+	TEST_ASSERT(!kv_admin_sockaddr_is_loopback((struct sockaddr *)&v4, sizeof(v4)));
+	inet_pton(AF_INET, "192.168.1.4", &v4.sin_addr);
+	TEST_ASSERT(!kv_admin_sockaddr_is_loopback((struct sockaddr *)&v4, sizeof(v4)));
+	struct sockaddr_in6 v6 = {0};
+	v6.sin6_family = AF_INET6;
+	inet_pton(AF_INET6, "::1", &v6.sin6_addr);
+	TEST_ASSERT(kv_admin_sockaddr_is_loopback((struct sockaddr *)&v6, sizeof(v6)));
+	inet_pton(AF_INET6, "fe80::1", &v6.sin6_addr);
+	TEST_ASSERT(!kv_admin_sockaddr_is_loopback((struct sockaddr *)&v6, sizeof(v6)));
+	struct sockaddr_un un = {0};
+	un.sun_family = AF_UNIX;
+	TEST_ASSERT(!kv_admin_sockaddr_is_loopback((struct sockaddr *)&un, sizeof(un)));
+}
+
+static void test_kv_admin_persistence_is_atomic_and_private(void) {
+	char tmpl[] = "/tmp/ds4-kv-admin-persist.XXXXXX";
+	char *root = mkdtemp(tmpl);
+	TEST_ASSERT(root != NULL);
+	if (!root) return;
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/nested/kv-space-mb", root);
+	char detail[160] = {0};
+	TEST_ASSERT(kv_admin_persist_budget(path, 8192, detail, sizeof(detail)));
+	FILE *fp = fopen(path, "rb");
+	TEST_ASSERT(fp != NULL);
+	char textbuf[32] = {0};
+	TEST_ASSERT(fp && fgets(textbuf, sizeof(textbuf), fp) != NULL);
+	if (fp) fclose(fp);
+	TEST_ASSERT(!strcmp(textbuf, "8192\n"));
+	struct stat st;
+	TEST_ASSERT(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600);
+	char parent[PATH_MAX];
+	snprintf(parent, sizeof(parent), "%s/nested", root);
+	TEST_ASSERT(stat(parent, &st) == 0 && (st.st_mode & 0777) == 0700);
+	char rename_fail[PATH_MAX];
+	snprintf(rename_fail, sizeof(rename_fail), "%s/nested/existing-dir", root);
+	TEST_ASSERT(mkdir(rename_fail, 0700) == 0);
+	TEST_ASSERT(!kv_admin_persist_budget(rename_fail, 4096, detail, sizeof(detail)));
+	DIR *nested = opendir(parent);
+	TEST_ASSERT(nested != NULL);
+	if (nested) {
+		struct dirent *de;
+		while ((de = readdir(nested)) != NULL)
+			TEST_ASSERT(strstr(de->d_name, ".tmp.") == NULL);
+		closedir(nested);
+	}
+
+	char impossible[PATH_MAX];
+	snprintf(impossible, sizeof(impossible), "%s/file/kv-space-mb", root);
+	FILE *block = fopen(impossible, "wb");
+	TEST_ASSERT(block == NULL);
+	char blocker[PATH_MAX];
+	snprintf(blocker, sizeof(blocker), "%s/file", root);
+	block = fopen(blocker, "wb");
+	TEST_ASSERT(block != NULL);
+	if (block) fclose(block);
+	TEST_ASSERT(!kv_admin_persist_budget(impossible, 4096, detail, sizeof(detail)));
+	TEST_ASSERT(detail[0] != '\0');
+	DIR *dir = opendir(root);
+	TEST_ASSERT(dir != NULL);
+	if (dir) {
+		struct dirent *de;
+		while ((de = readdir(dir)) != NULL)
+			TEST_ASSERT(strstr(de->d_name, ".tmp.") == NULL);
+		closedir(dir);
+	}
+	unlink(path); rmdir(rename_fail); rmdir(parent); unlink(blocker); rmdir(root);
+}
+
+static char *test_kv_admin_core(server *s, const char *body, const char *path) {
+	int sv[2];
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	TEST_ASSERT(kv_admin_handle_authorized(s, sv[0], false, "application/json",
+	                                       body, path));
+	shutdown(sv[0], SHUT_WR);
+	char *out = read_socket_text(sv[1]);
+	close(sv[0]); close(sv[1]);
+	return out;
+}
+
+static void test_kv_admin_handler_semantics(void) {
+	server s = {0};
+	server_kv_init(&s);
+	char *out = test_kv_admin_core(&s,
+		"{\"budget_mb\":8192,\"mode\":\"dry-run\"}", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 409") != NULL);
+	TEST_ASSERT(strstr(out, "\"mode\":\"dry-run\"") != NULL);
+	TEST_ASSERT(strstr(out, "\"runtime\":{\"attempted\":true,\"ok\":false") != NULL);
+	TEST_ASSERT(strstr(out, "\"persistent\":{\"attempted\":false,\"ok\":false") != NULL);
+	free(out);
+	out = test_kv_admin_core(&s,
+		"{\"budget_mb\":8192,\"mode\":\"apply\"}", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 409") != NULL);
+	TEST_ASSERT(strstr(out, "\"mode\":\"apply\"") != NULL);
+	TEST_ASSERT(strstr(out, "\"runtime\":{\"attempted\":true,\"ok\":false") != NULL);
+	free(out);
+	out = test_kv_admin_core(&s, "{bad", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL);
+	TEST_ASSERT(strstr(out, "\"code\":\"invalid_json\"") != NULL);
+	free(out);
+
+	char tmpl[] = "/tmp/ds4-kv-admin-handler.XXXXXX";
+	char *dir = mkdtemp(tmpl);
+	TEST_ASSERT(dir != NULL);
+	if (dir) {
+		s.kv.enabled = true;
+		s.kv.dir = xstrdup(dir);
+		s.kv.budget_bytes = 1024ull * 1024 * 1024;
+		out = test_kv_admin_core(&s,
+			"{\"budget_mb\":2048,\"mode\":\"apply\"}", NULL);
+		TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+		TEST_ASSERT(strstr(out, "\"applied\":true") != NULL);
+		TEST_ASSERT(server_kv_get_published_stats(&s).budget_bytes == 2048ull * 1024 * 1024);
+		free(out);
+		server_kv_close(&s);
+		rmdir(dir);
+	}
+	out = test_kv_admin_core(&s,
+		"{\"budget_mb\":8192,\"mode\":\"persist\"}", "/dev/null/kv-space-mb");
+	TEST_ASSERT(strstr(out, "HTTP/1.1 500") != NULL);
+	TEST_ASSERT(strstr(out, "\"runtime\":{\"attempted\":false,\"ok\":false") != NULL);
+	TEST_ASSERT(strstr(out, "\"persistent\":{\"attempted\":true,\"ok\":false") != NULL);
+	free(out);
+	server_kv_destroy(&s);
 }
 
 static void test_status_json_reports_cache_totals_and_capacity(void) {
@@ -17109,6 +17551,10 @@ static void ds4_server_unit_tests_run(void) {
 	test_server_kv_wrappers_serialize_stats_and_budget();
 	test_server_kv_lifecycle_and_status_wrapper_seam();
 	test_server_kv_discard_publishes_refreshed_stats();
+	test_kv_admin_parser_is_strict();
+	test_kv_admin_loopback_sockaddrs();
+	test_kv_admin_persistence_is_atomic_and_private();
+	test_kv_admin_handler_semantics();
 	test_kv_cache_budget_changes();
 	test_kv_cache_budget_refreshes_external_files();
 	test_kv_cache_budget_reports_unlink_failure();
