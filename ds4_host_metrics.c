@@ -57,12 +57,16 @@ static bool host_metrics_sample_macos(ds4_host_metrics *out) {
 	size_t swap_size = sizeof(swap);
 	task_basic_info_64_data_t task = {0};
 	mach_msg_type_number_t task_count = TASK_BASIC_INFO_64_COUNT;
+	host_t host;
 
 	if (sysctlbyname("hw.memsize", &total, &total_size, NULL, 0) != 0 || !total)
 		return false;
 	out->memory_total_bytes = total;
-	if (host_page_size(mach_host_self(), &page_size) == KERN_SUCCESS &&
-		host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm,
+	host = mach_host_self();
+	if (host == MACH_PORT_NULL)
+		goto sampled;
+	if (host_page_size(host, &page_size) == KERN_SUCCESS &&
+		host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm,
 			&vm_count) == KERN_SUCCESS) {
 		available_pages = (uint64_t)vm.free_count + (uint64_t)vm.inactive_count;
 		if (available_pages >= (uint64_t)vm.free_count &&
@@ -71,6 +75,8 @@ static bool host_metrics_sample_macos(ds4_host_metrics *out) {
 			out->memory_used_bytes = total - out->memory_available_bytes;
 		}
 	}
+	mach_port_deallocate(mach_task_self(), host);
+sampled:
 	if (sysctlbyname("vm.swapusage", &swap, &swap_size, NULL, 0) == 0) {
 		out->swap_total_bytes = swap.xsu_total;
 		if (swap.xsu_used <= swap.xsu_total)
