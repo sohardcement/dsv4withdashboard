@@ -578,7 +578,7 @@ typedef struct {
 static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
                                            tool_replay_stats *stats);
 static bool tool_memory_has_id(server *s, const char *id);
-static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs);
+static void server_kv_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs);
 
 typedef struct {
     char **v;
@@ -2784,7 +2784,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    kv_cache_restore_tool_memory_for_messages(s, &msgs);
+	server_kv_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
@@ -2993,7 +2993,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         request_free(r);
         return false;
     }
-    kv_cache_restore_tool_memory_for_messages(s, &msgs);
+	server_kv_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     anthropic_prepare_live_continuation(r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -3934,7 +3934,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         request_free(r);
         return false;
     }
-    kv_cache_restore_tool_memory_for_messages(s, &msgs);
+	server_kv_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
@@ -7763,6 +7763,10 @@ struct server {
     ds4_session *session;
     int default_tokens;
     kv_disk_cache kv;
+	pthread_mutex_t kv_mu;
+#ifdef DS4_SERVER_TEST
+	int kv_stats_wrapper_calls;
+#endif
     tool_memory tool_mem;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
@@ -7784,6 +7788,19 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static void server_kv_init(server *s);
+static void server_kv_destroy(server *s);
+static bool server_kv_open(server *s, const char *dir, uint64_t budget_mb,
+                           bool reject_different_quant, kv_cache_options opt);
+static void server_kv_close(server *s);
+static ds4_kvstore_stats server_kv_get_stats(server *s);
+static ds4_kvstore_budget_result server_kv_set_budget(server *s,
+                                                       uint64_t budget_bytes,
+                                                       bool apply);
+static bool server_kv_evict(server *s, const ds4_tokens *live,
+                            uint64_t extra_bytes,
+                            const ds4_kvstore_eviction_context *incoming);
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -8157,7 +8174,9 @@ static bool send_status_json(server *s, int fd) {
         pthread_mutex_lock(&s->status_mu);
         snapshot = s->status;
         pthread_mutex_unlock(&s->status_mu);
-        kv = ds4_kvstore_get_stats(&s->kv);
+		/* Lock ordering by construction: status is copied and released before
+		 * the independent KV snapshot acquires kv_mu. */
+		kv = server_kv_get_stats(s);
     }
     buf b = {0};
     append_status_json(&b, &snapshot, &kv);
@@ -8959,11 +8978,19 @@ static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
 
 
 
-static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs) {
-    if (!s || s->disable_exact_dsml_tool_replay || !s->kv.enabled || !msgs) return;
+static void server_kv_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs) {
+	if (!s || s->disable_exact_dsml_tool_replay || !msgs) return;
+	pthread_mutex_lock(&s->kv_mu);
+	if (!s->kv.enabled) {
+		pthread_mutex_unlock(&s->kv_mu);
+		return;
+	}
     stop_list wanted = {0};
     collect_tool_call_ids(msgs, &wanted);
-    if (wanted.len == 0) return;
+	if (wanted.len == 0) {
+		pthread_mutex_unlock(&s->kv_mu);
+		return;
+	}
     /* Tool replay payloads are stored next to KV checkpoints; keep them model
      * scoped too, since token positions and graph state are not portable across
      * Flash/Pro shapes even when the rendered chat text is identical. */
@@ -8972,6 +8999,7 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
     DIR *d = opendir(s->kv.dir);
     if (!d) {
         id_list_free(&wanted);
+		pthread_mutex_unlock(&s->kv_mu);
         return;
     }
     struct dirent *de;
@@ -8998,6 +9026,7 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
     }
     closedir(d);
     id_list_free(&wanted);
+	pthread_mutex_unlock(&s->kv_mu);
 }
 
 #ifdef DS4_SERVER_TEST
@@ -9022,6 +9051,67 @@ static void kv_cache_log_cb(void *ud, ds4_kvstore_log_type type, const char *msg
     if (type == DS4_KVSTORE_LOG_DEFAULT) stype = DS4_LOG_DEFAULT;
     else if (type == DS4_KVSTORE_LOG_WARNING) stype = DS4_LOG_WARNING;
     server_log(stype, "%s", msg);
+}
+
+static void server_kv_init(server *s) {
+	if (!s) return;
+	pthread_mutex_init(&s->kv_mu, NULL);
+}
+
+static void server_kv_destroy(server *s) {
+	if (!s) return;
+	pthread_mutex_destroy(&s->kv_mu);
+}
+
+static bool server_kv_open(server *s, const char *dir, uint64_t budget_mb,
+                           bool reject_different_quant, kv_cache_options opt) {
+	if (!s) return false;
+	pthread_mutex_lock(&s->kv_mu);
+	bool ok = ds4_kvstore_open(&s->kv, dir, budget_mb,
+	                           reject_different_quant, opt, "ds4-server",
+	                           kv_cache_log_cb, NULL);
+	pthread_mutex_unlock(&s->kv_mu);
+	return ok;
+}
+
+static void server_kv_close(server *s) {
+	if (!s) return;
+	pthread_mutex_lock(&s->kv_mu);
+	ds4_kvstore_close(&s->kv);
+	pthread_mutex_unlock(&s->kv_mu);
+}
+
+static ds4_kvstore_stats server_kv_get_stats(server *s) {
+	ds4_kvstore_stats stats = {0};
+	if (!s) return stats;
+	pthread_mutex_lock(&s->kv_mu);
+	stats = ds4_kvstore_get_stats(&s->kv);
+#ifdef DS4_SERVER_TEST
+	s->kv_stats_wrapper_calls++;
+#endif
+	pthread_mutex_unlock(&s->kv_mu);
+	return stats;
+}
+
+static ds4_kvstore_budget_result server_kv_set_budget(server *s,
+                                                       uint64_t budget_bytes,
+                                                       bool apply) {
+	ds4_kvstore_budget_result result = {0};
+	if (!s) return result;
+	pthread_mutex_lock(&s->kv_mu);
+	result = ds4_kvstore_set_budget(&s->kv, budget_bytes, apply);
+	pthread_mutex_unlock(&s->kv_mu);
+	return result;
+}
+
+static bool server_kv_evict(server *s, const ds4_tokens *live,
+                            uint64_t extra_bytes,
+                            const ds4_kvstore_eviction_context *incoming) {
+	if (!s) return false;
+	pthread_mutex_lock(&s->kv_mu);
+	bool ok = ds4_kvstore_evict(&s->kv, live, extra_bytes, incoming);
+	pthread_mutex_unlock(&s->kv_mu);
+	return ok;
 }
 
 static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb,
@@ -9123,28 +9213,31 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
     };
 }
 
-static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
+static bool server_kv_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
                                             const char *cache_text_key) {
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    return ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->session,
+	pthread_mutex_lock(&s->kv_mu);
+	bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->session,
                                               tokens, store_len, reason,
                                               cache_text_override,
                                               cache_text_ext,
                                               cache_text_key,
-                                              &hooks, err, sizeof(err));
+	                                              &hooks, err, sizeof(err));
+	pthread_mutex_unlock(&s->kv_mu);
+	return ok;
 }
 
-static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
+static bool server_kv_store_live_prefix(server *s, const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
-    return kv_cache_store_live_prefix_text(s, tokens, store_len, reason,
+    return server_kv_store_live_prefix_text(s, tokens, store_len, reason,
                                            NULL, 0, NULL);
 }
 
-static void kv_cache_store_current(server *s, const char *reason) {
+static void server_kv_store_current(server *s, const char *reason) {
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
     if (!tokens) return;
 
@@ -9177,30 +9270,93 @@ static void kv_cache_store_current(server *s, const char *reason) {
      * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
-        kv_cache_store_live_prefix_text(s, tokens, tokens->len, reason,
+        server_kv_store_live_prefix_text(s, tokens, tokens->len, reason,
                                         visible_text, visible_ext, visible_key);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, tokens, tokens->len, reason);
+        server_kv_store_live_prefix(s, tokens, tokens->len, reason);
     }
 }
 
-static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
-    ds4_kvstore_note_store(kc, tokens);
+static void server_kv_note_store(server *s, int tokens) {
+	pthread_mutex_lock(&s->kv_mu);
+	ds4_kvstore_note_store(&s->kv, tokens);
+	pthread_mutex_unlock(&s->kv_mu);
 }
 
+static int server_kv_suppress_continued_store(server *s, int tokens) {
+	pthread_mutex_lock(&s->kv_mu);
+	int old = ds4_kvstore_suppress_continued_store(&s->kv, tokens);
+	pthread_mutex_unlock(&s->kv_mu);
+	return old;
+}
+
+#ifdef DS4_SERVER_TEST
 static int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens) {
-    return ds4_kvstore_suppress_continued_store(kc, tokens);
+	return ds4_kvstore_suppress_continued_store(kc, tokens);
 }
 
 static void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
-                                                  int old_tokens,
-                                                  int suppressed_tokens) {
-    ds4_kvstore_restore_suppressed_continued(kc, old_tokens, suppressed_tokens);
+                                                   int old_tokens,
+                                                   int suppressed_tokens) {
+	ds4_kvstore_restore_suppressed_continued(kc, old_tokens, suppressed_tokens);
+}
+#endif
+
+static void server_kv_restore_suppressed_continued(server *s, int old_tokens,
+                                                   int suppressed_tokens) {
+	pthread_mutex_lock(&s->kv_mu);
+	ds4_kvstore_restore_suppressed_continued(&s->kv, old_tokens,
+	                                        suppressed_tokens);
+	pthread_mutex_unlock(&s->kv_mu);
 }
 
-static void kv_cache_discard_failed_disk_entry(server *s, const char *path) {
+typedef struct {
+	bool enabled;
+	int min_tokens;
+	int cold_max_tokens;
+} server_kv_policy;
+
+static server_kv_policy server_kv_get_policy(server *s) {
+	server_kv_policy policy = {0};
+	if (!s) return policy;
+	pthread_mutex_lock(&s->kv_mu);
+	policy.enabled = s->kv.enabled;
+	policy.min_tokens = s->kv.opt.min_tokens;
+	policy.cold_max_tokens = s->kv.opt.cold_max_tokens;
+	pthread_mutex_unlock(&s->kv_mu);
+	return policy;
+}
+
+static void server_kv_reset_continued_store(server *s) {
+	if (!s) return;
+	pthread_mutex_lock(&s->kv_mu);
+	s->kv.continued_last_store_tokens = 0;
+	pthread_mutex_unlock(&s->kv_mu);
+}
+
+static int server_kv_cold_store_len(server *s, const ds4_tokens *prompt,
+	                                int user_token_id,
+	                                int assistant_token_id) {
+	if (!s || !prompt) return 0;
+	pthread_mutex_lock(&s->kv_mu);
+	int store_len = 0;
+	if (s->kv.enabled && prompt->len >= s->kv.opt.min_tokens &&
+	    s->kv.opt.cold_max_tokens > 0 &&
+	    prompt->len <= s->kv.opt.cold_max_tokens) {
+		int anchor = ds4_kvstore_chat_anchor_pos(&s->kv, prompt,
+		                                           user_token_id,
+		                                           assistant_token_id);
+		store_len = anchor >= s->kv.opt.min_tokens ? anchor :
+			ds4_kvstore_store_len(&s->kv, prompt->len);
+	}
+	pthread_mutex_unlock(&s->kv_mu);
+	return store_len;
+}
+
+static void server_kv_discard_failed_disk_entry(server *s, const char *path) {
     if (!s || !path) return;
+	pthread_mutex_lock(&s->kv_mu);
     if (unlink(path) == 0) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: kv cache discarded reason=prefill-failed file=%s",
@@ -9211,17 +9367,19 @@ static void kv_cache_discard_failed_disk_entry(server *s, const char *path) {
                    path, strerror(errno));
     }
     s->kv.continued_last_store_tokens = 0;
+	pthread_mutex_unlock(&s->kv_mu);
     ds4_session_invalidate(s->session);
 }
 
-static void kv_cache_maybe_store_continued(server *s) {
-    kv_disk_cache *kc = &s->kv;
+static void server_kv_maybe_store_continued(server *s) {
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
     if (!tokens) return;
-    const int target = kv_cache_continued_store_target(kc, tokens->len);
+	pthread_mutex_lock(&s->kv_mu);
+	const int target = ds4_kvstore_continued_store_target(&s->kv, tokens->len);
+	pthread_mutex_unlock(&s->kv_mu);
     if (target == 0) return;
-    if (kv_cache_store_live_prefix(s, tokens, target, "continued")) {
-        kv_cache_note_store(kc, target);
+    if (server_kv_store_live_prefix(s, tokens, target, "continued")) {
+		server_kv_note_store(s, target);
     }
 }
 
@@ -9232,7 +9390,7 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 }
 #endif
 
-static int kv_cache_try_load_text(server *s, const char *prompt_text,
+static int server_kv_try_load_text(server *s, const char *prompt_text,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
@@ -9241,7 +9399,8 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, s->session,
+	pthread_mutex_lock(&s->kv_mu);
+	int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, s->session,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
     if (loaded > 0) {
@@ -9249,14 +9408,15 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
     }
     ds4_kvstore_load_result_free(&lr);
+	pthread_mutex_unlock(&s->kv_mu);
     return loaded;
 }
 
-static int kv_cache_try_load(server *s, const request *req,
+static int server_kv_try_load(server *s, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_text(s, req ? req->prompt_text : NULL,
+    return server_kv_try_load_text(s, req ? req->prompt_text : NULL,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
@@ -10077,7 +10237,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && current > p->cached_tokens) {
-            kv_cache_maybe_store_continued(p->srv);
+			server_kv_maybe_store_continued(p->srv);
         }
         return;
     }
@@ -10121,7 +10281,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && current > p->cached_tokens) {
-        kv_cache_maybe_store_continued(p->srv);
+		server_kv_maybe_store_continued(p->srv);
     }
 }
 
@@ -10296,7 +10456,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
          * a very long conversation from token zero. */
         char *path = NULL;
         ds4_tokens effective = {0};
-        int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
+		int loaded = server_kv_try_load_text(s, rendered.ptr ? rendered.ptr : "",
                                             &effective, &path, NULL, false);
         if (loaded == 0) ds4_session_invalidate(s->session);
 
@@ -10516,15 +10676,16 @@ static void generate_job(server *s, job *j) {
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
     }
-    if (cached == 0) s->kv.continued_last_store_tokens = 0;
-    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
+	if (cached == 0) server_kv_reset_continued_store(s);
+	server_kv_policy kv_policy = server_kv_get_policy(s);
+	if (kv_policy.enabled && cached == 0 && old_pos >= kv_policy.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, "evict");
+		server_kv_store_current(s, "evict");
     }
     if (cached == 0) {
-        disk_cached = kv_cache_try_load(s, &j->req, &effective_prompt,
+		disk_cached = server_kv_try_load(s, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
         if (disk_cached > 0) {
@@ -10617,21 +10778,12 @@ static void generate_job(server *s, job *j) {
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
 
-    int cold_store_len = 0;
-    if (cached == 0 &&
-        s->kv.enabled &&
-        prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0 &&
-        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
-    {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
-    }
+	int cold_store_len = cached == 0 ?
+		server_kv_cold_store_len(s, prompt_for_sync,
+		                         ds4_token_user(s->engine),
+		                         ds4_token_assistant(s->engine)) : 0;
     int suppressed_continued_last = -1;
-    if (cold_store_len >= s->kv.opt.min_tokens) {
+	if (cold_store_len >= kv_policy.min_tokens) {
         /* A cold checkpoint can land exactly on the continued-checkpoint
          * frontier.  The prefill progress callback would then write the same
          * prefix as "continued" while we are intentionally stopping there to
@@ -10639,11 +10791,11 @@ static void generate_job(server *s, job *j) {
          * sync reaches it; if the cold write fails, restore the old schedule so
          * a later continued write can still try. */
         suppressed_continued_last =
-            kv_cache_suppress_continued_store(&s->kv, cold_store_len);
+			server_kv_suppress_continued_store(s, cold_store_len);
     }
 
-    if (s->kv.enabled &&
-        cold_store_len >= s->kv.opt.min_tokens &&
+	if (kv_policy.enabled &&
+		cold_store_len >= kv_policy.min_tokens &&
         cold_store_len < prompt_for_sync->len)
     {
         ds4_tokens prefix = {0};
@@ -10653,21 +10805,21 @@ static void generate_job(server *s, job *j) {
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                                  cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+			server_kv_restore_suppressed_continued(s, suppressed_continued_last,
+			                                      cold_store_len);
+			server_kv_discard_failed_disk_entry(s, disk_cache_path);
             free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             server_status_finish_request(s, "error", err);
             return;
         }
-        if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
-            kv_cache_note_store(&s->kv, cold_store_len);
+		if (server_kv_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
+			server_kv_note_store(s, cold_store_len);
             suppressed_continued_last = -1;
         } else {
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                                  cold_store_len);
+			server_kv_restore_suppressed_continued(s, suppressed_continued_last,
+			                                      cold_store_len);
             suppressed_continued_last = -1;
         }
         ds4_tokens_free(&prefix);
@@ -10677,9 +10829,9 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
         ds4_session_set_display_progress(s->session, NULL, NULL);
-        kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                              cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+		server_kv_restore_suppressed_continued(s, suppressed_continued_last,
+		                                      cold_store_len);
+		server_kv_discard_failed_disk_entry(s, disk_cache_path);
         free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
@@ -10694,7 +10846,7 @@ static void generate_job(server *s, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s);
     ds4_session_set_progress(s->session, NULL, NULL);
     ds4_session_set_display_progress(s->session, NULL, NULL);
-    kv_cache_maybe_store_continued(s);
+	server_kv_maybe_store_continued(s);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -10703,12 +10855,12 @@ static void generate_job(server *s, job *j) {
                req_flags,
                now_sec() - t0);
     if (cold_store_len == prompt_for_sync->len) {
-        if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
-            kv_cache_note_store(&s->kv, cold_store_len);
+		if (server_kv_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
+			server_kv_note_store(s, cold_store_len);
             suppressed_continued_last = -1;
         } else {
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                                  cold_store_len);
+			server_kv_restore_suppressed_continued(s, suppressed_continued_last,
+			                                      cold_store_len);
         }
     }
     char id[96];
@@ -10824,7 +10976,7 @@ decode_again:
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            kv_cache_maybe_store_continued(s);
+			server_kv_maybe_store_continued(s);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -11916,7 +12068,7 @@ static void server_close_resources(server *s) {
         fclose(s->trace);
         s->trace = NULL;
     }
-    kv_cache_close(&s->kv);
+	server_kv_close(s);
     tool_memory_free(&s->tool_mem);
     live_tool_state_free(&s->responses_live);
     live_tool_state_free(&s->anthropic_live);
@@ -11927,6 +12079,7 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
+	server_kv_destroy(s);
     ds4_session_free(s->session);
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
@@ -12193,9 +12346,10 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+	server_kv_init(&s);
     if (cfg.kv_disk_dir) {
-        kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                      cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+		server_kv_open(&s, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
+		               cfg.kv_cache_reject_different_quant, cfg.kv_cache);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -12290,11 +12444,13 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&s.mu);
 
     const ds4_tokens *tokens = ds4_session_tokens(s.session);
-    if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
+	server_kv_policy shutdown_policy = server_kv_get_policy(&s);
+	if (shutdown_policy.enabled && tokens &&
+	    tokens->len >= shutdown_policy.min_tokens) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
                    tokens->len);
-        kv_cache_store_current(&s, "shutdown");
+		server_kv_store_current(&s, "shutdown");
     }
     server_close_resources(&s);
     return 0;
@@ -12310,6 +12466,10 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 }
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
+
+static void test_kv_stub_file(const char *dir, const char *sha,
+                              uint8_t reason, uint32_t tokens, uint32_t hits,
+                              uint64_t last_used, uint64_t payload_bytes);
 
 static void test_tool_schema_order_from_anthropic_schema(void) {
     tool_schema_orders orders = {0};
@@ -12736,6 +12896,7 @@ static void test_dashboard_page_is_served_as_html(void) {
 static void test_status_json_reports_idle_metrics_shape(void) {
     server s;
     memset(&s, 0, sizeof(s));
+	server_kv_init(&s);
     pthread_mutex_init(&s.status_mu, NULL);
     server_status_init(&s);
 
@@ -12759,6 +12920,101 @@ static void test_status_json_reports_idle_metrics_shape(void) {
     }
 
     pthread_mutex_destroy(&s.status_mu);
+	server_kv_destroy(&s);
+}
+
+typedef struct {
+	server *srv;
+	int iterations;
+} test_kv_stats_thread_arg;
+
+static void *test_server_kv_stats_thread(void *ud) {
+	test_kv_stats_thread_arg *arg = ud;
+	for (int i = 0; i < arg->iterations; i++) {
+		ds4_kvstore_stats stats = server_kv_get_stats(arg->srv);
+		TEST_ASSERT(stats.enabled);
+		TEST_ASSERT(stats.budget_bytes == 1000);
+		TEST_ASSERT(stats.used_bytes == 600);
+		TEST_ASSERT(stats.entries == 2);
+	}
+	return NULL;
+}
+
+static void test_server_kv_wrappers_serialize_stats_and_budget(void) {
+	char tmpl[] = "/tmp/ds4-server-kv-lock-test.XXXXXX";
+	char *dir = mkdtemp(tmpl);
+	TEST_ASSERT(dir != NULL);
+	if (!dir) return;
+
+	uint64_t now = (uint64_t)time(NULL);
+	test_kv_stub_file(dir, "1111111111111111111111111111111111111111",
+	                  KV_REASON_UNKNOWN, 512, 0, now, 248);
+	test_kv_stub_file(dir, "2222222222222222222222222222222222222222",
+	                  KV_REASON_UNKNOWN, 1024, 0, now, 248);
+
+	server s = {0};
+	server_kv_init(&s);
+	s.kv.enabled = true;
+	s.kv.dir = xstrdup(dir);
+	s.kv.opt = kv_cache_default_options();
+	s.kv.budget_bytes = 1000;
+	TEST_ASSERT(server_kv_evict(&s, NULL, 0, NULL));
+
+	test_kv_stats_thread_arg arg = {.srv = &s, .iterations = 200};
+	pthread_t thread;
+	TEST_ASSERT(pthread_create(&thread, NULL, test_server_kv_stats_thread, &arg) == 0);
+	for (int i = 0; i < arg.iterations; i++) {
+		ds4_kvstore_budget_result result =
+			server_kv_set_budget(&s, (i & 1) ? 500 : 2000, false);
+		TEST_ASSERT(result.ok);
+		TEST_ASSERT(!result.applied);
+		TEST_ASSERT(result.old_budget_bytes == 1000);
+		TEST_ASSERT(result.before_bytes == 600);
+		TEST_ASSERT(result.after_bytes == 600);
+		TEST_ASSERT(result.before_entries == 2);
+		TEST_ASSERT(result.after_entries == 2);
+	}
+	TEST_ASSERT(pthread_join(thread, NULL) == 0);
+
+	server_kv_close(&s);
+	server_kv_destroy(&s);
+	char *first = path_join(dir, "1111111111111111111111111111111111111111.kv");
+	char *second = path_join(dir, "2222222222222222222222222222222222222222.kv");
+	unlink(first);
+	unlink(second);
+	free(first);
+	free(second);
+	rmdir(dir);
+}
+
+static void test_server_kv_lifecycle_and_status_wrapper_seam(void) {
+	char tmpl[] = "/tmp/ds4-server-kv-lifecycle-test.XXXXXX";
+	char *dir = mkdtemp(tmpl);
+	TEST_ASSERT(dir != NULL);
+	if (!dir) return;
+
+	server s = {0};
+	server_kv_init(&s);
+	TEST_ASSERT(server_kv_open(&s, dir, 1, false,
+	                           kv_cache_default_options()));
+	TEST_ASSERT(server_kv_get_stats(&s).enabled);
+
+	int before = s.kv_stats_wrapper_calls;
+	pthread_mutex_init(&s.status_mu, NULL);
+	server_status_init(&s);
+	int sv[2];
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	if (sv[0] >= 0 && sv[1] >= 0) {
+		TEST_ASSERT(send_status_json(&s, sv[0]));
+		TEST_ASSERT(s.kv_stats_wrapper_calls == before + 1);
+		close(sv[0]);
+		close(sv[1]);
+	}
+	pthread_mutex_destroy(&s.status_mu);
+	server_kv_close(&s);
+	TEST_ASSERT(!server_kv_get_stats(&s).enabled);
+	server_kv_destroy(&s);
+	rmdir(dir);
 }
 
 static void test_status_json_reports_cache_totals_and_capacity(void) {
@@ -15715,6 +15971,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     }
 
     server dst = {0};
+	server_kv_init(&dst);
     pthread_mutex_init(&dst.tool_mu, NULL);
     dst.kv.enabled = true;
     dst.kv.dir = xstrdup(dir);
@@ -15730,7 +15987,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     tool_calls_push(&a.calls, tc);
     chat_msgs_push(&msgs, a);
 
-    kv_cache_restore_tool_memory_for_messages(&dst, &msgs);
+	server_kv_restore_tool_memory_for_messages(&dst, &msgs);
     tool_replay_stats stats = {0};
     tool_memory_attach_to_messages(&dst, &msgs, &stats);
     TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
@@ -15742,11 +15999,12 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
 
     free(prompt);
     chat_msgs_free(&msgs);
-    kv_cache_close(&dst.kv);
+	server_kv_close(&dst);
     tool_memory_free(&src.tool_mem);
     tool_memory_free(&dst.tool_mem);
     pthread_mutex_destroy(&src.tool_mu);
     pthread_mutex_destroy(&dst.tool_mu);
+	server_kv_destroy(&dst);
     unlink(path);
     free(path);
     rmdir(dir);
@@ -16738,6 +16996,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_stats_snapshot();
+	test_server_kv_wrappers_serialize_stats_and_budget();
+	test_server_kv_lifecycle_and_status_wrapper_seam();
 	test_kv_cache_budget_changes();
 	test_kv_cache_budget_refreshes_external_files();
 	test_kv_cache_budget_reports_unlink_failure();
