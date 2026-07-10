@@ -33,6 +33,28 @@ Important defaults:
 --trace /tmp/ds4-trace.jsonl
 ```
 
+## Dashboard Capacity Controls
+
+The dashboard reports current rates separately from process-lifetime token and
+request rates. Process counters reset whenever `ds4-server` restarts. Disk usage
+is the actual byte total of files currently present in the KV index; the live
+token and context figures describe model state and must not be interpreted as
+estimated RAM bytes.
+
+The capacity control accepts a minimum of 256 MiB. Applying a smaller capacity
+updates the limit and immediately evicts indexed disk entries until actual disk
+usage is within that limit. The saved value is written to
+`${DS4_KV_SPACE_FILE:-$HOME/.ds4/kv-space-mb}` and is used by the next
+`start-server.sh` invocation. An explicit valid `DS4_KV_SPACE` takes precedence
+over that saved value, and the profile default is used when neither supplies a
+valid capacity. An explicitly empty or otherwise invalid `DS4_KV_SPACE` emits a
+warning, then falls back to the saved value or profile default.
+
+Treat the capacity endpoint as a local administrative interface: keep the
+dashboard bound to loopback and require `X-DS4-Admin` on updates. The header is
+an intent check, not authentication; exposing the endpoint to untrusted hosts or
+browser origins is unsafe.
+
 ## Model Choice
 
 The default `ds4flash.gguf` symlink should remain explicit in `start-server.sh`

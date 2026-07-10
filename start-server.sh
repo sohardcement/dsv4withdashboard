@@ -77,12 +77,46 @@ case "$PROFILE" in
         ;;
 esac
 
+KV_SPACE_FILE=${DS4_KV_SPACE_FILE:-$HOME/.ds4/kv-space-mb}
+SAVED_KV_SPACE=
+kv_space_valid() {
+    local value=$1 normalized
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    normalized=${value#"${value%%[!0]*}"}
+    [ -n "$normalized" ] || normalized=0
+    [ ${#normalized} -lt 19 ] || {
+        [ ${#normalized} -eq 19 ] && [[ "$normalized" < 9223372036854775808 ]]
+    } || return 1
+    [ "$normalized" -ge 256 ]
+}
+
+if [ -e "$KV_SPACE_FILE" ]; then
+    if [ -r "$KV_SPACE_FILE" ]; then
+        SAVED_KV_SPACE=$(<"$KV_SPACE_FILE")
+        if ! kv_space_valid "$SAVED_KV_SPACE"; then
+            echo "ignoring invalid KV capacity in $KV_SPACE_FILE (expected integer >= 256 MiB)" >&2
+            SAVED_KV_SPACE=
+        fi
+    else
+        echo "ignoring unreadable KV capacity file: $KV_SPACE_FILE" >&2
+    fi
+fi
+
 MODEL=${DS4_MODEL-$DEFAULT_MODEL}
 CTX=${DS4_CTX:-$DEFAULT_CTX}
 THREADS=${DS4_THREADS:-$DEFAULT_THREADS}
 PREFILL_CHUNK=${DS4_PREFILL_CHUNK:-$DEFAULT_PREFILL_CHUNK}
 KV_DIR=${DS4_KV_DIR:-$DEFAULT_KV_DIR}
-KV_SPACE=${DS4_KV_SPACE:-$DEFAULT_KV_SPACE}
+if [ -n "${DS4_KV_SPACE+x}" ]; then
+    if kv_space_valid "$DS4_KV_SPACE"; then
+        KV_SPACE=$DS4_KV_SPACE
+    else
+        echo "ignoring invalid DS4_KV_SPACE (expected integer >= 256 MiB)" >&2
+        KV_SPACE=${SAVED_KV_SPACE:-$DEFAULT_KV_SPACE}
+    fi
+else
+    KV_SPACE=${SAVED_KV_SPACE:-$DEFAULT_KV_SPACE}
+fi
 COLD_MAX=${DS4_COLD_MAX:-$DEFAULT_COLD_MAX}
 CONTINUED_INTERVAL=${DS4_CONTINUED_INTERVAL:-$DEFAULT_CONTINUED_INTERVAL}
 CACHE_MIN=${DS4_CACHE_MIN:-$DEFAULT_CACHE_MIN}
@@ -188,6 +222,7 @@ if [ -n "$CONFIG_SNAPSHOT" ]; then
         printf 'trace=%s\n' "$TRACE"
         printf 'server_log=%s\n' "$SERVER_LOG"
         printf 'kv_dir=%s\n' "$KV_DIR"
+        printf 'kv_space_file=%s\n' "$KV_SPACE_FILE"
         printf 'kv_space_mb=%s\n' "$KV_SPACE"
         printf 'cache_min=%s\n' "$CACHE_MIN"
         printf 'cold_max=%s\n' "$COLD_MAX"
