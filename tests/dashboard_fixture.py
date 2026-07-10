@@ -9,7 +9,7 @@ page = "".join(ast.literal_eval(s) for s in re.findall(r'"(?:[^"\\]|\\.)*"', blo
 base_kv = {"enabled": True, "budget_bytes": 64 << 30, "used_bytes": 46 << 30, "entries": 116, "revision": "1"}
 state = {"kv": dict(base_kv), "admin": [], "status_active": 0, "status_max": 0,
          "status_delay_ms": 0, "admin_delay_ms": 0, "forbidden": False,
-         "malformed": False, "mismatch_once": False, "mismatch_makes_eviction": False}
+         "malformed": False, "mismatch_once": False, "mismatch_remaining": 0, "mismatch_makes_eviction": False}
 lock = threading.Lock()
 
 def status():
@@ -38,7 +38,7 @@ class Handler(BaseHTTPRequestHandler):
         body=json.loads(self.rfile.read(int(self.headers.get("Content-Length","0"))))
         if self.path == "/fixture/config":
             if body.get("reset"):
-                state.update(kv=dict(base_kv), admin=[], status_active=0, status_max=0, status_delay_ms=0, admin_delay_ms=0, forbidden=False, malformed=False, mismatch_once=False, mismatch_makes_eviction=False)
+                state.update(kv=dict(base_kv), admin=[], status_active=0, status_max=0, status_delay_ms=0, admin_delay_ms=0, forbidden=False, malformed=False, mismatch_once=False, mismatch_remaining=0, mismatch_makes_eviction=False)
             for key,value in body.items():
                 if key != "reset": state[key]=value
             self.json(state); return
@@ -49,8 +49,8 @@ class Handler(BaseHTTPRequestHandler):
             raw=b"{"; self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length","1"); self.end_headers(); self.wfile.write(raw); return
         mb=body["budget_mb"]; new=mb<<20; kv=state["kv"]
         runtime={"attempted":True,"ok":True,"applied":body["mode"]=="apply","old_budget_bytes":kv["budget_bytes"],"new_budget_bytes":new,"before_bytes":kv["used_bytes"],"after_bytes":min(kv["used_bytes"],new),"before_entries":kv["entries"],"after_entries":88 if new<kv["used_bytes"] else kv["entries"],"eviction_required":new<kv["used_bytes"],"revision":kv["revision"]}
-        if body["mode"]=="apply" and state["mismatch_once"]:
-            state["mismatch_once"]=False; kv["revision"]=str(int(kv["revision"])+1)
+        if body["mode"]=="apply" and (state["mismatch_once"] or state["mismatch_remaining"]>0):
+            state["mismatch_once"]=False; state["mismatch_remaining"]=max(0,state["mismatch_remaining"]-1); kv["revision"]=str(int(kv["revision"])+1)
             if state["mismatch_makes_eviction"]: kv["used_bytes"]=90<<30; kv["entries"]=150
             self.json({"ok":False,"runtime":runtime,"current_revision":kv["revision"],"error":{"code":"kv_state_changed","message":"state changed"}},409); return
         if body["mode"]=="apply":

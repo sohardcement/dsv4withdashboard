@@ -32,5 +32,7 @@ async page => {
   s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run,apply,dry-run,apply','revision mismatch did not retry transaction');
   assert(s.admin[1].revision==='1'&&s.admin[3].revision==='2','apply did not echo dry-run revisions');
   const confirms=await page.evaluate(()=>window.__confirms); assert(confirms.length===1&&confirms[0].includes('90.0 GB'),'retry did not reconfirm changed eviction pressure');
+  await cfg({reset:true,mismatch_remaining:2}); await page.reload(); await wait(100); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvApplyNow').click(); await wait(300);
+  assert((await page.locator('#adminNotice').innerText()).includes('kept changing'),'revision retry cap was not actionable');
   return {ok:true,double_apply:'one transaction',apply_save:'one transaction',poll_max_active:1,revision_sequence:s.admin.map(x=>x.mode),confirm_count:confirms.length};
 }
