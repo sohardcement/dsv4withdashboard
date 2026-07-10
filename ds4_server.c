@@ -7787,6 +7787,10 @@ struct server {
     server_status status;
 	pthread_mutex_t call_history_mu;
 	ds4_call_history call_history;
+	pthread_mutex_t host_metrics_mu;
+	pthread_cond_t host_metrics_cv;
+	ds4_host_metrics host_metrics;
+	bool host_sampling;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -7819,6 +7823,52 @@ static bool server_kv_evict(server *s, const ds4_tokens *live,
                             const ds4_kvstore_eviction_context *incoming);
 #endif
 static ds4_kvstore_stats server_kv_get_published_stats(server *s);
+
+static void server_host_metrics_init(server *s) {
+	if (!s) return;
+	pthread_mutex_init(&s->host_metrics_mu, NULL);
+	pthread_cond_init(&s->host_metrics_cv, NULL);
+}
+
+static void server_host_metrics_destroy(server *s) {
+	if (!s) return;
+	pthread_cond_destroy(&s->host_metrics_cv);
+	pthread_mutex_destroy(&s->host_metrics_mu);
+}
+
+/* This deliberately samples without any server lock held.  Callers only hold
+ * host_metrics_mu briefly to read or publish the cached result. */
+static ds4_host_metrics server_host_get_snapshot(server *s) {
+	ds4_host_metrics snapshot = {0};
+	if (!s) return snapshot;
+	const double now = now_sec();
+	pthread_mutex_lock(&s->host_metrics_mu);
+	while (s->host_sampling) {
+		pthread_cond_wait(&s->host_metrics_cv, &s->host_metrics_mu);
+	}
+	if (s->host_metrics.sampled_at > 0.0 &&
+		now - s->host_metrics.sampled_at < 1.0) {
+		snapshot = s->host_metrics;
+		pthread_mutex_unlock(&s->host_metrics_mu);
+		return snapshot;
+	}
+	s->host_sampling = true;
+	pthread_mutex_unlock(&s->host_metrics_mu);
+
+	ds4_host_metrics sampled = {0};
+	if (!ds4_host_metrics_sample(&sampled)) {
+		sampled.pressure = DS4_HOST_PRESSURE_UNKNOWN;
+		sampled.sampled_at = now_sec();
+	}
+
+	pthread_mutex_lock(&s->host_metrics_mu);
+	s->host_metrics = sampled;
+	s->host_sampling = false;
+	snapshot = sampled;
+	pthread_cond_broadcast(&s->host_metrics_cv);
+	pthread_mutex_unlock(&s->host_metrics_mu);
+	return snapshot;
+}
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -8160,8 +8210,50 @@ static bool send_dashboard_page(int fd, bool enable_cors) {
                          dashboard_html);
 }
 
+static const char *call_status_name(ds4_call_status status) {
+	return status == DS4_CALL_ACTIVE ? "active" :
+		status == DS4_CALL_COMPLETED ? "completed" : "failed";
+}
+
+static void append_status_calls_json(buf *b, const ds4_call_history_snapshot *calls,
+							 size_t capacity, uint64_t active_request_id) {
+	buf_printf(b, ",\"calls\":{\"capacity\":%llu,\"active_request_id\":\"%llu\",\"records\":[",
+		(unsigned long long)capacity, (unsigned long long)active_request_id);
+	for (size_t i = 0; calls && i < calls->records_len; i++) {
+		const ds4_call_record *r = &calls->records[i];
+		if (i) buf_putc(b, ',');
+		buf_puts(b, "{\"request_id\":");
+		buf_printf(b, "\"%llu\",\"caller\":", (unsigned long long)r->request_id);
+		json_escape(b, r->caller); buf_puts(b, ",\"api\":"); json_escape(b, r->api);
+		buf_puts(b, ",\"kind\":"); json_escape(b, r->kind);
+		buf_printf(b, ",\"stream\":%s,\"tools\":%s,\"status\":",
+			r->stream ? "true" : "false", r->has_tools ? "true" : "false");
+		json_escape(b, call_status_name(r->status));
+		buf_printf(b, ",\"started_at\":%.3f,\"finished_at\":%.3f,\"prompt_tokens\":%d,\"cached_tokens\":%d,\"cache_write_tokens\":%d,\"output_tokens\":%d,\"cache_source\":",
+			r->started_at, r->finished_at, r->prompt_tokens, r->cached_tokens,
+			r->cache_write_tokens, r->output_tokens);
+		json_escape(b, r->cache_source); buf_puts(b, ",\"finish\":");
+		json_escape(b, r->finish); buf_puts(b, ",\"error\":");
+		json_escape(b, r->error); buf_putc(b, '}');
+	}
+	buf_puts(b, "],\"callers\":[");
+	for (size_t i = 0; calls && i < calls->callers_len; i++) {
+		const ds4_call_caller *c = &calls->callers[i];
+		if (i) buf_putc(b, ',');
+		buf_puts(b, "{\"caller\":"); json_escape(b, c->caller);
+		buf_printf(b, ",\"calls\":%llu,\"failed\":%llu,\"prompt_tokens\":%llu,\"cached_tokens\":%llu,\"average_duration_sec\":%.3f,\"recent_at\":%.3f}",
+			(unsigned long long)c->calls, (unsigned long long)c->failures,
+			(unsigned long long)c->prompt_tokens, (unsigned long long)c->cached_tokens,
+			c->average_terminal_duration, c->recent_activity);
+	}
+	buf_puts(b, "]}");
+}
+
 static void append_status_json(buf *b, const server_status *st,
-                               const ds4_kvstore_stats *kv) {
+                               const ds4_kvstore_stats *kv,
+							 const ds4_host_metrics *host,
+							 const ds4_call_history_snapshot *calls,
+							 size_t calls_capacity, uint64_t active_request_id) {
     double prefill_percent = st->prefill_total > 0 ?
         100.0 * (double)st->prefill_current / (double)st->prefill_total : 100.0;
     if (prefill_percent < 0.0) prefill_percent = 0.0;
@@ -8236,12 +8328,33 @@ static void append_status_json(buf *b, const server_status *st,
                (unsigned long long)(kv_enabled ? kv->used_bytes : 0),
                (unsigned long long)(kv_enabled ? kv->entries : 0),
                (unsigned long long)(kv ? kv->revision : 0));
+	int limit = st->ctx_size > 0 ? st->ctx_size : 0;
+	int current = st->session_pos > 0 ? st->session_pos : 0;
+	int remaining = limit > current ? limit - current : 0;
+	double utilization = limit > 0 ? (double)current / (double)limit : 0.0;
+	buf_printf(b, ",\"context\":{\"current_tokens\":%d,\"limit_tokens\":%d,\"remaining\":%d,\"utilization\":%.3f}",
+		current, limit, remaining, utilization);
+	const ds4_host_metrics unavailable = { .pressure = DS4_HOST_PRESSURE_UNKNOWN };
+	if (!host) host = &unavailable;
+	buf_printf(b, ",\"host\":{\"available\":%s,\"memory_total_bytes\":%llu,\"memory_used_bytes\":%llu,\"memory_available_bytes\":%llu,\"memory_pressure\":",
+		host->available ? "true" : "false", (unsigned long long)host->memory_total_bytes,
+		(unsigned long long)host->memory_used_bytes, (unsigned long long)host->memory_available_bytes);
+	json_escape(b, ds4_host_pressure_name(host->pressure));
+	buf_printf(b, ",\"swap_total_bytes\":%llu,\"swap_used_bytes\":%llu,\"process_rss_bytes\":%llu,\"sampled_at\":%.3f}",
+		(unsigned long long)host->swap_total_bytes, (unsigned long long)host->swap_used_bytes,
+		(unsigned long long)host->process_rss_bytes, host->sampled_at);
+	append_status_calls_json(b, calls, calls_capacity, active_request_id);
     buf_puts(b, "}\n");
 }
 
 static bool send_status_json(server *s, int fd) {
     server_status snapshot;
     ds4_kvstore_stats kv = {0};
+	ds4_host_metrics host = {0};
+	ds4_call_history_snapshot calls = {0};
+	size_t calls_capacity = 0;
+	uint64_t active_request_id = 0;
+	double active_started_at = -1.0;
     memset(&snapshot, 0, sizeof(snapshot));
     if (s) {
         pthread_mutex_lock(&s->status_mu);
@@ -8250,12 +8363,24 @@ static bool send_status_json(server *s, int fd) {
 		/* KV stats are the last completed wrapper snapshot.  Active disk I/O
 		 * may make them briefly stale, but status never waits for kv_mu. */
 		kv = server_kv_get_published_stats(s);
+		host = server_host_get_snapshot(s);
+		pthread_mutex_lock(&s->call_history_mu);
+		calls = ds4_call_history_snapshot_take(&s->call_history, now_sec());
+		calls_capacity = s->call_history.capacity;
+		for (size_t i = 0; i < s->call_history.len; i++)
+			if (s->call_history.records[i].status == DS4_CALL_ACTIVE &&
+				s->call_history.records[i].started_at >= active_started_at) {
+				active_started_at = s->call_history.records[i].started_at;
+				active_request_id = s->call_history.records[i].request_id;
+			}
+		pthread_mutex_unlock(&s->call_history_mu);
     }
     buf b = {0};
-    append_status_json(&b, &snapshot, &kv);
+	append_status_json(&b, &snapshot, &kv, &host, &calls, calls_capacity, active_request_id);
     bool ok = http_response(fd, s ? s->enable_cors : false, 200,
                             "application/json", b.ptr);
     buf_free(&b);
+	ds4_call_history_snapshot_free(&calls);
     return ok;
 }
 
@@ -12820,6 +12945,7 @@ static void server_close_resources(server *s) {
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->status_mu);
 	pthread_mutex_destroy(&s->call_history_mu);
+	server_host_metrics_destroy(s);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
@@ -13107,6 +13233,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.status_mu, NULL);
 	pthread_mutex_init(&s.call_history_mu, NULL);
 	ds4_call_history_init(&s.call_history);
+	server_host_metrics_init(&s);
     pthread_mutex_init(&s.trace_mu, NULL);
     server_status_init(&s);
     server_status_set_model(&s, cfg.engine.backend);
@@ -13677,6 +13804,9 @@ static void test_status_json_reports_idle_metrics_shape(void) {
     memset(&s, 0, sizeof(s));
 	server_kv_init(&s);
     pthread_mutex_init(&s.status_mu, NULL);
+	server_host_metrics_init(&s);
+	pthread_mutex_init(&s.call_history_mu, NULL);
+	ds4_call_history_init(&s.call_history);
     server_status_init(&s);
 
     int sv[2];
@@ -13699,6 +13829,9 @@ static void test_status_json_reports_idle_metrics_shape(void) {
     }
 
     pthread_mutex_destroy(&s.status_mu);
+	ds4_call_history_free(&s.call_history);
+	pthread_mutex_destroy(&s.call_history_mu);
+	server_host_metrics_destroy(&s);
 	server_kv_destroy(&s);
 }
 
@@ -13739,6 +13872,9 @@ static void test_server_kv_wrappers_serialize_stats_and_budget(void) {
 	s.kv.budget_bytes = 1000;
 	TEST_ASSERT(server_kv_evict(&s, NULL, 0, NULL));
 	pthread_mutex_init(&s.status_mu, NULL);
+	server_host_metrics_init(&s);
+	pthread_mutex_init(&s.call_history_mu, NULL);
+	ds4_call_history_init(&s.call_history);
 	server_status_init(&s);
 	int sv[2];
 	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -13778,6 +13914,9 @@ static void test_server_kv_wrappers_serialize_stats_and_budget(void) {
 	TEST_ASSERT(pthread_join(thread, NULL) == 0);
 
 	pthread_mutex_destroy(&s.status_mu);
+	ds4_call_history_free(&s.call_history);
+	pthread_mutex_destroy(&s.call_history_mu);
+	server_host_metrics_destroy(&s);
 	server_kv_close(&s);
 	server_kv_destroy(&s);
 	char *first = path_join(dir, "1111111111111111111111111111111111111111.kv");
@@ -13803,6 +13942,9 @@ static void test_server_kv_lifecycle_and_status_wrapper_seam(void) {
 
 	int before = s.kv_stats_wrapper_calls;
 	pthread_mutex_init(&s.status_mu, NULL);
+	server_host_metrics_init(&s);
+	pthread_mutex_init(&s.call_history_mu, NULL);
+	ds4_call_history_init(&s.call_history);
 	server_status_init(&s);
 	int sv[2];
 	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -13813,6 +13955,9 @@ static void test_server_kv_lifecycle_and_status_wrapper_seam(void) {
 		close(sv[1]);
 	}
 	pthread_mutex_destroy(&s.status_mu);
+	ds4_call_history_free(&s.call_history);
+	pthread_mutex_destroy(&s.call_history_mu);
+	server_host_metrics_destroy(&s);
 	server_kv_close(&s);
 	TEST_ASSERT(!server_kv_get_published_stats(&s).enabled);
 	server_kv_destroy(&s);
@@ -14512,22 +14657,49 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
         .entries = 3,
 		.revision = 7,
     };
+    ds4_host_metrics host = {
+        .available = true, .memory_total_bytes = 1000,
+        .memory_used_bytes = 600, .memory_available_bytes = 400,
+        .swap_total_bytes = 200, .swap_used_bytes = 25,
+        .process_rss_bytes = 50, .pressure = DS4_HOST_PRESSURE_WARNING,
+        .sampled_at = 123.5,
+    };
+    ds4_call_history history = {0};
+    ds4_call_history_init(&history);
+    uint64_t request_id = ds4_call_history_begin(&history, "status-client",
+        "openai", "chat", true, true, 120.0);
+    ds4_call_history_update_prompt(&history, request_id, 10, 4, "disk");
+    ds4_call_history_finish(&history, request_id, DS4_CALL_COMPLETED,
+        122.0, 3, "disk", "stop", NULL);
+    ds4_call_history_snapshot calls = ds4_call_history_snapshot_take(&history, 123.5);
+    s.status.ctx_size = 100;
+    s.status.session_pos = 40;
     buf b = {0};
-    append_status_json(&b, &s.status, &kv);
+    append_status_json(&b, &s.status, &kv, &host, &calls, history.capacity, 0);
     TEST_ASSERT(strstr(b.ptr, "\"cache\":{\"prompt_tokens\":150,"
                               "\"cached_tokens\":75,\"prompt_requests\":2,"
                               "\"hit_requests\":1}") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"kv_cache\":{\"enabled\":true,"
                               "\"budget_bytes\":4096,\"used_bytes\":1024,"
                               "\"entries\":3,\"revision\":\"7\"}") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"context\":{\"current_tokens\":40,\"limit_tokens\":100,\"remaining\":60,\"utilization\":0.400") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"host\":{\"available\":true,\"memory_total_bytes\":1000,\"memory_used_bytes\":600,\"memory_available_bytes\":400,\"memory_pressure\":\"warning\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"calls\":{\"capacity\":200,\"active_request_id\":\"0\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"request_id\":\"1\",\"caller\":\"status-client\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"callers\":[{\"caller\":\"status-client\",\"calls\":1,\"failed\":0") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "X-Forwarded") == NULL);
     buf_free(&b);
 
     b = (buf){0};
-    append_status_json(&b, &s.status, NULL);
+    s.status.session_pos = 120;
+    append_status_json(&b, &s.status, NULL, &host, &calls, history.capacity, 0);
     TEST_ASSERT(strstr(b.ptr, "\"kv_cache\":{\"enabled\":false,"
                               "\"budget_bytes\":0,\"used_bytes\":0,"
                               "\"entries\":0,\"revision\":\"0\"}") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"context\":{\"current_tokens\":120,\"limit_tokens\":100,\"remaining\":0,\"utilization\":1.200") != NULL);
     buf_free(&b);
+    ds4_call_history_snapshot_free(&calls);
+    ds4_call_history_free(&history);
 
     server_status_begin_request(&s, &r, -2, -1, "none");
     TEST_ASSERT(s.status.prompt_tokens == 0);
