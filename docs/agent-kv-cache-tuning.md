@@ -45,10 +45,13 @@ The capacity control accepts a minimum of 256 MiB. Applying a smaller capacity
 updates the limit and immediately evicts indexed disk entries until actual disk
 usage is within that limit. The saved value is written to
 `${DS4_KV_SPACE_FILE:-$HOME/.ds4/kv-space-mb}` and is used by the next
-`start-server.sh` invocation. An explicit valid `DS4_KV_SPACE` takes precedence
-over that saved value, and the profile default is used when neither supplies a
-valid capacity. An explicitly empty or otherwise invalid `DS4_KV_SPACE` emits a
-warning, then falls back to the saved value or profile default.
+`start-server.sh` invocation. Both the launcher and a directly started
+`ds4-server` honor the nonempty `DS4_KV_SPACE_FILE` override; an empty override
+uses `$HOME/.ds4/kv-space-mb`. Paths containing CR or LF are rejected. An
+explicit valid `DS4_KV_SPACE` takes precedence over the saved value, and the
+profile default is used when neither supplies a valid capacity. An explicitly
+empty or otherwise invalid `DS4_KV_SPACE` emits a warning, then falls back to the
+saved value or profile default.
 
 Treat the capacity endpoint as a local administrative interface: keep the
 dashboard bound to loopback and require `X-DS4-Admin` on updates. The header is

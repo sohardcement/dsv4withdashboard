@@ -12263,6 +12263,23 @@ static bool kv_admin_response(int fd, bool cors, int status,
                                 persistent_ok, code, message);
 }
 
+static const char *kv_admin_persistence_path(const char *override, char *path,
+                                             size_t path_len) {
+	const char *target = override;
+	if (!target) {
+		const char *configured = getenv("DS4_KV_SPACE_FILE");
+		if (configured && configured[0]) target = configured;
+	}
+	if (!target) {
+		const char *home = getenv("HOME");
+		if (!home) return NULL;
+		int n = snprintf(path, path_len, "%s/.ds4/kv-space-mb", home);
+		if (n < 0 || (size_t)n >= path_len) return NULL;
+		target = path;
+	}
+	return strpbrk(target, "\r\n") ? NULL : target;
+}
+
 static bool kv_admin_handle_authorized(server *s, int fd, bool cors,
                                        const char *content_type, const char *body,
                                        size_t body_len,
@@ -12285,14 +12302,11 @@ static bool kv_admin_handle_authorized(server *s, int fd, bool cors,
                                  result.ok ? NULL : "KV cache is disabled");
     }
     char path[PATH_MAX];
-    const char *target = persist_path_override;
-    if (!target) {
-        const char *home = getenv("HOME");
-        if (!home || snprintf(path, sizeof(path), "%s/.ds4/kv-space-mb", home) >= (int)sizeof(path))
-            return kv_admin_response(fd, cors, 500, &req, NULL, false, true, false,
-                                     "persistence_path_error", "cannot resolve persistence path");
-        target = path;
-    }
+    const char *target = kv_admin_persistence_path(persist_path_override,
+                                                   path, sizeof(path));
+    if (!target)
+        return kv_admin_response(fd, cors, 500, &req, NULL, false, true, false,
+                                 "persistence_path_error", "cannot resolve persistence path");
     char detail[160] = {0};
     kv_admin_persist_result persisted =
         kv_admin_persist_budget_ex(target, req.budget_mb, detail, sizeof(detail));
@@ -13760,6 +13774,70 @@ static void test_kv_admin_persistence_is_atomic_and_private(void) {
 		closedir(dir);
 	}
 	unlink(path); rmdir(rename_fail); rmdir(parent); unlink(blocker); rmdir(root);
+}
+
+static char *test_kv_admin_core(server *s, const char *body, const char *path);
+
+static void test_kv_admin_persistence_path_env(void) {
+	const char *old_home_value = getenv("HOME");
+	const char *old_path_value = getenv("DS4_KV_SPACE_FILE");
+	char *old_home = old_home_value ? xstrdup(old_home_value) : NULL;
+	char *old_path = old_path_value ? xstrdup(old_path_value) : NULL;
+	char tmpl[] = "/tmp/ds4-kv-admin-env.XXXXXX";
+	char *root = mkdtemp(tmpl);
+	TEST_ASSERT(root != NULL);
+	if (!root) goto restore_env;
+	char custom[PATH_MAX], default_path[PATH_MAX], bad[PATH_MAX];
+	snprintf(custom, sizeof(custom), "%s/custom/kv-space-mb", root);
+	snprintf(default_path, sizeof(default_path), "%s/.ds4/kv-space-mb", root);
+	TEST_ASSERT(setenv("HOME", root, 1) == 0);
+	TEST_ASSERT(setenv("DS4_KV_SPACE_FILE", custom, 1) == 0);
+	server s = {0};
+	server_kv_init(&s);
+	char *out = test_kv_admin_core(&s,
+		"{\"budget_mb\":8192,\"mode\":\"persist\"}", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+	TEST_ASSERT(access(custom, F_OK) == 0);
+	TEST_ASSERT(access(default_path, F_OK) != 0);
+	free(out);
+
+	const char bad_chars[] = {'\r', '\n'};
+	for (size_t i = 0; i < sizeof(bad_chars); i++) {
+		snprintf(bad, sizeof(bad), "%s/bad%ckv-space-mb", root, bad_chars[i]);
+		TEST_ASSERT(setenv("DS4_KV_SPACE_FILE", bad, 1) == 0);
+		out = test_kv_admin_core(&s,
+			"{\"budget_mb\":4096,\"mode\":\"persist\"}", NULL);
+		TEST_ASSERT(strstr(out, "HTTP/1.1 500") != NULL);
+		TEST_ASSERT(strstr(out, "persistence_path_error") != NULL);
+		TEST_ASSERT(access(bad, F_OK) != 0);
+		free(out);
+	}
+
+	TEST_ASSERT(unsetenv("DS4_KV_SPACE_FILE") == 0);
+	out = test_kv_admin_core(&s,
+		"{\"budget_mb\":4096,\"mode\":\"persist\"}", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+	TEST_ASSERT(access(default_path, F_OK) == 0);
+	free(out);
+	TEST_ASSERT(unlink(default_path) == 0);
+	TEST_ASSERT(setenv("DS4_KV_SPACE_FILE", "", 1) == 0);
+	out = test_kv_admin_core(&s,
+		"{\"budget_mb\":4096,\"mode\":\"persist\"}", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+	TEST_ASSERT(access(default_path, F_OK) == 0);
+	free(out);
+	server_kv_destroy(&s);
+	unlink(custom); unlink(default_path);
+	char custom_dir[PATH_MAX], default_dir[PATH_MAX];
+	snprintf(custom_dir, sizeof(custom_dir), "%s/custom", root);
+	snprintf(default_dir, sizeof(default_dir), "%s/.ds4", root);
+	rmdir(custom_dir); rmdir(default_dir); rmdir(root);
+
+restore_env:
+	if (old_home) { TEST_ASSERT(setenv("HOME", old_home, 1) == 0); free(old_home); }
+	else TEST_ASSERT(unsetenv("HOME") == 0);
+	if (old_path) { TEST_ASSERT(setenv("DS4_KV_SPACE_FILE", old_path, 1) == 0); free(old_path); }
+	else TEST_ASSERT(unsetenv("DS4_KV_SPACE_FILE") == 0);
 }
 
 static char *test_kv_admin_core(server *s, const char *body, const char *path) {
@@ -18173,6 +18251,7 @@ static void ds4_server_unit_tests_run(void) {
 	test_kv_admin_parser_is_strict();
 	test_kv_admin_loopback_sockaddrs();
 	test_kv_admin_persistence_is_atomic_and_private();
+	test_kv_admin_persistence_path_env();
 	test_kv_admin_handler_semantics();
 	test_kv_admin_actual_route_and_peer_auth();
 	test_kv_admin_rejects_headers_before_body();

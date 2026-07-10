@@ -78,6 +78,12 @@ case "$PROFILE" in
 esac
 
 KV_SPACE_FILE=${DS4_KV_SPACE_FILE:-$HOME/.ds4/kv-space-mb}
+case "$KV_SPACE_FILE" in
+    *$'\r'*|*$'\n'*)
+        echo "invalid DS4_KV_SPACE_FILE: path must not contain CR or LF" >&2
+        exit 2
+        ;;
+esac
 SAVED_KV_SPACE=
 kv_space_valid() {
     local value=$1 normalized
