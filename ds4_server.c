@@ -15790,6 +15790,115 @@ static void test_kv_cache_budget_changes(void) {
 	rmdir(dir);
 }
 
+static void test_kv_cache_budget_refreshes_external_files(void) {
+	char tmpl[] = "/tmp/ds4-kv-budget-refresh-test.XXXXXX";
+	char *dir = mkdtemp(tmpl);
+	TEST_ASSERT(dir != NULL);
+	if (!dir) return;
+
+	const char *first_sha = "1111111111111111111111111111111111111111";
+	const char *second_sha = "2222222222222222222222222222222222222222";
+	uint64_t now = (uint64_t)time(NULL);
+	test_kv_stub_file(dir, first_sha, KV_REASON_UNKNOWN, 512, 0, now, 248);
+
+	ds4_kvstore kc = {0};
+	kc.enabled = true;
+	kc.dir = xstrdup(dir);
+	kc.opt = kv_cache_default_options();
+	kc.budget_bytes = 1000;
+	ds4_kvstore_evict(&kc, NULL, 0, NULL);
+	TEST_ASSERT(kc.len == 1);
+
+	/* Simulate another process adding a valid cache entry after our index. */
+	test_kv_stub_file(dir, second_sha, KV_REASON_UNKNOWN, 1024, 0, now, 248);
+	ds4_kvstore_budget_result dry = ds4_kvstore_set_budget(&kc, 500, false);
+	TEST_ASSERT(dry.ok);
+	TEST_ASSERT(!dry.applied);
+	TEST_ASSERT(dry.eviction_required);
+	TEST_ASSERT(dry.before_bytes == 600);
+	TEST_ASSERT(dry.after_bytes == 600);
+	TEST_ASSERT(dry.before_entries == 2);
+	TEST_ASSERT(dry.after_entries == 2);
+	TEST_ASSERT(kc.budget_bytes == 1000);
+
+	ds4_kvstore_budget_result apply = ds4_kvstore_set_budget(&kc, 500, true);
+	TEST_ASSERT(apply.ok);
+	TEST_ASSERT(apply.applied);
+	TEST_ASSERT(apply.before_bytes == 600);
+	TEST_ASSERT(apply.after_bytes <= 500);
+	TEST_ASSERT(apply.before_entries == 2);
+	TEST_ASSERT(apply.after_entries < apply.before_entries);
+	TEST_ASSERT(kc.budget_bytes == 500);
+
+	ds4_kvstore_close(&kc);
+	char first_name[44], second_name[44];
+	snprintf(first_name, sizeof(first_name), "%.40s.kv", first_sha);
+	snprintf(second_name, sizeof(second_name), "%.40s.kv", second_sha);
+	char *first_path = path_join(dir, first_name);
+	char *second_path = path_join(dir, second_name);
+	unlink(first_path);
+	unlink(second_path);
+	free(first_path);
+	free(second_path);
+	rmdir(dir);
+}
+
+static int test_kv_cache_unlink_fails(const char *path) {
+	(void)path;
+	errno = EACCES;
+	return -1;
+}
+
+static void test_kv_cache_budget_reports_unlink_failure(void) {
+	char tmpl[] = "/tmp/ds4-kv-budget-unlink-test.XXXXXX";
+	char *dir = mkdtemp(tmpl);
+	TEST_ASSERT(dir != NULL);
+	if (!dir) return;
+
+	const char *first_sha = "1111111111111111111111111111111111111111";
+	const char *second_sha = "2222222222222222222222222222222222222222";
+	uint64_t now = (uint64_t)time(NULL);
+	test_kv_stub_file(dir, first_sha, KV_REASON_UNKNOWN, 512, 0, now, 248);
+	test_kv_stub_file(dir, second_sha, KV_REASON_UNKNOWN, 1024, 0, now, 248);
+
+	ds4_kvstore kc = {0};
+	kc.enabled = true;
+	kc.dir = xstrdup(dir);
+	kc.opt = kv_cache_default_options();
+	kc.budget_bytes = 1000;
+	kc.unlink_file = test_kv_cache_unlink_fails;
+	ds4_kvstore_evict(&kc, NULL, 0, NULL);
+	TEST_ASSERT(kc.len == 2);
+
+	ds4_kvstore_budget_result result = ds4_kvstore_set_budget(&kc, 500, true);
+	TEST_ASSERT(!result.ok);
+	TEST_ASSERT(!result.applied);
+	TEST_ASSERT(result.eviction_required);
+	TEST_ASSERT(result.old_budget_bytes == 1000);
+	TEST_ASSERT(result.new_budget_bytes == 500);
+	TEST_ASSERT(result.before_bytes == 600);
+	TEST_ASSERT(result.after_bytes == 600);
+	TEST_ASSERT(result.before_entries == 2);
+	TEST_ASSERT(result.after_entries == 2);
+	TEST_ASSERT(kc.budget_bytes == 1000);
+	TEST_ASSERT(kc.len == 2);
+
+	kc.unlink_file = NULL;
+	ds4_kvstore_close(&kc);
+	char first_name[44], second_name[44];
+	snprintf(first_name, sizeof(first_name), "%.40s.kv", first_sha);
+	snprintf(second_name, sizeof(second_name), "%.40s.kv", second_sha);
+	char *first_path = path_join(dir, first_name);
+	char *second_path = path_join(dir, second_name);
+	TEST_ASSERT(access(first_path, F_OK) == 0);
+	TEST_ASSERT(access(second_path, F_OK) == 0);
+	unlink(first_path);
+	unlink(second_path);
+	free(first_path);
+	free(second_path);
+	rmdir(dir);
+}
+
 static void test_kv_cache_eviction_prefers_anchor_reason(void) {
     char tmpl[] = "/tmp/ds4-kv-anchor-reason-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -16435,6 +16544,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_stats_snapshot();
 	test_kv_cache_budget_changes();
+	test_kv_cache_budget_refreshes_external_files();
+	test_kv_cache_budget_reports_unlink_failure();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();

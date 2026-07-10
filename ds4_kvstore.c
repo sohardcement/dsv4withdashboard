@@ -400,10 +400,13 @@ ds4_kvstore_stats ds4_kvstore_get_stats(const ds4_kvstore *kc) {
 	return stats;
 }
 
+static void kv_cache_refresh(ds4_kvstore *kc);
+
 ds4_kvstore_budget_result ds4_kvstore_set_budget(ds4_kvstore *kc,
 												 uint64_t budget_bytes,
 												 bool apply) {
 	ds4_kvstore_budget_result result = {0};
+	if (kc && kc->enabled) kv_cache_refresh(kc);
 	ds4_kvstore_stats before = ds4_kvstore_get_stats(kc);
 	result.old_budget_bytes = before.budget_bytes;
 	result.new_budget_bytes = budget_bytes;
@@ -418,12 +421,16 @@ ds4_kvstore_budget_result ds4_kvstore_set_budget(ds4_kvstore *kc,
 	if (!apply) return result;
 
 	kc->budget_bytes = budget_bytes;
-	if (result.eviction_required)
-		ds4_kvstore_evict(kc, NULL, 0, NULL);
+	bool enforced = ds4_kvstore_evict(kc, NULL, 0, NULL);
 	ds4_kvstore_stats after = ds4_kvstore_get_stats(kc);
-	result.applied = true;
 	result.after_bytes = after.used_bytes;
 	result.after_entries = after.entries;
+	if (!enforced) {
+		kc->budget_bytes = result.old_budget_bytes;
+		result.ok = false;
+		return result;
+	}
+	result.applied = true;
 	return result;
 }
 
@@ -603,11 +610,11 @@ double ds4_kvstore_entry_eviction_score(
     return score;
 }
 
-void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
+bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming) {
-    if (!kc->enabled || kc->budget_bytes == 0) return;
-    if (extra_bytes > kc->budget_bytes) return;
+    if (!kc->enabled || kc->budget_bytes == 0) return true;
+    if (extra_bytes > kc->budget_bytes) return false;
     kv_cache_refresh(kc);
     const uint64_t now = (uint64_t)time(NULL);
     uint64_t total = 0;
@@ -631,7 +638,8 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
             }
         }
         ds4_kvstore_entry e = kc->entry[victim];
-        if (unlink(e.path) == 0) {
+        int unlink_result = kc->unlink_file ? kc->unlink_file(e.path) : unlink(e.path);
+        if (unlink_result == 0) {
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                     "%s: kv cache evicted reason=disk-cache-full tokens=%u hits=%u size=%.2f MiB file=%s",
                     kv_log_name(kc),
@@ -642,13 +650,15 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
             if (total >= e.file_size) total -= e.file_size;
             else total = 0;
         } else {
-            total = 0;
+			kv_cache_refresh(kc);
+			return false;
         }
         ds4_kvstore_entry_free(&e);
         memmove(kc->entry + victim, kc->entry + victim + 1,
                 (size_t)(kc->len - victim - 1) * sizeof(kc->entry[0]));
         kc->len--;
     }
+	return total <= target;
 }
 
 bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
