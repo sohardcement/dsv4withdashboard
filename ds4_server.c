@@ -11727,24 +11727,32 @@ typedef struct {
     char origin[256];
     char sec_fetch_site[64];
     size_t content_length;
+    char *prebody;
+    size_t prebody_len;
     char *body;
     size_t body_len;
 } http_request;
 
 static void http_request_free(http_request *r) {
+    free(r->prebody);
     free(r->body);
     memset(r, 0, sizeof(*r));
 }
 
 static ssize_t header_end(const char *p, size_t n) {
-    /* Headers are read one byte at a time so the body remains untouched until
-     * route authorization.  The first terminator can therefore only be the
-     * current suffix; checking it directly avoids quadratic rescanning. */
-    if (n >= 4 && p[n - 4] == '\r' && p[n - 3] == '\n' &&
-        p[n - 2] == '\r' && p[n - 1] == '\n') return (ssize_t)n;
-    if (n >= 2 && p[n - 2] == '\n' && p[n - 1] == '\n') return (ssize_t)n;
+    for (size_t i = 3; i < n; i++)
+        if (p[i - 3] == '\r' && p[i - 2] == '\n' &&
+            p[i - 1] == '\r' && p[i] == '\n') return (ssize_t)(i + 1);
+    for (size_t i = 1; i < n; i++)
+        if (p[i - 1] == '\n' && p[i] == '\n') return (ssize_t)(i + 1);
     return -1;
 }
+
+#ifdef DS4_SERVER_TEST
+static int http_header_test_recv_calls;
+static int http_header_test_notify_fd = -1;
+static size_t http_header_test_prebody_bytes;
+#endif
 
 static bool parse_content_length_ascii(const char *s, size_t len, size_t *out) {
     if (!len) return false;
@@ -11792,11 +11800,16 @@ static bool read_http_headers(int fd, http_request *r) {
     const size_t max_header = 64 * 1024;
 
     while (hend < 0 && b.len < max_header) {
-        char byte;
-        ssize_t n = recv(fd, &byte, 1, 0);
+        char chunk[4096];
+        size_t want = max_header - b.len;
+        if (want > sizeof(chunk)) want = sizeof(chunk);
+        ssize_t n = recv(fd, chunk, want, 0);
+#ifdef DS4_SERVER_TEST
+        http_header_test_recv_calls++;
+#endif
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) goto fail;
-        buf_append(&b, &byte, 1);
+        buf_append(&b, chunk, (size_t)n);
         hend = header_end(b.ptr, b.len);
     }
     if (hend < 0) goto fail;
@@ -11855,6 +11868,19 @@ static bool read_http_headers(int fd, http_request *r) {
         }
         if (p < end) p++;
     }
+    r->prebody_len = b.len - (size_t)hend;
+    if (r->prebody_len > r->content_length) goto fail;
+    if (r->prebody_len) {
+        r->prebody = xmalloc(r->prebody_len);
+        memcpy(r->prebody, b.ptr + hend, r->prebody_len);
+    }
+#ifdef DS4_SERVER_TEST
+    http_header_test_prebody_bytes = r->prebody_len;
+    if (http_header_test_notify_fd >= 0) {
+        char byte = 1;
+        (void)write(http_header_test_notify_fd, &byte, 1);
+    }
+#endif
     r->body = NULL;
     r->body_len = 0;
     buf_free(&b);
@@ -11867,6 +11893,13 @@ fail:
 static bool read_http_body(int fd, http_request *r, size_t max_body) {
     if (r->content_length > max_body) return false;
     r->body = xrealloc(r->body, r->content_length + 1);
+    if (r->prebody_len) {
+        memcpy(r->body, r->prebody, r->prebody_len);
+        r->body_len = r->prebody_len;
+        free(r->prebody);
+        r->prebody = NULL;
+        r->prebody_len = 0;
+    }
     while (r->body_len < r->content_length) {
         ssize_t n = recv(fd, r->body + r->body_len,
                          r->content_length - r->body_len, 0);
@@ -13813,6 +13846,42 @@ static char *test_kv_admin_headers_only_route(server *s, const char *headers,
 	return out;
 }
 
+static char *test_kv_admin_split_prebody_route(server *s, const char *first,
+	                                           const char *remainder) {
+	int listener = socket(AF_INET, SOCK_STREAM, 0);
+	TEST_ASSERT(listener >= 0);
+	struct sockaddr_in addr = {0};
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	TEST_ASSERT(bind(listener, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+	TEST_ASSERT(listen(listener, 1) == 0);
+	socklen_t len = sizeof(addr);
+	TEST_ASSERT(getsockname(listener, (struct sockaddr *)&addr, &len) == 0);
+	int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+	TEST_ASSERT(connect(client_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+	int server_fd = accept(listener, NULL, NULL);
+	close(listener);
+	int notify_pipe[2];
+	TEST_ASSERT(pipe(notify_pipe) == 0);
+	http_header_test_notify_fd = notify_pipe[1];
+	TEST_ASSERT(send_all(client_fd, first, strlen(first)));
+	client_arg *ca = xmalloc(sizeof(*ca));
+	ca->srv = s; ca->fd = server_fd;
+	s->clients = 1;
+	pthread_t thread;
+	TEST_ASSERT(pthread_create(&thread, NULL, client_main, ca) == 0);
+	char notified;
+	TEST_ASSERT(read(notify_pipe[0], &notified, 1) == 1);
+	TEST_ASSERT(http_header_test_prebody_bytes > 0);
+	TEST_ASSERT(send_all(client_fd, remainder, strlen(remainder)));
+	shutdown(client_fd, SHUT_WR);
+	char *out = read_socket_text(client_fd);
+	TEST_ASSERT(pthread_join(thread, NULL) == 0);
+	http_header_test_notify_fd = -1;
+	close(notify_pipe[0]); close(notify_pipe[1]); close(client_fd);
+	return out;
+}
+
 static void test_kv_admin_actual_route_and_peer_auth(void) {
 	server s = {0};
 	pthread_mutex_init(&s.mu, NULL);
@@ -13831,9 +13900,31 @@ static void test_kv_admin_actual_route_and_peer_auth(void) {
 	snprintf(request_text, sizeof(request_text),
 		"POST /ds4/admin/kv-cache HTTP/1.1\r\nX-DS4-Admin: 1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
 		strlen(body), body);
+	http_header_test_recv_calls = 0;
 	char *out = test_kv_admin_route(&s, request_text, true);
 	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+	TEST_ASSERT(http_header_test_recv_calls < 10);
 	TEST_ASSERT(s.kv.budget_bytes == 2048ull * 1024 * 1024);
+	free(out);
+
+	const char *split_body = "{\"budget_mb\":3072,\"mode\":\"apply\"}";
+	char split_first[512];
+	snprintf(split_first, sizeof(split_first),
+		"POST /ds4/admin/kv-cache HTTP/1.1\r\nX-DS4-Admin: 1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n{\"budget_mb\":",
+		strlen(split_body));
+	out = test_kv_admin_split_prebody_route(&s, split_first,
+		"3072,\"mode\":\"apply\"}");
+	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+	TEST_ASSERT(s.kv.budget_bytes == 3072ull * 1024 * 1024);
+	free(out);
+
+	s.kv.budget_bytes = 1024ull * 1024 * 1024;
+	out = test_kv_admin_route(&s,
+		"POST /ds4/admin/kv-cache HTTP/1.1\r\nX-DS4-Admin: 1\r\nContent-Type: application/json\r\nContent-Length: 1\r\n\r\n{}",
+		true);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL);
+	TEST_ASSERT(strstr(out, "bad HTTP request") != NULL);
+	TEST_ASSERT(s.kv.budget_bytes == 1024ull * 1024 * 1024);
 	free(out);
 
 	s.kv.budget_bytes = 1024ull * 1024 * 1024;
@@ -13980,6 +14071,40 @@ static void test_http_content_length_framing_is_strict(void) {
 	pthread_mutex_destroy(&s.status_mu);
 	pthread_cond_destroy(&s.clients_cv);
 	pthread_mutex_destroy(&s.mu);
+}
+
+static void test_http_chunked_headers_preserve_normal_route_body(void) {
+	int sv[2];
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	const char *body = "normal request body";
+	char request_text[256];
+	snprintf(request_text, sizeof(request_text),
+		"POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+		strlen(body), body);
+	TEST_ASSERT(send_all(sv[0], request_text, strlen(request_text)));
+	http_request hr = {0};
+	TEST_ASSERT(read_http_headers(sv[1], &hr));
+	TEST_ASSERT(!strcmp(hr.path, "/v1/chat/completions"));
+	TEST_ASSERT(read_http_body(sv[1], &hr, 64 * 1024 * 1024));
+	TEST_ASSERT(hr.body_len == strlen(body) && !memcmp(hr.body, body, hr.body_len));
+	http_request_free(&hr);
+	close(sv[0]); close(sv[1]);
+
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	const char *partial = "split ";
+	const char *remainder = "body";
+	snprintf(request_text, sizeof(request_text),
+		"POST /v1/responses HTTP/1.1\r\nContent-Length: %zu\r\n\r\n%s",
+		strlen(partial) + strlen(remainder), partial);
+	TEST_ASSERT(send_all(sv[0], request_text, strlen(request_text)));
+	hr = (http_request){0};
+	TEST_ASSERT(read_http_headers(sv[1], &hr));
+	TEST_ASSERT(hr.prebody_len == strlen(partial));
+	TEST_ASSERT(send_all(sv[0], remainder, strlen(remainder)));
+	TEST_ASSERT(read_http_body(sv[1], &hr, 64 * 1024 * 1024));
+	TEST_ASSERT(!strcmp(hr.body, "split body"));
+	http_request_free(&hr);
+	close(sv[0]); close(sv[1]);
 }
 
 static void test_kv_admin_handler_semantics(void) {
@@ -18052,6 +18177,7 @@ static void ds4_server_unit_tests_run(void) {
 	test_kv_admin_actual_route_and_peer_auth();
 	test_kv_admin_rejects_headers_before_body();
 	test_http_content_length_framing_is_strict();
+	test_http_chunked_headers_preserve_normal_route_body();
 	test_kv_cache_budget_changes();
 	test_kv_cache_budget_refreshes_external_files();
 	test_kv_cache_budget_reports_unlink_failure();
