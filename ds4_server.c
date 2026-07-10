@@ -7727,6 +7727,10 @@ typedef struct {
     uint64_t total_requests;
     uint64_t completed_requests;
     uint64_t failed_requests;
+    uint64_t total_prompt_tokens;
+    uint64_t total_cached_tokens;
+    uint64_t prompt_requests;
+    uint64_t cache_hit_requests;
     int prompt_tokens;
     int cached_tokens;
     int cache_write_tokens;
@@ -7811,6 +7815,14 @@ static void status_copy(char *dst, size_t len, const char *src) {
     snprintf(dst, len, "%s", src ? src : "");
 }
 
+static uint64_t status_sat_add(uint64_t value, uint64_t add) {
+    return UINT64_MAX - value < add ? UINT64_MAX : value + add;
+}
+
+static uint64_t status_sat_inc(uint64_t value) {
+    return status_sat_add(value, 1);
+}
+
 static void server_status_init(server *s) {
     if (!s) return;
     pthread_mutex_lock(&s->status_mu);
@@ -7865,6 +7877,9 @@ static void server_status_begin_request(server *s, const request *r,
                                         int prompt_tokens,
                                         const char *cache_source) {
     if (!s || !r) return;
+    if (prompt_tokens < 0) prompt_tokens = 0;
+    if (cached_tokens < 0) cached_tokens = 0;
+    if (cached_tokens > prompt_tokens) cached_tokens = prompt_tokens;
     const double now = now_sec();
     pthread_mutex_lock(&s->status_mu);
     s->status.active = true;
@@ -7879,7 +7894,18 @@ static void server_status_begin_request(server *s, const request *r,
                 cache_source ? cache_source : "none");
     s->status.finish[0] = '\0';
     s->status.last_error[0] = '\0';
-    s->status.total_requests++;
+    s->status.total_requests = status_sat_inc(s->status.total_requests);
+    s->status.total_prompt_tokens = status_sat_add(
+        s->status.total_prompt_tokens, (uint64_t)prompt_tokens);
+    s->status.total_cached_tokens = status_sat_add(
+        s->status.total_cached_tokens, (uint64_t)cached_tokens);
+    if (prompt_tokens > 0) {
+        s->status.prompt_requests = status_sat_inc(s->status.prompt_requests);
+        if (cached_tokens > 0) {
+            s->status.cache_hit_requests = status_sat_inc(
+                s->status.cache_hit_requests);
+        }
+    }
     s->status.prompt_tokens = prompt_tokens;
     s->status.cached_tokens = cached_tokens;
     s->status.cache_write_tokens = prompt_tokens > cached_tokens ?
@@ -8044,7 +8070,8 @@ static bool send_dashboard_page(int fd, bool enable_cors) {
                          dashboard_html);
 }
 
-static void append_status_json(buf *b, const server_status *st) {
+static void append_status_json(buf *b, const server_status *st,
+                               const ds4_kvstore_stats *kv) {
     double prefill_percent = st->prefill_total > 0 ?
         100.0 * (double)st->prefill_current / (double)st->prefill_total : 100.0;
     if (prefill_percent < 0.0) prefill_percent = 0.0;
@@ -8101,23 +8128,38 @@ static void append_status_json(buf *b, const server_status *st) {
                st->decode_avg_tps,
                st->decode_chunk_tps,
                st->decode_elapsed_s);
-    buf_printf(b, ",\"totals\":{\"requests\":%llu,\"completed\":%llu,\"failed\":%llu}",
+    buf_printf(b, ",\"totals\":{\"requests\":%llu,\"completed\":%llu,\"failed\":%llu,"
+                  "\"cache\":{\"prompt_tokens\":%llu,\"cached_tokens\":%llu,"
+                  "\"prompt_requests\":%llu,\"hit_requests\":%llu}}",
                (unsigned long long)st->total_requests,
                (unsigned long long)st->completed_requests,
-               (unsigned long long)st->failed_requests);
+               (unsigned long long)st->failed_requests,
+               (unsigned long long)st->total_prompt_tokens,
+               (unsigned long long)st->total_cached_tokens,
+               (unsigned long long)st->prompt_requests,
+               (unsigned long long)st->cache_hit_requests);
+    const bool kv_enabled = kv && kv->enabled;
+    buf_printf(b, ",\"kv_cache\":{\"enabled\":%s,\"budget_bytes\":%llu,"
+                  "\"used_bytes\":%llu,\"entries\":%llu}",
+               kv_enabled ? "true" : "false",
+               (unsigned long long)(kv_enabled ? kv->budget_bytes : 0),
+               (unsigned long long)(kv_enabled ? kv->used_bytes : 0),
+               (unsigned long long)(kv_enabled ? kv->entries : 0));
     buf_puts(b, "}\n");
 }
 
 static bool send_status_json(server *s, int fd) {
     server_status snapshot;
+    ds4_kvstore_stats kv = {0};
     memset(&snapshot, 0, sizeof(snapshot));
     if (s) {
         pthread_mutex_lock(&s->status_mu);
         snapshot = s->status;
         pthread_mutex_unlock(&s->status_mu);
+        kv = ds4_kvstore_get_stats(&s->kv);
     }
     buf b = {0};
-    append_status_json(&b, &snapshot);
+    append_status_json(&b, &snapshot, &kv);
     bool ok = http_response(fd, s ? s->enable_cors : false, 200,
                             "application/json", b.ptr);
     buf_free(&b);
@@ -12718,6 +12760,57 @@ static void test_status_json_reports_idle_metrics_shape(void) {
     pthread_mutex_destroy(&s.status_mu);
 }
 
+static void test_status_json_reports_cache_totals_and_capacity(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.status_mu, NULL);
+    server_status_init(&s);
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    server_status_begin_request(&s, &r, 75, 100, "disk");
+    server_status_begin_request(&s, &r, 0, 50, "none");
+    server_status_begin_request(&s, &r, 0, 0, "none");
+
+    ds4_kvstore_stats kv = {
+        .enabled = true,
+        .budget_bytes = 4096,
+        .used_bytes = 1024,
+        .entries = 3,
+    };
+    buf b = {0};
+    append_status_json(&b, &s.status, &kv);
+    TEST_ASSERT(strstr(b.ptr, "\"cache\":{\"prompt_tokens\":150,"
+                              "\"cached_tokens\":75,\"prompt_requests\":2,"
+                              "\"hit_requests\":1}") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"kv_cache\":{\"enabled\":true,"
+                              "\"budget_bytes\":4096,\"used_bytes\":1024,"
+                              "\"entries\":3}") != NULL);
+    buf_free(&b);
+
+    b = (buf){0};
+    append_status_json(&b, &s.status, NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"kv_cache\":{\"enabled\":false,"
+                              "\"budget_bytes\":0,\"used_bytes\":0,"
+                              "\"entries\":0}") != NULL);
+    buf_free(&b);
+
+    s.status.total_requests = UINT64_MAX;
+    s.status.total_prompt_tokens = UINT64_MAX - 5;
+    s.status.total_cached_tokens = UINT64_MAX - 2;
+    s.status.prompt_requests = UINT64_MAX;
+    s.status.cache_hit_requests = UINT64_MAX;
+    server_status_begin_request(&s, &r, 8, 10, "disk");
+    TEST_ASSERT(s.status.total_requests == UINT64_MAX);
+    TEST_ASSERT(s.status.total_prompt_tokens == UINT64_MAX);
+    TEST_ASSERT(s.status.total_cached_tokens == UINT64_MAX);
+    TEST_ASSERT(s.status.prompt_requests == UINT64_MAX);
+    TEST_ASSERT(s.status.cache_hit_requests == UINT64_MAX);
+
+    request_free(&r);
+    pthread_mutex_destroy(&s.status_mu);
+}
+
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -16552,6 +16645,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_sse_headers();
     test_dashboard_page_is_served_as_html();
     test_status_json_reports_idle_metrics_shape();
+    test_status_json_reports_cache_totals_and_capacity();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
