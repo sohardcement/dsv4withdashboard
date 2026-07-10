@@ -7856,6 +7856,23 @@ static void server_call_history_finish(server *s, const job *j,
 	pthread_mutex_unlock(&s->call_history_mu);
 }
 
+static void server_finalize_call_history(server *s, const job *j,
+								 int output_tokens, const char *cache_source,
+								 const char **final_finish, char *err,
+								 size_t errlen, bool response_ok) {
+	if (!response_ok) {
+		if (final_finish) *final_finish = "error";
+		if (err && errlen && !err[0])
+			snprintf(err, errlen, "client stream write failed");
+	}
+	const char *finish = final_finish && *final_finish ? *final_finish : "error";
+	server_call_history_finish(s, j,
+			(!strcmp(finish, "error") || !strcmp(finish, "cancelled")) ?
+				DS4_CALL_FAILED : DS4_CALL_COMPLETED,
+			output_tokens, cache_source, finish,
+			!strcmp(finish, "error") && err && err[0] ? err : "");
+}
+
 static const char *request_api_name(api_style api) {
     switch (api) {
     case API_OPENAI: return "openai";
@@ -11626,8 +11643,8 @@ decode_again:
         thinking_live_clear(s);
     }
 
+    bool response_ok = true;
     if (j->req.stream) {
-        bool response_ok = true;
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
@@ -11687,6 +11704,8 @@ decode_again:
                        &parsed_calls, final_finish,
                        prompt_tokens, completion);
     }
+	server_finalize_call_history(s, j, completion, cache_source, &final_finish,
+							 err, sizeof(err), response_ok);
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),
@@ -11746,11 +11765,6 @@ decode_again:
                        now_sec() - t0);
         }
     }
-    server_call_history_finish(s, j,
-                               (!strcmp(final_finish, "error") || !strcmp(final_finish, "cancelled")) ?
-                                   DS4_CALL_FAILED : DS4_CALL_COMPLETED,
-                               completion, cache_source, final_finish,
-                               !strcmp(final_finish, "error") && err[0] ? err : "");
     server_status_finish_request(s, final_finish,
                                  !strcmp(final_finish, "error") && err[0] ? err : "");
     free(parsed_content);
@@ -14615,6 +14629,43 @@ static void test_call_history_snapshot_owns_copies(void) {
     ds4_call_history_snapshot_free(NULL);
     ds4_call_history_free(&h);
     ds4_call_history_free(NULL);
+}
+
+static void test_call_history_marks_final_stream_write_failure(void) {
+	server s = {0};
+	pthread_mutex_init(&s.call_history_mu, NULL);
+	ds4_call_history_init(&s.call_history);
+	job j = {0};
+	j.call_request_id = ds4_call_history_begin(&s.call_history, "caller",
+		"openai", "chat", true, false, 1.0);
+	ds4_call_history_update_prompt(&s.call_history, j.call_request_id, 5, 2, "memory-token");
+	const char *final_finish = "stop";
+	char err[160] = {0};
+	int sv[2];
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	request r;
+	request_init(&r, REQ_CHAT, 16);
+	r.model = xstrdup("test");
+	close(sv[1]);
+	void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+	bool response_ok = sse_chunk(sv[0], &r, "test", NULL, "stop");
+	signal(SIGPIPE, old_sigpipe);
+	close(sv[0]);
+	request_free(&r);
+	TEST_ASSERT(!response_ok);
+	server_finalize_call_history(&s, &j, 3, "memory-token", &final_finish,
+							 err, sizeof(err), response_ok);
+	TEST_ASSERT(!strcmp(final_finish, "error"));
+	TEST_ASSERT(err[0] != '\0');
+	TEST_ASSERT(s.call_history.len == 1);
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_FAILED);
+	TEST_ASSERT(!strcmp(s.call_history.records[0].finish, "error"));
+	TEST_ASSERT(s.call_history.records[0].error[0] != '\0');
+	ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(&s.call_history, 2.0);
+	TEST_ASSERT(snap.callers_len == 1 && snap.callers[0].failures == 1);
+	ds4_call_history_snapshot_free(&snap);
+	ds4_call_history_free(&s.call_history);
+	pthread_mutex_destroy(&s.call_history_mu);
 }
 
 static void test_peer_caller_formats_direct_addresses(void) {
@@ -18602,6 +18653,7 @@ static void ds4_server_unit_tests_run(void) {
     test_call_history_capacity_keeps_active_calls();
     test_call_history_clamps_tokens_and_aggregates_failures();
     test_call_history_snapshot_owns_copies();
+	test_call_history_marks_final_stream_write_failure();
     test_peer_caller_formats_direct_addresses();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
