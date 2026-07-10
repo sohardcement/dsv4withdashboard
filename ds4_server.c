@@ -12354,6 +12354,49 @@ static bool kv_admin_parse_request(const char *body, size_t body_len,
     return ok;
 }
 
+static bool context_admin_parse_request(const char *body, size_t body_len,
+                                        uint64_t *out, kv_admin_error *err) {
+	if (!body || memchr(body, '\0', body_len))
+		return kv_admin_fail(err, "invalid_context_limit", "context_tokens must be a JSON integer");
+	char *json = xmalloc(body_len + 1);
+	memcpy(json, body, body_len);
+	json[body_len] = '\0';
+	const char *p = json;
+	bool have_tokens = false;
+	uint64_t tokens = 0;
+	json_ws(&p);
+	if (*p++ != '{') goto invalid;
+	json_ws(&p);
+	if (*p == '}') { p++; goto finish; }
+	for (;;) {
+		char *key = NULL;
+		if (!json_string(&p, &key)) { free(json); return kv_admin_fail(err, "invalid_context_limit", "context_tokens must be a JSON integer"); }
+		json_ws(&p);
+		if (*p++ != ':') { free(key); goto invalid; }
+		json_ws(&p);
+		if (strcmp(key, "context_tokens") || have_tokens ||
+			(*p == '0' && isdigit((unsigned char)p[1])) ||
+			!kv_admin_parse_uint(&p, &tokens)) {
+			free(key); goto invalid;
+		}
+		free(key);
+		have_tokens = true;
+		json_ws(&p);
+		if (*p == '}') { p++; break; }
+		if (*p++ != ',') goto invalid;
+		json_ws(&p);
+	}
+finish:
+	json_ws(&p);
+	if (*p || !have_tokens || tokens < 4096 || tokens > INT_MAX) goto invalid;
+	free(json);
+	if (out) *out = tokens;
+	return true;
+invalid:
+	free(json);
+	return kv_admin_fail(err, "invalid_context_limit", "context_tokens must be one integer from 4096 through 2147483647");
+}
+
 static bool kv_admin_sockaddr_is_loopback(const struct sockaddr *sa,
                                           socklen_t salen) {
     if (!sa) return false;
@@ -12511,6 +12554,52 @@ static kv_admin_persist_result kv_admin_persist_budget_ex(
     return result;
 }
 
+static kv_admin_persist_result context_admin_persist_tokens_ex(
+		const char *path, uint64_t tokens, char *detail, size_t detail_len) {
+	kv_admin_persist_result result = {0};
+	char *copy = xstrdup(path ? path : "");
+	char *slash = strrchr(copy, '/');
+	if (!slash || slash == copy) { snprintf(detail, detail_len, "invalid context persistence path"); free(copy); return result; }
+	*slash = '\0';
+	const char *parent = copy;
+	if (mkdir(parent, 0700) != 0 && errno != EEXIST) { snprintf(detail, detail_len, "create context parent: %s", strerror(errno)); free(copy); return result; }
+	struct stat st;
+	if (stat(parent, &st) != 0 || !S_ISDIR(st.st_mode)) { snprintf(detail, detail_len, "context parent is not a directory"); free(copy); return result; }
+	if (chmod(parent, 0700) != 0) { snprintf(detail, detail_len, "secure context parent permissions: %s", strerror(errno)); free(copy); return result; }
+	unsigned char nonce[8];
+	if (!random_bytes(nonce, sizeof(nonce))) memset(nonce, 0, sizeof(nonce));
+	char temp[PATH_MAX];
+	int n = snprintf(temp, sizeof(temp), "%s/.context-tokens.tmp.%ld.%02x%02x%02x%02x",
+		parent, (long)getpid(), nonce[0], nonce[1], nonce[2], nonce[3]);
+	if (n < 0 || (size_t)n >= sizeof(temp)) { snprintf(detail, detail_len, "context persistence path is too long"); free(copy); return result; }
+	int fd = open(temp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0) { snprintf(detail, detail_len, "create context temporary file: %s", strerror(errno)); free(copy); return result; }
+	FILE *fp = fdopen(fd, "w");
+	int saved = 0;
+	bool ok = fp != NULL;
+	if (!fp) saved = errno;
+	if (ok && fprintf(fp, "%llu\n", (unsigned long long)tokens) <= 0) { saved = errno; ok = false; }
+	if (ok && fflush(fp) != 0) { saved = errno; ok = false; }
+	if (ok && fsync(fd) != 0) { saved = errno; ok = false; }
+	if (fp) { if (fclose(fp) != 0 && ok) { saved = errno; ok = false; } } else close(fd);
+	if (ok && rename(temp, path) != 0) { saved = errno; ok = false; }
+	if (!ok) { unlink(temp); snprintf(detail, detail_len, "persist context: %s", strerror(saved ? saved : EIO)); free(copy); return result; }
+	result.committed = true;
+	int dfd = open(parent, O_RDONLY);
+	if (dfd < 0) { snprintf(detail, detail_len, "open context directory: %s", strerror(errno)); free(copy); return result; }
+#ifdef DS4_SERVER_TEST
+	if (kv_admin_test_fail_dir_fsync) errno = EIO;
+	int sync_ok = kv_admin_test_fail_dir_fsync ? -1 : fsync(dfd);
+#else
+	int sync_ok = fsync(dfd);
+#endif
+	int sync_errno = errno, close_ok = close(dfd);
+	if (sync_ok != 0 || close_ok != 0) { snprintf(detail, detail_len, "sync context directory: %s", strerror(sync_ok != 0 ? sync_errno : errno)); free(copy); return result; }
+	result.ok = true; result.durable = true;
+	free(copy);
+	return result;
+}
+
 #ifdef DS4_SERVER_TEST
 static bool kv_admin_persist_budget(const char *path, uint64_t budget_mb,
                                     char *detail, size_t detail_len) {
@@ -12634,6 +12723,65 @@ static bool kv_admin_handle_authorized(server *s, int fd, bool cors,
                                 persisted.ok ? NULL : detail);
 }
 
+static const char *context_admin_persistence_path(const char *override, char *path,
+											 size_t path_len) {
+	const char *target = override;
+	if (!target) {
+		const char *configured = getenv("DS4_CTX_FILE");
+		if (configured && configured[0]) target = configured;
+	}
+	if (!target) {
+		const char *home = getenv("HOME");
+		if (!home) return NULL;
+		int n = snprintf(path, path_len, "%s/.ds4/context-tokens", home);
+		if (n < 0 || (size_t)n >= path_len) return NULL;
+		target = path;
+	}
+	return strpbrk(target, "\r\n") ? NULL : target;
+}
+
+static bool context_admin_response(int fd, bool cors, int status, int current,
+								   uint64_t next, bool attempted,
+								   kv_admin_persist_result persisted,
+								   const char *code, const char *message) {
+	buf b = {0};
+	buf_puts(&b, "{\"ok\":"); buf_puts(&b, status == 200 ? "true" : "false");
+	buf_printf(&b, ",\"current_context_tokens\":%d,\"next_context_tokens\":%llu",
+		current, (unsigned long long)next);
+	buf_puts(&b, ",\"persistent\":{\"attempted\":"); buf_puts(&b, attempted ? "true" : "false");
+	buf_puts(&b, ",\"ok\":"); buf_puts(&b, attempted && persisted.ok ? "true" : "false");
+	buf_puts(&b, ",\"committed\":"); buf_puts(&b, attempted && persisted.committed ? "true" : "false");
+	buf_puts(&b, ",\"durable\":"); buf_puts(&b, attempted && persisted.durable ? "true" : "false");
+	buf_putc(&b, '}');
+	if (code) { buf_puts(&b, ",\"error\":{\"code\":"); json_escape(&b, code); buf_puts(&b, ",\"message\":"); json_escape(&b, message ? message : ""); buf_putc(&b, '}'); }
+	buf_puts(&b, "}\n");
+	bool sent = http_response(fd, cors, status, "application/json", b.ptr);
+	buf_free(&b);
+	return sent;
+}
+
+static bool context_admin_handle_authorized(server *s, int fd, bool cors,
+		const char *content_type, const char *body, size_t body_len,
+		const char *persist_path_override) {
+	int current = s && s->session ? ds4_session_ctx(s->session) : (s ? s->status.ctx_size : 0);
+	if (!content_type || strcasecmp(content_type, "application/json"))
+		return context_admin_response(fd, cors, 400, current, 0, false,
+			(kv_admin_persist_result){0}, "invalid_context_limit", "Content-Type must be application/json");
+	uint64_t tokens = 0;
+	kv_admin_error err = {0};
+	if (!context_admin_parse_request(body, body_len, &tokens, &err))
+		return context_admin_response(fd, cors, 400, current, 0, false,
+			(kv_admin_persist_result){0}, err.code, err.message);
+	char path[PATH_MAX];
+	const char *target = context_admin_persistence_path(persist_path_override, path, sizeof(path));
+	if (!target) return context_admin_response(fd, cors, 500, current, tokens, true,
+		(kv_admin_persist_result){0}, "context_persist_failed", "cannot resolve context persistence path");
+	char detail[160] = {0};
+	kv_admin_persist_result persisted = context_admin_persist_tokens_ex(target, tokens, detail, sizeof(detail));
+	return context_admin_response(fd, cors, persisted.ok ? 200 : 500, current, tokens, true,
+		persisted, persisted.ok ? NULL : "context_persist_failed", persisted.ok ? NULL : detail);
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -12667,12 +12815,13 @@ static void *client_main(void *arg) {
 
     http_request hr = {0};
     if (!read_http_headers(fd, &hr)) {
-        bool admin = !strcmp(hr.path, "/ds4/admin/kv-cache");
+        bool admin = !strcmp(hr.path, "/ds4/admin/kv-cache") || !strcmp(hr.path, "/ds4/admin/context");
         http_error(fd, admin ? false : s->enable_cors, 400, "bad HTTP request");
         goto done;
     }
 
-    bool admin_path = !strcmp(hr.path, "/ds4/admin/kv-cache");
+    bool context_admin_path = !strcmp(hr.path, "/ds4/admin/context");
+    bool admin_path = !strcmp(hr.path, "/ds4/admin/kv-cache") || context_admin_path;
     if (admin_path) {
         /* This mutation route intentionally never opts into the server's
          * wildcard CORS policy.  The non-simple header blocks browser form
@@ -12690,40 +12839,56 @@ static void *client_main(void *arg) {
             goto done;
         }
         if (!kv_admin_peer_is_loopback(fd)) {
-            kv_admin_response(fd, false, 403, NULL, NULL, false, false, false,
-                              "loopback_required",
-                              "KV cache administration is restricted to 127.0.0.1 or ::1");
+            if (context_admin_path)
+                context_admin_response(fd, false, 403, s->session ? ds4_session_ctx(s->session) : s->status.ctx_size,
+                    0, false, (kv_admin_persist_result){0}, "admin_forbidden",
+                    "context administration is restricted to 127.0.0.1 or ::1");
+            else kv_admin_response(fd, false, 403, NULL, NULL, false, false, false,
+                "loopback_required", "KV cache administration is restricted to 127.0.0.1 or ::1");
             http_request_free(&hr);
             goto done;
         }
         if (strcmp(hr.admin_header, "1") || !kv_admin_origin_is_local(hr.origin) ||
             !strcasecmp(hr.sec_fetch_site, "cross-site")) {
-            kv_admin_response(fd, false, 403, NULL, NULL, false, false, false,
-                              "admin_request_forbidden",
-                              "required admin header or same-origin policy failed");
+            if (context_admin_path)
+                context_admin_response(fd, false, 403, s->session ? ds4_session_ctx(s->session) : s->status.ctx_size,
+                    0, false, (kv_admin_persist_result){0}, "admin_csrf_required",
+                    "required admin header or same-origin policy failed");
+            else kv_admin_response(fd, false, 403, NULL, NULL, false, false, false,
+                "admin_request_forbidden", "required admin header or same-origin policy failed");
             http_request_free(&hr);
             goto done;
         }
         if (strcasecmp(hr.content_type, "application/json")) {
-            kv_admin_response(fd, false, 400, NULL, NULL, false, false, false,
-                              "invalid_content_type", "Content-Type must be application/json");
+            if (context_admin_path) context_admin_response(fd, false, 400,
+                s->session ? ds4_session_ctx(s->session) : s->status.ctx_size, 0, false,
+                (kv_admin_persist_result){0}, "invalid_context_limit", "Content-Type must be application/json");
+            else kv_admin_response(fd, false, 400, NULL, NULL, false, false, false,
+                "invalid_content_type", "Content-Type must be application/json");
             http_request_free(&hr);
             goto done;
         }
         if (hr.content_length > 4096) {
-            kv_admin_response(fd, false, 413, NULL, NULL, false, false, false,
-                              "request_too_large", "admin request body exceeds 4096 bytes");
+            if (context_admin_path) context_admin_response(fd, false, 413,
+                s->session ? ds4_session_ctx(s->session) : s->status.ctx_size, 0, false,
+                (kv_admin_persist_result){0}, "invalid_context_limit", "admin request body exceeds 4096 bytes");
+            else kv_admin_response(fd, false, 413, NULL, NULL, false, false, false,
+                "request_too_large", "admin request body exceeds 4096 bytes");
             http_request_free(&hr);
             goto done;
         }
         if (!read_http_body(fd, &hr, 4096)) {
-            kv_admin_response(fd, false, 400, NULL, NULL, false, false, false,
-                              "invalid_body", "incomplete admin request body");
+            if (context_admin_path) context_admin_response(fd, false, 400,
+                s->session ? ds4_session_ctx(s->session) : s->status.ctx_size, 0, false,
+                (kv_admin_persist_result){0}, "invalid_context_limit", "incomplete admin request body");
+            else kv_admin_response(fd, false, 400, NULL, NULL, false, false, false,
+                "invalid_body", "incomplete admin request body");
             http_request_free(&hr);
             goto done;
         }
-        kv_admin_handle_authorized(s, fd, false, hr.content_type,
-                                   hr.body, hr.body_len, NULL);
+        if (context_admin_path) context_admin_handle_authorized(s, fd, false, hr.content_type,
+            hr.body, hr.body_len, NULL);
+        else kv_admin_handle_authorized(s, fd, false, hr.content_type, hr.body, hr.body_len, NULL);
         http_request_free(&hr);
         goto done;
     }
@@ -14079,6 +14244,30 @@ static void test_kv_admin_parser_is_strict(void) {
 	TEST_ASSERT(req.budget_mb == 256 && req.mode == KV_ADMIN_PERSIST);
 }
 
+static void test_context_admin_parser_is_strict(void) {
+	uint64_t tokens = 0;
+	kv_admin_error err = {0};
+	const char valid[] = "{\"context_tokens\":4096}";
+	TEST_ASSERT(context_admin_parse_request(valid, sizeof(valid) - 1, &tokens, &err));
+	TEST_ASSERT(tokens == 4096);
+	const char *bad[] = {
+		"{}", "{\"context_tokens\":4095}", "{\"context_tokens\":-1}",
+		"{\"context_tokens\":1.0}", "{\"context_tokens\":1e6}",
+		"{\"context_tokens\":04096}",
+		"{\"context_tokens\":4096,\"context_tokens\":8192}",
+		"{\"context_tokens\":4096,\"extra\":1}",
+		"{\"context_tokens\":4096} trailing",
+		"{\"context_tokens\":2147483648}",
+	};
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		memset(&err, 0, sizeof(err));
+		TEST_ASSERT(!context_admin_parse_request(bad[i], strlen(bad[i]), &tokens, &err));
+		TEST_ASSERT(err.code && !strcmp(err.code, "invalid_context_limit"));
+	}
+	const char embedded[] = "{\"context_tokens\":4096\0}";
+	TEST_ASSERT(!context_admin_parse_request(embedded, sizeof(embedded) - 1, &tokens, &err));
+}
+
 static void test_kv_admin_loopback_sockaddrs(void) {
 	struct sockaddr_in v4 = {0};
 	v4.sin_family = AF_INET;
@@ -14169,6 +14358,65 @@ static void test_kv_admin_persistence_is_atomic_and_private(void) {
 }
 
 static char *test_kv_admin_core(server *s, const char *body, const char *path);
+static char *test_context_admin_core(server *s, const char *body, const char *path);
+
+static void test_context_admin_persistence_path_env(void) {
+	const char *old_home_value = getenv("HOME");
+	const char *old_path_value = getenv("DS4_CTX_FILE");
+	char *old_home = old_home_value ? xstrdup(old_home_value) : NULL;
+	char *old_path = old_path_value ? xstrdup(old_path_value) : NULL;
+	char tmpl[] = "/tmp/ds4-context-admin-env.XXXXXX";
+	char *root = mkdtemp(tmpl);
+	TEST_ASSERT(root != NULL);
+	if (!root) goto restore_env;
+	char custom[PATH_MAX], default_path[PATH_MAX];
+	snprintf(custom, sizeof(custom), "%s/custom/context-tokens", root);
+	snprintf(default_path, sizeof(default_path), "%s/.ds4/context-tokens", root);
+	TEST_ASSERT(setenv("HOME", root, 1) == 0);
+	TEST_ASSERT(setenv("DS4_CTX_FILE", custom, 1) == 0);
+	server s = {0}; s.status.ctx_size = 65536;
+	char *out = test_context_admin_core(&s, "{\"context_tokens\":131072}", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+	TEST_ASSERT(strstr(out, "\"current_context_tokens\":65536") != NULL);
+	TEST_ASSERT(strstr(out, "\"next_context_tokens\":131072") != NULL);
+	TEST_ASSERT(access(custom, F_OK) == 0 && access(default_path, F_OK) != 0);
+	struct stat st;
+	TEST_ASSERT(stat(custom, &st) == 0 && (st.st_mode & 0777) == 0600);
+	free(out);
+	TEST_ASSERT(unsetenv("DS4_CTX_FILE") == 0);
+	out = test_context_admin_core(&s, "{\"context_tokens\":262144}", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+	TEST_ASSERT(access(default_path, F_OK) == 0);
+	TEST_ASSERT(s.status.ctx_size == 65536);
+	free(out);
+	TEST_ASSERT(setenv("DS4_CTX_FILE", "", 1) == 0);
+	out = test_context_admin_core(&s, "{\"context_tokens\":4096}", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+	free(out);
+	char bad[PATH_MAX];
+	snprintf(bad, sizeof(bad), "%s/bad\ncontext-tokens", root);
+	TEST_ASSERT(setenv("DS4_CTX_FILE", bad, 1) == 0);
+	out = test_context_admin_core(&s, "{\"context_tokens\":4096}", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 500") != NULL);
+	TEST_ASSERT(strstr(out, "context_persist_failed") != NULL);
+	free(out);
+	kv_admin_test_fail_dir_fsync = true;
+	out = test_context_admin_core(&s, "{\"context_tokens\":65536}", custom);
+	kv_admin_test_fail_dir_fsync = false;
+	TEST_ASSERT(strstr(out, "HTTP/1.1 500") != NULL);
+	TEST_ASSERT(strstr(out, "\"committed\":true,\"durable\":false") != NULL);
+	free(out);
+	unlink(custom); unlink(default_path);
+	char custom_dir[PATH_MAX], default_dir[PATH_MAX];
+	snprintf(custom_dir, sizeof(custom_dir), "%s/custom", root);
+	snprintf(default_dir, sizeof(default_dir), "%s/.ds4", root);
+	rmdir(custom_dir); rmdir(default_dir); rmdir(root);
+restore_env:
+	if (old_home) { TEST_ASSERT(setenv("HOME", old_home, 1) == 0); free(old_home); }
+	else TEST_ASSERT(unsetenv("HOME") == 0);
+	if (old_path) { TEST_ASSERT(setenv("DS4_CTX_FILE", old_path, 1) == 0); free(old_path); }
+	else TEST_ASSERT(unsetenv("DS4_CTX_FILE") == 0);
+}
 
 static void test_kv_admin_persistence_path_env(void) {
 	const char *old_home_value = getenv("HOME");
@@ -14237,6 +14485,17 @@ static char *test_kv_admin_core(server *s, const char *body, const char *path) {
 	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
 	TEST_ASSERT(kv_admin_handle_authorized(s, sv[0], false, "application/json",
 	                                       body, strlen(body), path));
+	shutdown(sv[0], SHUT_WR);
+	char *out = read_socket_text(sv[1]);
+	close(sv[0]); close(sv[1]);
+	return out;
+}
+
+static char *test_context_admin_core(server *s, const char *body, const char *path) {
+	int sv[2];
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	TEST_ASSERT(context_admin_handle_authorized(s, sv[0], false, "application/json",
+	                                            body, strlen(body), path));
 	shutdown(sv[0], SHUT_WR);
 	char *out = read_socket_text(sv[1]);
 	close(sv[0]); close(sv[1]);
@@ -14486,6 +14745,99 @@ static void test_kv_admin_actual_route_and_peer_auth(void) {
 	pthread_cond_destroy(&s.clients_cv);
 	pthread_mutex_destroy(&s.mu);
 	rmdir(dir);
+}
+
+static void test_context_admin_route_auth_and_active_context(void) {
+	server s = {0};
+	pthread_mutex_init(&s.mu, NULL);
+	pthread_cond_init(&s.clients_cv, NULL);
+	pthread_mutex_init(&s.status_mu, NULL);
+	server_status_init(&s);
+	s.status.ctx_size = 65536;
+	char tmpl[] = "/tmp/ds4-context-admin-route.XXXXXX";
+	char *dir = mkdtemp(tmpl);
+	TEST_ASSERT(dir != NULL);
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/context-tokens", dir);
+	TEST_ASSERT(setenv("DS4_CTX_FILE", path, 1) == 0);
+	const char *body = "{\"context_tokens\":131072}";
+	char request_text[512];
+	snprintf(request_text, sizeof(request_text),
+		"POST /ds4/admin/context HTTP/1.1\r\nX-DS4-Admin: 1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+		strlen(body), body);
+	char *out = test_kv_admin_route(&s, request_text, true);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+	TEST_ASSERT(strstr(out, "\"current_context_tokens\":65536") != NULL);
+	TEST_ASSERT(strstr(out, "\"next_context_tokens\":131072") != NULL);
+	TEST_ASSERT(s.status.ctx_size == 65536);
+	free(out);
+	TEST_ASSERT(unlink(path) == 0);
+	out = test_kv_admin_route(&s,
+		"POST /ds4/admin/context HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 24\r\n\r\n{\"context_tokens\":4096}", true);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 403") != NULL && access(path, F_OK) != 0);
+	TEST_ASSERT(strstr(out, "admin_csrf_required") != NULL);
+	free(out);
+	out = test_kv_admin_route(&s,
+		"POST /ds4/admin/context HTTP/1.1\r\nX-DS4-Admin: 1\r\nContent-Type: text/plain\r\nContent-Length: 24\r\n\r\n{\"context_tokens\":4096}", true);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL && access(path, F_OK) != 0);
+	free(out);
+	out = test_kv_admin_route(&s, request_text, false);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 403") != NULL && access(path, F_OK) != 0);
+	free(out);
+	out = test_kv_admin_route(&s,
+		"OPTIONS /ds4/admin/context HTTP/1.1\r\nContent-Length: 0\r\n\r\n", true);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 403") != NULL && access(path, F_OK) != 0);
+	free(out);
+	unsetenv("DS4_CTX_FILE"); rmdir(dir);
+	pthread_mutex_destroy(&s.status_mu);
+	pthread_cond_destroy(&s.clients_cv);
+	pthread_mutex_destroy(&s.mu);
+}
+
+static char *test_start_server_dry_run(void) {
+	FILE *fp = popen("./start-server.sh 2>&1", "r");
+	TEST_ASSERT(fp != NULL);
+	buf out = {0};
+	char chunk[256];
+	while (fp && fgets(chunk, sizeof(chunk), fp)) buf_puts(&out, chunk);
+	TEST_ASSERT(fp && pclose(fp) == 0);
+	return out.ptr;
+}
+
+static void test_start_server_context_precedence(void) {
+	const char *old_home_value = getenv("HOME"), *old_ctx_value = getenv("DS4_CTX");
+	char *old_home = old_home_value ? xstrdup(old_home_value) : NULL;
+	char *old_ctx = old_ctx_value ? xstrdup(old_ctx_value) : NULL;
+	char tmpl[] = "/tmp/ds4-context-launcher.XXXXXX";
+	char *root = mkdtemp(tmpl);
+	TEST_ASSERT(root != NULL);
+	if (!root) goto restore;
+	char ds4dir[PATH_MAX], file[PATH_MAX];
+	snprintf(ds4dir, sizeof(ds4dir), "%s/.ds4", root);
+	snprintf(file, sizeof(file), "%s/context-tokens", ds4dir);
+	TEST_ASSERT(mkdir(ds4dir, 0700) == 0);
+	FILE *fp = fopen(file, "w"); TEST_ASSERT(fp != NULL);
+	if (fp) { fputs("262144\n", fp); fclose(fp); }
+	TEST_ASSERT(setenv("HOME", root, 1) == 0);
+	TEST_ASSERT(setenv("DS4_MODEL", "", 1) == 0);
+	TEST_ASSERT(setenv("DS4_DRY_RUN", "1", 1) == 0);
+	TEST_ASSERT(unsetenv("DS4_CTX") == 0);
+	char *out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--ctx 262144") != NULL); free(out);
+	TEST_ASSERT(setenv("DS4_CTX", "131072", 1) == 0);
+	out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--ctx 131072") != NULL); free(out);
+	TEST_ASSERT(setenv("DS4_CTX", "bad", 1) == 0);
+	out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--ctx 262144") != NULL); free(out);
+	TEST_ASSERT(unlink(file) == 0);
+	out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--ctx 204800") != NULL); free(out);
+	rmdir(ds4dir); rmdir(root);
+restore:
+	unsetenv("DS4_MODEL"); unsetenv("DS4_DRY_RUN");
+	if (old_home) { setenv("HOME", old_home, 1); free(old_home); } else unsetenv("HOME");
+	if (old_ctx) { setenv("DS4_CTX", old_ctx, 1); free(old_ctx); } else unsetenv("DS4_CTX");
 }
 
 static void test_kv_admin_rejects_headers_before_body(void) {
@@ -19020,11 +19372,15 @@ static void ds4_server_unit_tests_run(void) {
 	test_server_kv_lifecycle_and_status_wrapper_seam();
 	test_server_kv_discard_publishes_refreshed_stats();
 	test_kv_admin_parser_is_strict();
+	test_context_admin_parser_is_strict();
 	test_kv_admin_loopback_sockaddrs();
 	test_kv_admin_persistence_is_atomic_and_private();
 	test_kv_admin_persistence_path_env();
+	test_context_admin_persistence_path_env();
 	test_kv_admin_handler_semantics();
 	test_kv_admin_actual_route_and_peer_auth();
+	test_context_admin_route_auth_and_active_context();
+	test_start_server_context_precedence();
 	test_kv_admin_rejects_headers_before_body();
 	test_http_content_length_framing_is_strict();
 	test_http_chunked_headers_preserve_normal_route_body();

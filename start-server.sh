@@ -108,8 +108,47 @@ if [ -e "$KV_SPACE_FILE" ]; then
     fi
 fi
 
+CTX_FILE=${DS4_CTX_FILE:-$HOME/.ds4/context-tokens}
+case "$CTX_FILE" in
+    *$'\r'*|*$'\n'*)
+        echo "invalid DS4_CTX_FILE: path must not contain CR or LF" >&2
+        exit 2
+        ;;
+esac
+context_valid() {
+    local value=$1 normalized
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    normalized=${value#"${value%%[!0]*}"}
+    [ -n "$normalized" ] || normalized=0
+    [ ${#normalized} -lt 10 ] || {
+        [ ${#normalized} -eq 10 ] && [[ ! "$normalized" > 2147483647 ]]
+    } || return 1
+    [ "$normalized" -ge 4096 ]
+}
+SAVED_CTX=
+if [ -e "$CTX_FILE" ]; then
+    if [ -r "$CTX_FILE" ]; then
+        SAVED_CTX=$(<"$CTX_FILE")
+        if ! context_valid "$SAVED_CTX"; then
+            echo "ignoring invalid saved context in $CTX_FILE (expected integer 4096..2147483647)" >&2
+            SAVED_CTX=
+        fi
+    else
+        echo "ignoring unreadable saved context file: $CTX_FILE" >&2
+    fi
+fi
+
 MODEL=${DS4_MODEL-$DEFAULT_MODEL}
-CTX=${DS4_CTX:-$DEFAULT_CTX}
+if [ -n "${DS4_CTX+x}" ]; then
+    if context_valid "$DS4_CTX"; then
+        CTX=$DS4_CTX
+    else
+        echo "ignoring invalid DS4_CTX (expected integer 4096..2147483647)" >&2
+        CTX=${SAVED_CTX:-$DEFAULT_CTX}
+    fi
+else
+    CTX=${SAVED_CTX:-$DEFAULT_CTX}
+fi
 THREADS=${DS4_THREADS:-$DEFAULT_THREADS}
 PREFILL_CHUNK=${DS4_PREFILL_CHUNK:-$DEFAULT_PREFILL_CHUNK}
 KV_DIR=${DS4_KV_DIR:-$DEFAULT_KV_DIR}
@@ -221,6 +260,7 @@ if [ -n "$CONFIG_SNAPSHOT" ]; then
         printf 'profile=%s\n' "$PROFILE"
         printf 'model=%s\n' "$MODEL"
         printf 'ctx=%s\n' "$CTX"
+		printf 'ctx_file=%s\n' "$CTX_FILE"
         printf 'threads=%s\n' "$THREADS"
         printf 'host=%s\n' "$HOST"
         printf 'port=%s\n' "$PORT"
