@@ -7764,6 +7764,10 @@ struct server {
     int default_tokens;
     kv_disk_cache kv;
 	pthread_mutex_t kv_mu;
+	uint64_t kv_stats_seq;
+	pthread_mutex_t kv_stats_mu;
+	ds4_kvstore_stats kv_stats;
+	uint64_t kv_stats_published_seq;
 #ifdef DS4_SERVER_TEST
 	int kv_stats_wrapper_calls;
 #endif
@@ -7794,13 +7798,15 @@ static void server_kv_destroy(server *s);
 static bool server_kv_open(server *s, const char *dir, uint64_t budget_mb,
                            bool reject_different_quant, kv_cache_options opt);
 static void server_kv_close(server *s);
-static ds4_kvstore_stats server_kv_get_stats(server *s);
+#ifdef DS4_SERVER_TEST
 static ds4_kvstore_budget_result server_kv_set_budget(server *s,
                                                        uint64_t budget_bytes,
                                                        bool apply);
 static bool server_kv_evict(server *s, const ds4_tokens *live,
                             uint64_t extra_bytes,
                             const ds4_kvstore_eviction_context *incoming);
+#endif
+static ds4_kvstore_stats server_kv_get_published_stats(server *s);
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -8174,9 +8180,9 @@ static bool send_status_json(server *s, int fd) {
         pthread_mutex_lock(&s->status_mu);
         snapshot = s->status;
         pthread_mutex_unlock(&s->status_mu);
-		/* Lock ordering by construction: status is copied and released before
-		 * the independent KV snapshot acquires kv_mu. */
-		kv = server_kv_get_stats(s);
+		/* KV stats are the last completed wrapper snapshot.  Active disk I/O
+		 * may make them briefly stale, but status never waits for kv_mu. */
+		kv = server_kv_get_published_stats(s);
     }
     buf b = {0};
     append_status_json(&b, &snapshot, &kv);
@@ -9056,11 +9062,40 @@ static void kv_cache_log_cb(void *ud, ds4_kvstore_log_type type, const char *msg
 static void server_kv_init(server *s) {
 	if (!s) return;
 	pthread_mutex_init(&s->kv_mu, NULL);
+	s->kv_stats_seq = 0;
+	pthread_mutex_init(&s->kv_stats_mu, NULL);
+	s->kv_stats = (ds4_kvstore_stats){0};
+	s->kv_stats_published_seq = 0;
 }
 
 static void server_kv_destroy(server *s) {
 	if (!s) return;
+	pthread_mutex_destroy(&s->kv_stats_mu);
 	pthread_mutex_destroy(&s->kv_mu);
+}
+
+static void server_kv_publish_stats(server *s, ds4_kvstore_stats stats,
+	                                uint64_t seq) {
+	/* Publish only after releasing kv_mu.  Status remains responsive during
+	 * checkpoint I/O and intentionally reports the last completed operation. */
+	pthread_mutex_lock(&s->kv_stats_mu);
+	if (seq >= s->kv_stats_published_seq) {
+		s->kv_stats = stats;
+		s->kv_stats_published_seq = seq;
+	}
+	pthread_mutex_unlock(&s->kv_stats_mu);
+}
+
+static ds4_kvstore_stats server_kv_get_published_stats(server *s) {
+	ds4_kvstore_stats stats = {0};
+	if (!s) return stats;
+	pthread_mutex_lock(&s->kv_stats_mu);
+	stats = s->kv_stats;
+#ifdef DS4_SERVER_TEST
+	s->kv_stats_wrapper_calls++;
+#endif
+	pthread_mutex_unlock(&s->kv_stats_mu);
+	return stats;
 }
 
 static bool server_kv_open(server *s, const char *dir, uint64_t budget_mb,
@@ -9070,7 +9105,10 @@ static bool server_kv_open(server *s, const char *dir, uint64_t budget_mb,
 	bool ok = ds4_kvstore_open(&s->kv, dir, budget_mb,
 	                           reject_different_quant, opt, "ds4-server",
 	                           kv_cache_log_cb, NULL);
+	ds4_kvstore_stats stats = ds4_kvstore_get_stats(&s->kv);
+	uint64_t seq = ++s->kv_stats_seq;
 	pthread_mutex_unlock(&s->kv_mu);
+	server_kv_publish_stats(s, stats, seq);
 	return ok;
 }
 
@@ -9078,21 +9116,13 @@ static void server_kv_close(server *s) {
 	if (!s) return;
 	pthread_mutex_lock(&s->kv_mu);
 	ds4_kvstore_close(&s->kv);
+	ds4_kvstore_stats stats = ds4_kvstore_get_stats(&s->kv);
+	uint64_t seq = ++s->kv_stats_seq;
 	pthread_mutex_unlock(&s->kv_mu);
+	server_kv_publish_stats(s, stats, seq);
 }
 
-static ds4_kvstore_stats server_kv_get_stats(server *s) {
-	ds4_kvstore_stats stats = {0};
-	if (!s) return stats;
-	pthread_mutex_lock(&s->kv_mu);
-	stats = ds4_kvstore_get_stats(&s->kv);
 #ifdef DS4_SERVER_TEST
-	s->kv_stats_wrapper_calls++;
-#endif
-	pthread_mutex_unlock(&s->kv_mu);
-	return stats;
-}
-
 static ds4_kvstore_budget_result server_kv_set_budget(server *s,
                                                        uint64_t budget_bytes,
                                                        bool apply) {
@@ -9100,7 +9130,10 @@ static ds4_kvstore_budget_result server_kv_set_budget(server *s,
 	if (!s) return result;
 	pthread_mutex_lock(&s->kv_mu);
 	result = ds4_kvstore_set_budget(&s->kv, budget_bytes, apply);
+	ds4_kvstore_stats stats = ds4_kvstore_get_stats(&s->kv);
+	uint64_t seq = ++s->kv_stats_seq;
 	pthread_mutex_unlock(&s->kv_mu);
+	server_kv_publish_stats(s, stats, seq);
 	return result;
 }
 
@@ -9110,9 +9143,13 @@ static bool server_kv_evict(server *s, const ds4_tokens *live,
 	if (!s) return false;
 	pthread_mutex_lock(&s->kv_mu);
 	bool ok = ds4_kvstore_evict(&s->kv, live, extra_bytes, incoming);
+	ds4_kvstore_stats stats = ds4_kvstore_get_stats(&s->kv);
+	uint64_t seq = ++s->kv_stats_seq;
 	pthread_mutex_unlock(&s->kv_mu);
+	server_kv_publish_stats(s, stats, seq);
 	return ok;
 }
+#endif
 
 static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb,
                           bool reject_different_quant, kv_cache_options opt) {
@@ -9227,7 +9264,10 @@ static bool server_kv_store_live_prefix_text(server *s, const ds4_tokens *tokens
                                               cache_text_ext,
                                               cache_text_key,
 	                                              &hooks, err, sizeof(err));
+	ds4_kvstore_stats stats = ds4_kvstore_get_stats(&s->kv);
+	uint64_t seq = ++s->kv_stats_seq;
 	pthread_mutex_unlock(&s->kv_mu);
+	server_kv_publish_stats(s, stats, seq);
 	return ok;
 }
 
@@ -9408,7 +9448,10 @@ static int server_kv_try_load_text(server *s, const char *prompt_text,
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
     }
     ds4_kvstore_load_result_free(&lr);
+	ds4_kvstore_stats stats = ds4_kvstore_get_stats(&s->kv);
+	uint64_t seq = ++s->kv_stats_seq;
 	pthread_mutex_unlock(&s->kv_mu);
+	server_kv_publish_stats(s, stats, seq);
     return loaded;
 }
 
@@ -12931,7 +12974,7 @@ typedef struct {
 static void *test_server_kv_stats_thread(void *ud) {
 	test_kv_stats_thread_arg *arg = ud;
 	for (int i = 0; i < arg->iterations; i++) {
-		ds4_kvstore_stats stats = server_kv_get_stats(arg->srv);
+		ds4_kvstore_stats stats = server_kv_get_published_stats(arg->srv);
 		TEST_ASSERT(stats.enabled);
 		TEST_ASSERT(stats.budget_bytes == 1000);
 		TEST_ASSERT(stats.used_bytes == 600);
@@ -12959,6 +13002,28 @@ static void test_server_kv_wrappers_serialize_stats_and_budget(void) {
 	s.kv.opt = kv_cache_default_options();
 	s.kv.budget_bytes = 1000;
 	TEST_ASSERT(server_kv_evict(&s, NULL, 0, NULL));
+	pthread_mutex_init(&s.status_mu, NULL);
+	server_status_init(&s);
+	int sv[2];
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	pthread_mutex_lock(&s.kv_mu);
+	ds4_kvstore_stats nonblocking = server_kv_get_published_stats(&s);
+	if (sv[0] >= 0 && sv[1] >= 0) TEST_ASSERT(send_status_json(&s, sv[0]));
+	pthread_mutex_unlock(&s.kv_mu);
+	TEST_ASSERT(nonblocking.enabled);
+	TEST_ASSERT(nonblocking.budget_bytes == 1000);
+	TEST_ASSERT(nonblocking.used_bytes == 600);
+	TEST_ASSERT(nonblocking.entries == 2);
+	if (sv[0] >= 0 && sv[1] >= 0) {
+		shutdown(sv[0], SHUT_WR);
+		char *out = read_socket_text(sv[1]);
+		TEST_ASSERT(strstr(out, "\"budget_bytes\":1000") != NULL);
+		TEST_ASSERT(strstr(out, "\"used_bytes\":600") != NULL);
+		TEST_ASSERT(strstr(out, "\"entries\":2") != NULL);
+		free(out);
+		close(sv[0]);
+		close(sv[1]);
+	}
 
 	test_kv_stats_thread_arg arg = {.srv = &s, .iterations = 200};
 	pthread_t thread;
@@ -12976,6 +13041,7 @@ static void test_server_kv_wrappers_serialize_stats_and_budget(void) {
 	}
 	TEST_ASSERT(pthread_join(thread, NULL) == 0);
 
+	pthread_mutex_destroy(&s.status_mu);
 	server_kv_close(&s);
 	server_kv_destroy(&s);
 	char *first = path_join(dir, "1111111111111111111111111111111111111111.kv");
@@ -12997,7 +13063,7 @@ static void test_server_kv_lifecycle_and_status_wrapper_seam(void) {
 	server_kv_init(&s);
 	TEST_ASSERT(server_kv_open(&s, dir, 1, false,
 	                           kv_cache_default_options()));
-	TEST_ASSERT(server_kv_get_stats(&s).enabled);
+	TEST_ASSERT(server_kv_get_published_stats(&s).enabled);
 
 	int before = s.kv_stats_wrapper_calls;
 	pthread_mutex_init(&s.status_mu, NULL);
@@ -13012,7 +13078,7 @@ static void test_server_kv_lifecycle_and_status_wrapper_seam(void) {
 	}
 	pthread_mutex_destroy(&s.status_mu);
 	server_kv_close(&s);
-	TEST_ASSERT(!server_kv_get_stats(&s).enabled);
+	TEST_ASSERT(!server_kv_get_published_stats(&s).enabled);
 	server_kv_destroy(&s);
 	rmdir(dir);
 }
