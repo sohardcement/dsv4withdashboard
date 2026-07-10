@@ -15,5 +15,6 @@ __pycache__/
 *.pyc
 /misc/
 /.superpowers/
+/.worktrees/
 .*.swp
 .DS_Store
