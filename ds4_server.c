@@ -9407,8 +9407,14 @@ static void server_kv_discard_failed_disk_entry(server *s, const char *path) {
                    path, strerror(errno));
     }
     s->kv.continued_last_store_tokens = 0;
+	/* Refresh even for ENOENT: another actor may already have removed the
+	 * indexed file, and the published snapshot must describe disk truth. */
+	(void)ds4_kvstore_evict(&s->kv, NULL, 0, NULL);
+	ds4_kvstore_stats stats = ds4_kvstore_get_stats(&s->kv);
+	uint64_t seq = ++s->kv_stats_seq;
 	pthread_mutex_unlock(&s->kv_mu);
-    ds4_session_invalidate(s->session);
+	server_kv_publish_stats(s, stats, seq);
+	if (s->session) ds4_session_invalidate(s->session);
 }
 
 static void server_kv_maybe_store_continued(server *s) {
@@ -13080,6 +13086,44 @@ static void test_server_kv_lifecycle_and_status_wrapper_seam(void) {
 	server_kv_close(&s);
 	TEST_ASSERT(!server_kv_get_published_stats(&s).enabled);
 	server_kv_destroy(&s);
+	rmdir(dir);
+}
+
+static void test_server_kv_discard_publishes_refreshed_stats(void) {
+	char tmpl[] = "/tmp/ds4-server-kv-discard-test.XXXXXX";
+	char *dir = mkdtemp(tmpl);
+	TEST_ASSERT(dir != NULL);
+	if (!dir) return;
+
+	const char *name = "3333333333333333333333333333333333333333.kv";
+	test_kv_stub_file(dir, "3333333333333333333333333333333333333333",
+	                  KV_REASON_UNKNOWN, 512, 0, (uint64_t)time(NULL), 248);
+	char *path = path_join(dir, name);
+	server s = {0};
+	server_kv_init(&s);
+	s.kv.enabled = true;
+	s.kv.dir = xstrdup(dir);
+	s.kv.opt = kv_cache_default_options();
+	s.kv.budget_bytes = 1000;
+	TEST_ASSERT(server_kv_evict(&s, NULL, 0, NULL));
+	ds4_kvstore_stats stats = server_kv_get_published_stats(&s);
+	TEST_ASSERT(stats.used_bytes == 300);
+	TEST_ASSERT(stats.entries == 1);
+
+	server_kv_discard_failed_disk_entry(&s, path);
+	stats = server_kv_get_published_stats(&s);
+	TEST_ASSERT(stats.used_bytes == 0);
+	TEST_ASSERT(stats.entries == 0);
+
+	/* ENOENT is already in the desired state and must publish that truth. */
+	server_kv_discard_failed_disk_entry(&s, path);
+	stats = server_kv_get_published_stats(&s);
+	TEST_ASSERT(stats.used_bytes == 0);
+	TEST_ASSERT(stats.entries == 0);
+
+	server_kv_close(&s);
+	server_kv_destroy(&s);
+	free(path);
 	rmdir(dir);
 }
 
@@ -17064,6 +17108,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_stats_snapshot();
 	test_server_kv_wrappers_serialize_stats_and_budget();
 	test_server_kv_lifecycle_and_status_wrapper_seam();
+	test_server_kv_discard_publishes_refreshed_stats();
 	test_kv_cache_budget_changes();
 	test_kv_cache_budget_refreshes_external_files();
 	test_kv_cache_budget_reports_unlink_failure();
