@@ -7726,6 +7726,7 @@ typedef struct {
     char model_name[96];
     char backend_name[16];
     int ctx_size;
+    int next_ctx_size;
     int session_pos;
     int default_tokens;
     int queue_depth;
@@ -7993,6 +7994,7 @@ static void server_status_init(server *s) {
     }
     if (s->session) {
         s->status.ctx_size = ds4_session_ctx(s->session);
+        s->status.next_ctx_size = s->status.ctx_size;
         s->status.session_pos = ds4_session_pos(s->session);
     }
     pthread_mutex_unlock(&s->status_mu);
@@ -8006,6 +8008,7 @@ static void server_status_set_model(server *s, ds4_backend backend) {
     status_copy(s->status.backend_name, sizeof(s->status.backend_name),
                 ds4_backend_name(backend));
     s->status.ctx_size = s->session ? ds4_session_ctx(s->session) : 0;
+    s->status.next_ctx_size = s->status.ctx_size;
     s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
     s->status.default_tokens = s->default_tokens;
     s->status.updated_t = now_sec();
@@ -8192,9 +8195,9 @@ static int server_queue_depth_locked(const server *s) {
 }
 
 static const char dashboard_html[] =
-"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+"<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-"<title>DS4 Server</title><style>"
+"<title>DS4 运行报告</title><style>"
 ":root{color-scheme:light;--paper:#f2f0e8;--ink:#171714;--muted:#69675f;--line:#cbc7ba;--accent:#e33f27;--bad:#a52a1c}"
 "*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 Avenir,\"Gill Sans\",\"Trebuchet MS\",Arial,sans-serif}"
 "button,input,select{font:inherit;color:inherit}button,input,select{min-height:44px;border:1px solid var(--ink);background:transparent;border-radius:0}button{padding:0 18px;cursor:pointer}button.primary{background:var(--ink);color:var(--paper)}button:disabled{cursor:not-allowed;opacity:.45}input{width:9rem;padding:0 10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}select{padding:0 30px 0 10px}"
@@ -8205,33 +8208,46 @@ static const char dashboard_html[] =
 "table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:10px 12px 10px 0;border-top:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:500;width:16%}td{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}.stale .phase{color:var(--bad)}"
 "@media(max-width:760px){.page{padding:20px 16px 44px}.masthead{display:block}.state{margin-top:20px;justify-content:space-between;gap:8px}.hero{grid-template-columns:1fr}.hero>div{padding:32px 0}.hero>div+div{border-left:0;border-top:1px solid var(--line);padding-left:0}.strip,.process,.capacity-grid,.capacity-stats{grid-template-columns:1fr}.datum+.datum{border-left:0;border-top:1px solid var(--line);padding-left:0}.capacity-grid{gap:26px}.editor{border-left:0;border-top:1px solid var(--line);padding:26px 0 0}.hero-value{font-size:72px}.controls>*{flex:1 1 auto}input{font-size:16px;width:min(11rem,60vw)}.section-head{display:block}.section-head .caption{margin-top:8px}}"
 "@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}"
-"</style></head><body><main class=\"page\" id=\"dashboard\"><header class=\"masthead\"><div><h1 class=\"brand\">DS4 / Runtime Ledger</h1><p id=\"model\" class=\"model\">Loading status</p></div><div class=\"state\"><div><span class=\"eyebrow\">Phase</span><strong id=\"phase\" class=\"phase\">connecting</strong></div><div><span class=\"eyebrow\">Health</span><strong id=\"health\">waiting</strong></div><div><span class=\"eyebrow\">Queue</span><strong id=\"queue\">0</strong></div><div><span class=\"eyebrow\">Clients</span><strong id=\"clients\">0</strong></div></div></header>"
+"[data-theme=terminal]{color-scheme:dark;--paper:#07130d;--ink:#e5f1d8;--muted:#aab9a5;--line:#3d5545;--accent:#b7ff4a;--bad:#ff8b70}[data-theme=calm]{--paper:#eaf0f4;--ink:#18242d;--muted:#5d6d79;--line:#b7c5cf;--accent:#a84435;--bad:#9c3027}.theme-switch{display:flex;gap:0;flex-wrap:wrap}.theme-switch button[aria-pressed=true]{background:var(--ink);color:var(--paper)}.dashboard-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:28px}.call-filters{display:flex;gap:8px;flex-wrap:wrap}.call-filters input,.call-filters select{min-width:0}.call-table-wrap{overflow-x:auto}.call-table-wrap table{min-width:640px}@media(max-width:760px){.dashboard-grid{grid-template-columns:1fr}.theme-switch{margin-top:16px}.theme-switch button{flex:1 1 100%;font-size:16px}}"
+"</style></head><body><main class=\"page\" id=\"dashboard\" data-theme=\"paper\"><header class=\"masthead\"><div><h1 class=\"brand\">DS4 / 运行报告</h1><p id=\"model\" class=\"model\">正在读取状态</p></div><div class=\"theme-switch\" role=\"group\" aria-label=\"显示主题\"><button type=\"button\" data-theme-choice=\"paper\" aria-pressed=\"true\">纸面运行报告</button><button type=\"button\" data-theme-choice=\"terminal\" aria-pressed=\"false\">深色控制台</button><button type=\"button\" data-theme-choice=\"calm\" aria-pressed=\"false\">从容解释型</button></div><div class=\"state\"><div><span class=\"eyebrow\">阶段</span><strong id=\"phase\" class=\"phase\">连接中</strong></div><div><span class=\"eyebrow\">健康</span><strong id=\"health\">等待中</strong></div><div><span class=\"eyebrow\">队列</span><strong id=\"queue\">0</strong></div><div><span class=\"eyebrow\">客户端</span><strong id=\"clients\">0</strong></div></div></header>"
 "<section class=\"hero\" aria-labelledby=\"currentTitle\"><div><span class=\"eyebrow\" id=\"currentTitle\">Current request / KV token hit</span><div id=\"requestHitRate\" class=\"hero-value accent\">—</div><p id=\"requestHitDetail\" class=\"caption mono\">— cached / — prompt · source —</p></div><div><span class=\"eyebrow\">Decode / average</span><div id=\"decodeSpeed\" class=\"secondary-value\">—</div><p class=\"caption\">tokens per second</p></div></section>"
 "<section class=\"strip\" aria-label=\"Request operations\"><div class=\"datum\"><span class=\"eyebrow\">Prefill</span><strong id=\"prefillSpeed\">—</strong><small id=\"prefillDetail\">—</small><div class=\"progress\" aria-hidden=\"true\"><span id=\"prefillBar\"></span></div></div><div class=\"datum\"><span class=\"eyebrow\">Decode progress</span><strong id=\"decodeProgress\">—</strong><small id=\"decodeChunk\">—</small></div><div class=\"datum\"><span class=\"eyebrow\">Live session</span><strong id=\"sessionTokens\">—</strong><small id=\"contextRatio\">tokens / context, not RAM bytes</small></div><div class=\"datum\"><span class=\"eyebrow\">Request</span><strong id=\"requestElapsed\">—</strong><small id=\"requestFlags\">—</small></div></section>"
 "<section class=\"section\"><div class=\"section-head\"><h2>Process record</h2><p class=\"caption\">Counters reset when this server process restarts.</p></div><div class=\"process\"><div><span class=\"eyebrow\">Token hit rate</span><div id=\"processTokenHitRate\" class=\"big\">—</div><p id=\"processTokenDetail\" class=\"caption mono\">—</p></div><div><span class=\"eyebrow\">Request hit rate</span><div id=\"processRequestHitRate\" class=\"big\">—</div><p id=\"processRequestDetail\" class=\"caption mono\">—</p></div><div><span class=\"eyebrow\">Outcomes</span><div id=\"outcomes\" class=\"big\">—</div><p id=\"outcomeDetail\" class=\"caption mono\">—</p></div></div></section>"
 "<section id=\"kvCapacity\" class=\"section\"><div class=\"section-head\"><h2>Disk KV capacity</h2><p class=\"caption\">Indexed disk cache; live context above is measured in tokens.</p></div><div class=\"capacity-grid\"><div><div class=\"capacity-stats\"><div><span class=\"eyebrow\">Used</span><strong id=\"kvUsed\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">Budget</span><strong id=\"kvBudget\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">Entries / utilization</span><strong id=\"kvEntries\" class=\"mono\">—</strong><small id=\"kvUtilization\" class=\"caption\">—</small></div></div><div class=\"progress\" aria-hidden=\"true\"><span id=\"kvBar\"></span></div></div><form class=\"editor\" id=\"kvForm\"><label class=\"eyebrow\" for=\"kvBudgetInput\">Capacity limit</label><div class=\"controls\"><input id=\"kvBudgetInput\" inputmode=\"decimal\" type=\"number\" min=\"0.25\" step=\"0.25\" aria-describedby=\"budgetHelp\"><select id=\"kvBudgetUnit\" aria-label=\"Capacity unit\"><option value=\"GB\">GB</option><option value=\"MB\">MB</option></select></div><p id=\"budgetHelp\" class=\"caption\">Minimum 256 MB. Apply changes runtime state; save writes the next-start limit.</p><div class=\"controls\"><button id=\"kvApplyNow\" class=\"primary\" type=\"button\">Apply now</button><button id=\"kvSaveRestart\" type=\"button\">Save for restart</button></div><div id=\"adminNotice\" class=\"notice\" role=\"status\" aria-live=\"polite\"></div></form></div></section>"
+"<section class=\"section\" id=\"contextCapacity\"><div class=\"section-head\"><h2>上下文窗口</h2><p class=\"caption\">数值以 token 计，不代表 RAM。</p></div><div class=\"capacity-grid\"><div class=\"capacity-stats\"><div><span class=\"eyebrow\">当前 / 上限</span><strong id=\"contextCurrent\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">剩余</span><strong id=\"contextRemaining\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">利用率</span><strong id=\"contextUtilization\" class=\"mono\">—</strong></div></div><form class=\"editor\" id=\"contextForm\"><label class=\"eyebrow\" for=\"contextNextInput\">下次启动窗口（token）</label><div class=\"controls\"><input id=\"contextNextInput\" type=\"number\" inputmode=\"numeric\" min=\"1\" step=\"1\"><button id=\"contextSaveRestart\" class=\"primary\" type=\"button\">保存下次启动设置</button></div><div id=\"contextNotice\" class=\"notice\" role=\"status\" aria-live=\"polite\"></div></form></div></section>"
+"<section class=\"section\" id=\"hostStatus\"><div class=\"section-head\"><h2>主机资源</h2><p class=\"caption\">系统采样不可用时明确标注。</p></div><div class=\"dashboard-grid\"><div><span class=\"eyebrow\">物理内存 已用 / 总量 / 可用</span><strong id=\"hostPhysical\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">内存压力 / Swap</span><strong id=\"hostPressure\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">DS4 RSS</span><strong id=\"hostRss\" class=\"mono\">不可用</strong></div></div></section>"
+"<section class=\"section\" id=\"callsSection\"><div class=\"section-head\"><h2>调用记录</h2><p id=\"callsActive\" class=\"caption\">当前活动请求：—</p></div><div class=\"call-filters\"><input id=\"callFilterCaller\" data-call-filter=\"caller\" aria-label=\"按调用方筛选\" placeholder=\"调用方\"><select id=\"callFilterApi\" data-call-filter=\"api\" aria-label=\"按 API 筛选\"><option value=\"\">全部 API</option></select><select id=\"callFilterStatus\" data-call-filter=\"result\" aria-label=\"按结果筛选\"><option value=\"\">全部结果</option><option value=\"active\">进行中</option><option value=\"completed\">完成</option><option value=\"failed\">失败</option></select></div><div class=\"call-table-wrap\"><table><thead><tr><th>请求</th><th>调用方</th><th>API</th><th>结果</th><th>错误</th></tr></thead><tbody id=\"callsRecords\"></tbody></table></div><h3>调用方汇总</h3><div class=\"call-table-wrap\"><table><thead><tr><th>调用方</th><th>调用</th><th>失败</th><th>提示 token</th></tr></thead><tbody id=\"callsCallers\"></tbody></table></div></section>"
 "<section class=\"section\"><div class=\"section-head\"><h2>Request detail</h2></div><table><tbody id=\"requestDetail\"></tbody></table></section></main><script>"
-"const $=id=>document.getElementById(id),dash=$('dashboard');let lastSnapshot=null,online=false,adminLocal=true,adminBusy=false,adminGeneration=0,pollGeneration=0;"
+"const $=id=>document.getElementById(id),dash=$('dashboard');let lastSnapshot=null,online=false,adminLocal=true,adminBusy=false,adminGeneration=0,pollGeneration=0,contextLocal=true,contextBusy=false;"
+"function chineseStatic(){$('currentTitle').textContent='当前请求 / KV token 命中';document.querySelectorAll('.hero .eyebrow').forEach((e,i)=>e.textContent=['当前请求 / KV token 命中','解码 / 平均'][i]);document.querySelectorAll('.hero .caption').forEach(e=>e.textContent='—');document.querySelectorAll('.strip .eyebrow').forEach((e,i)=>e.textContent=['预填充','解码进度','当前会话','请求'][i]);document.querySelectorAll('.section h2').forEach((e,i)=>e.textContent=['进程记录','磁盘 KV 容量','上下文窗口','主机资源','调用记录','请求详情'][i]);$('kvForm').querySelector('label').textContent='容量上限';$('kvBudgetUnit').setAttribute('aria-label','容量单位');$('budgetHelp').textContent='最小 256 MB。立即应用会修改运行时状态；保存会写入下次启动上限。';$('kvApplyNow').textContent='立即应用';$('kvSaveRestart').textContent='保存供重启后使用'}chineseStatic();"
 "const num=n=>Number.isFinite(Number(n))?Number(n):0,ratio=(n,d)=>num(d)>0?num(n)/num(d):null,pct=v=>v==null?'—':(v*100).toFixed(1)+'%',rate=n=>num(n)>0?num(n).toFixed(1)+' t/s':'—';"
 "const bytes=n=>{n=num(n);if(n>=1073741824)return (n/1073741824).toFixed(1)+' GB';if(n>=1048576)return (n/1048576).toFixed(1)+' MB';if(n>=1024)return (n/1024).toFixed(1)+' KB';return Math.round(n)+' B'};"
 "const sec=n=>{n=num(n);if(n<60)return n.toFixed(1)+'s';return Math.floor(n/60)+'m '+(n%60).toFixed(1)+'s'};const text=(id,v)=>$(id).textContent=v;"
 "function rows(items){const body=$('requestDetail');body.replaceChildren();for(const [key,value] of items){const tr=document.createElement('tr'),th=document.createElement('th'),td=document.createElement('td');th.scope='row';th.textContent=key;td.textContent=value==null||value===''?'—':String(value);tr.append(th,td);body.append(tr)}}"
 "function controls(kv){const disabled=adminBusy||!online||!adminLocal||!kv.enabled;$('kvApplyNow').disabled=disabled;$('kvSaveRestart').disabled=disabled;$('kvBudgetInput').disabled=disabled;$('kvBudgetUnit').disabled=disabled}"
+"function contextControls(){const disabled=contextBusy||!online||!contextLocal;$('contextNextInput').disabled=disabled;$('contextSaveRestart').disabled=disabled}"
+"function callRows(id,items,fields){const body=$(id);body.replaceChildren();for(const item of items){const tr=document.createElement('tr');for(const field of fields){const td=document.createElement('td');td.textContent=item[field]==null?'—':String(item[field]);tr.append(td)}body.append(tr)}}"
+"function paintCalls(calls){calls=calls||{};const records=(calls.records||[]).slice(0,200),caller=$('callFilterCaller').value.toLowerCase(),api=$('callFilterApi').value,status=$('callFilterStatus').value;const apis=[...new Set(records.map(x=>x.api||''))];const select=$('callFilterApi');const old=select.value;select.replaceChildren();for(const value of [''].concat(apis)){const option=document.createElement('option');option.value=value;option.textContent=value||'全部 API';select.append(option)}select.value=apis.includes(old)?old:'';const shown=records.filter(x=>(!caller||String(x.caller||'').toLowerCase().includes(caller))&&(!api||x.api===api)&&(!status||x.status===status));callRows('callsRecords',shown,['request_id','caller','api','status','error']);callRows('callsCallers',calls.callers||[],['caller','calls','failed','prompt_tokens']);text('callsActive','当前活动请求：'+(calls.active_request_id||'—'))}"
+"function pressure(v){return v==='normal'?'正常':v==='warning'?'警告':v==='critical'?'严重':'不可用'}"
+"function paintHost(h){if(!h||!h.available){text('hostPhysical','不可用');text('hostPressure','不可用');text('hostRss','不可用');return}text('hostPhysical',bytes(h.memory_used_bytes)+' / '+bytes(h.memory_total_bytes)+' / '+bytes(h.memory_available_bytes));text('hostPressure',pressure(h.memory_pressure)+' / '+bytes(h.swap_used_bytes)+' / '+bytes(h.swap_total_bytes));text('hostRss',bytes(h.process_rss_bytes))}"
 "function paint(s){lastSnapshot=s;online=true;dash.classList.remove('stale');const m=s.model||{},r=s.request||{},p=s.prefill||{},d=s.decode||{},t=s.totals||{},c=t.cache||{},k=s.kv_cache||{};text('model',(m.name||'Unknown model')+' / '+(m.backend||'unknown backend')+' / '+num(m.context_length).toLocaleString()+' token context');text('phase',s.phase||'idle');text('health',s.active?'active':'ready');text('queue',num(s.queue_depth));text('clients',num(s.clients));"
 "const rr=ratio(r.cached_tokens,r.prompt_tokens);text('requestHitRate',pct(rr));text('requestHitDetail',num(r.cached_tokens).toLocaleString()+' cached / '+num(r.prompt_tokens).toLocaleString()+' prompt · source '+(r.cache_source||'none'));text('decodeSpeed',rate(d.avg_tps));"
 "text('prefillSpeed',rate(p.avg_tps)+' average');text('prefillDetail',num(p.current).toLocaleString()+' / '+num(p.total).toLocaleString()+' · chunk '+rate(p.chunk_tps)+' · ETA '+(num(p.total)>num(p.current)?sec(p.eta_sec):'—'));$('prefillBar').style.width=Math.max(0,Math.min(100,num(p.percent)))+'%';text('decodeProgress',num(d.generated).toLocaleString()+' / '+num(d.max_tokens).toLocaleString()+' tokens');text('decodeChunk','chunk '+rate(d.chunk_tps));const cr=ratio(m.session_pos,m.context_length);text('sessionTokens',num(m.session_pos).toLocaleString()+' / '+num(m.context_length).toLocaleString());text('contextRatio',pct(cr)+' context utilization · tokens, not RAM bytes');text('requestElapsed',s.active?sec(r.elapsed_sec):'—');text('requestFlags',(r.api||'—')+' · '+(r.tools?'tools':'no tools')+' · '+(r.stream?'stream':'buffered'));"
 "text('processTokenHitRate',pct(ratio(c.cached_tokens,c.prompt_tokens)));text('processTokenDetail',num(c.cached_tokens).toLocaleString()+' / '+num(c.prompt_tokens).toLocaleString()+' prompt tokens');text('processRequestHitRate',pct(ratio(c.hit_requests,c.prompt_requests)));text('processRequestDetail',num(c.hit_requests).toLocaleString()+' / '+num(c.prompt_requests).toLocaleString()+' prompt requests');text('outcomes',num(t.completed).toLocaleString()+' / '+num(t.failed).toLocaleString());text('outcomeDetail','successful / failed · '+num(t.requests).toLocaleString()+' total');"
-"if(!k.enabled){text('kvUsed','Disabled');text('kvBudget','Disabled');text('kvEntries','—');text('kvUtilization','Disk KV cache is not configured.');$('kvBar').style.width='0%'}else{const ku=ratio(k.used_bytes,k.budget_bytes);text('kvUsed',bytes(k.used_bytes));text('kvBudget',bytes(k.budget_bytes));text('kvEntries',num(k.entries).toLocaleString());text('kvUtilization',pct(ku)+' utilized');$('kvBar').style.width=Math.max(0,Math.min(100,(ku||0)*100))+'%';if(!$('kvForm').contains(document.activeElement)){$('kvBudgetInput').value=(num(k.budget_bytes)/1073741824).toFixed(2).replace(/\\.?0+$/,'');$('kvBudgetUnit').value='GB'}}controls(k);rows([['kind',r.kind],['API',r.api],['stream',r.stream?'yes':'no'],['tools',r.tools?'yes':'no'],['prompt tokens',num(r.prompt_tokens)],['cached tokens',num(r.cached_tokens)],['cache write tokens',num(r.cache_write_tokens)],['cache source',r.cache_source],['finish',r.finish],['last error',r.last_error]]);}"
-"function budgetMB(){const value=Number($('kvBudgetInput').value),factor=$('kvBudgetUnit').value==='GB'?1024:1,mb=value*factor;if(!Number.isFinite(mb)||!Number.isInteger(mb)||mb<256)throw new Error('Enter a capacity that resolves to an integer number of MB (minimum 256 MB).');return mb}"
+"text('model',(m.name||'未知模型')+' / '+(m.backend||'未知后端')+' / '+num(m.context_length).toLocaleString()+' token 上下文');text('phase',({decode:'解码中',prefill:'预填充中',idle:'空闲'})[s.phase]||s.phase||'未知');text('health',s.active?'运行中':'就绪');text('requestHitDetail',num(r.cached_tokens).toLocaleString()+' 命中 / '+num(r.prompt_tokens).toLocaleString()+' 提示 · 来源 '+(r.cache_source||'无'));$('decodeSpeed').nextElementSibling.textContent='每秒 token';text('prefillSpeed',rate(p.avg_tps)+' 平均');text('prefillDetail',num(p.current).toLocaleString()+' / '+num(p.total).toLocaleString()+' · 分段 '+rate(p.chunk_tps)+' · 预计 '+(num(p.total)>num(p.current)?sec(p.eta_sec):'—'));text('decodeProgress',num(d.generated).toLocaleString()+' / '+num(d.max_tokens).toLocaleString()+' token');text('decodeChunk','分段 '+rate(d.chunk_tps));text('contextRatio',pct(cr)+' 上下文利用率 · token，不是 RAM 字节');text('requestFlags',(r.api||'—')+' · '+(r.tools?'工具':'无工具')+' · '+(r.stream?'流式':'缓冲'));text('processTokenDetail',num(c.cached_tokens).toLocaleString()+' / '+num(c.prompt_tokens).toLocaleString()+' 提示 token');text('processRequestDetail',num(c.hit_requests).toLocaleString()+' / '+num(c.prompt_requests).toLocaleString()+' 提示请求');text('outcomeDetail','成功 / 失败 · 共 '+num(t.requests).toLocaleString()+' 次');"
+"if(!k.enabled){text('kvUsed','已禁用');text('kvBudget','已禁用');text('kvEntries','—');text('kvUtilization','未配置磁盘 KV 缓存。');$('kvBar').style.width='0%'}else{const ku=ratio(k.used_bytes,k.budget_bytes);text('kvUsed',bytes(k.used_bytes));text('kvBudget',bytes(k.budget_bytes));text('kvEntries',num(k.entries).toLocaleString());text('kvUtilization',pct(ku)+' 已使用');$('kvBar').style.width=Math.max(0,Math.min(100,(ku||0)*100))+'%';if(!$('kvForm').contains(document.activeElement)){$('kvBudgetInput').value=(num(k.budget_bytes)/1073741824).toFixed(2).replace(/\\.?0+$/,'');$('kvBudgetUnit').value='GB'}}const x=s.context||{};text('contextCurrent',num(x.current_tokens).toLocaleString()+' / '+num(x.limit_tokens).toLocaleString());text('contextRemaining',num(x.remaining).toLocaleString());text('contextUtilization',pct(x.utilization));if(!$('contextForm').contains(document.activeElement))$('contextNextInput').value=num(x.next_limit_tokens)||num(x.limit_tokens)||'';contextControls();paintHost(s.host);paintCalls(s.calls);controls(k);rows([['类别',r.kind],['API',r.api],['流式',r.stream?'是':'否'],['工具',r.tools?'是':'否'],['提示 token',num(r.prompt_tokens)],['命中 token',num(r.cached_tokens)],['写入缓存 token',num(r.cache_write_tokens)],['缓存来源',r.cache_source],['结束原因',r.finish],['最近错误',r.last_error]]);}"
+"function budgetMB(){const value=Number($('kvBudgetInput').value),factor=$('kvBudgetUnit').value==='GB'?1024:1,mb=value*factor;if(!Number.isFinite(mb)||!Number.isInteger(mb)||mb<256)throw new Error('请输入换算后为整数 MB 的容量（最小 256 MB）。');return mb}"
 "async function admin(mode,mb,revision){const payload={mode,budget_mb:mb};if(mode==='apply')payload.revision=String(revision);const response=await fetch('/ds4/admin/kv-cache',{method:'POST',headers:{'Content-Type':'application/json','X-DS4-Admin':'1'},body:JSON.stringify(payload)});let body;try{body=await response.json()}catch(e){throw new Error('The server returned an unreadable admin response.')}if(response.status===403){adminLocal=false;if(lastSnapshot)controls(lastSnapshot.kv_cache||{});throw new Error('Capacity controls are available only from localhost.')}if(!body.ok&&!(mode==='persist'&&body.persistent&&body.persistent.committed)){const error=new Error((body.error&&body.error.message)||'The capacity operation failed.');error.code=body.error&&body.error.code;error.body=body;throw error}return body}"
-"function runtimeMessage(body){const r=body.runtime||{},evicted=Math.max(0,num(r.before_entries)-num(r.after_entries));return 'Runtime: '+bytes(r.before_bytes)+' → '+bytes(r.after_bytes)+', entries '+num(r.before_entries)+' → '+num(r.after_entries)+' ('+evicted+' evicted); limit '+bytes(r.old_budget_bytes)+' → '+bytes(r.new_budget_bytes)+'.'}"
-"function persistentMessage(body){const p=body.persistent||{};if(!p.attempted)return 'Persistence was not attempted.';if(p.ok&&p.committed&&p.durable)return 'Saved for restart: committed and durable.';if(p.committed&&!p.durable)return 'Saved for restart: committed, but durability was not confirmed.';return 'The restart setting was not committed.'}"
+"function runtimeMessage(body){const r=body.runtime||{},evicted=Math.max(0,num(r.before_entries)-num(r.after_entries));return '运行时：'+bytes(r.before_bytes)+' → '+bytes(r.after_bytes)+'，条目 '+num(r.before_entries)+' → '+num(r.after_entries)+'（清理 '+evicted+' 条）；上限 '+bytes(r.old_budget_bytes)+' → '+bytes(r.new_budget_bytes)+'。'}"
+"function persistentMessage(body){const p=body.persistent||{};if(!p.attempted)return '未尝试持久化。';if(p.ok&&p.committed&&p.durable)return '已保存供下次启动使用：已提交并完成持久化。';if(p.committed&&!p.durable)return '已保存供下次启动使用：已提交，但尚未确认持久化。';return '未能提交下次启动设置。'}"
 "function adminNotice(op,message,bad){if(op!==adminGeneration)return;$('adminNotice').className=bad?'notice bad':'notice';text('adminNotice',message)}"
-"async function adminOperation(work){if(adminBusy)return;const op=++adminGeneration;adminBusy=true;controls((lastSnapshot&&lastSnapshot.kv_cache)||{});try{await work(op)}catch(e){adminNotice(op,e.message,true)}finally{if(op===adminGeneration){adminBusy=false;controls((lastSnapshot&&lastSnapshot.kv_cache)||{})}}}"
-"async function applyWork(op){const mb=budgetMB();for(let attempt=0;attempt<2;attempt++){adminNotice(op,attempt?'KV state changed; checking again…':'Checking eviction pressure…',false);const dry=await admin('dry-run',mb),r=dry.runtime||{};if(!r.ok||r.revision==null)throw new Error('The runtime dry-run did not return a valid revision.');if(r.eviction_required&&!confirm('Current disk KV usage is '+bytes(r.before_bytes)+'. The new limit is '+bytes(r.new_budget_bytes)+'. Applying it may evict indexed entries. Continue?')){adminNotice(op,'Apply cancelled; runtime capacity was not changed.',false);return}try{const revision=String(r.revision),applied=await admin('apply',mb,revision);if(!(applied.runtime&&applied.runtime.ok&&applied.runtime.applied))throw new Error('The server did not confirm that the runtime limit was applied.');adminNotice(op,runtimeMessage(applied),false);return}catch(e){if(e.code==='kv_state_changed'&&attempt===0)continue;if(e.code==='kv_state_changed')throw new Error('KV state kept changing. Wait for active cache work to settle, then try again.');throw e}}}"
-"async function saveWork(op){const mb=budgetMB();adminNotice(op,'Saving next-start limit…',false);const saved=await admin('persist',mb),p=saved.persistent||{};if(!p.committed)throw new Error('The server did not commit the restart setting.');adminNotice(op,persistentMessage(saved),!p.ok||!p.durable)}"
+"async function adminOperation(work){if(adminBusy)return;const op=++adminGeneration;adminBusy=true;controls((lastSnapshot&&lastSnapshot.kv_cache)||{});try{await work(op)}catch(e){adminNotice(op,e.code==='kv_state_changed'?'KV 状态持续变化，请等待活动缓存操作结束后重试。':/^[\u4e00-\u9fff]/.test(e.message)?e.message:'操作失败：请检查输入、权限或服务器状态。',true)}finally{if(op===adminGeneration){adminBusy=false;controls((lastSnapshot&&lastSnapshot.kv_cache)||{})}}}"
+"async function applyWork(op){const mb=budgetMB();for(let attempt=0;attempt<2;attempt++){adminNotice(op,attempt?'KV 状态已变化，正在重新检查…':'正在检查清理压力…',false);const dry=await admin('dry-run',mb),r=dry.runtime||{};if(!r.ok||r.revision==null)throw new Error('运行时预检未返回有效修订版本。');if(r.eviction_required&&!confirm('当前磁盘 KV 使用量为 '+bytes(r.before_bytes)+'。新上限为 '+bytes(r.new_budget_bytes)+'。应用后可能清理已索引条目，是否继续？')){adminNotice(op,'已取消应用；运行时容量未改变。',false);return}try{const revision=String(r.revision),applied=await admin('apply',mb,revision);if(!(applied.runtime&&applied.runtime.ok&&applied.runtime.applied))throw new Error('服务器未确认已应用运行时上限。');adminNotice(op,runtimeMessage(applied),false);return}catch(e){if(e.code==='kv_state_changed'&&attempt===0)continue;if(e.code==='kv_state_changed')throw new Error('KV 状态持续变化。');throw e}}}"
+"async function saveWork(op){const mb=budgetMB();adminNotice(op,'正在保存下次启动上限…',false);const saved=await admin('persist',mb),p=saved.persistent||{};if(!p.committed)throw new Error('服务器未提交下次启动设置。');adminNotice(op,persistentMessage(saved),!p.ok||!p.durable)}"
 "function applyNow(){if(adminBusy)return;return adminOperation(applyWork)}function saveRestart(){if(adminBusy)return;return adminOperation(saveWork)}"
-"async function tick(){const generation=++pollGeneration;try{const response=await fetch('/ds4/status',{cache:'no-store'});if(!response.ok)throw new Error('status '+response.status);const snapshot=await response.json();if(generation===pollGeneration)paint(snapshot)}catch(e){if(generation===pollGeneration){online=false;dash.classList.add('stale');text('phase','offline');text('health',lastSnapshot?'stale':'unavailable');controls((lastSnapshot&&lastSnapshot.kv_cache)||{})}}finally{if(generation===pollGeneration)setTimeout(tick,1000)}}$('kvApplyNow').addEventListener('click',applyNow);$('kvSaveRestart').addEventListener('click',saveRestart);tick();"
+"async function saveContext(){if(contextBusy)return;const value=Number($('contextNextInput').value);if(!Number.isInteger(value)||value<1){text('contextNotice','请输入正整数 token 上限');return}contextBusy=true;contextControls();try{const response=await fetch('/ds4/admin/context',{method:'POST',headers:{'Content-Type':'application/json','X-DS4-Admin':'1'},body:JSON.stringify({context_tokens:value})});let body;try{body=await response.json()}catch(e){throw new Error('服务器返回了无法读取的上下文设置结果。')}if(response.status===403){contextLocal=false;throw new Error('上下文设置仅可从本机管理。')}if(!body.ok&&!(body.persistent&&body.persistent.committed))throw new Error((body.error&&body.error.message)||'上下文设置失败。');const p=body.persistent||{};text('contextNotice',p.committed&&p.durable?'已保存：下次启动生效，需要重启。':p.committed?'已提交，但尚未确认已持久化；下次启动生效，需要重启。':'未能提交下次启动设置。')}catch(e){$('contextNotice').className='notice bad';text('contextNotice',e.message)}finally{contextBusy=false;contextControls()}}"
+"function setTheme(value){const theme=['paper','terminal','calm'].includes(value)?value:'paper';dash.dataset.theme=theme;try{localStorage.setItem('ds4-dashboard-theme',theme)}catch(e){}document.querySelectorAll('[data-theme-choice]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.themeChoice===theme)))}try{setTheme(localStorage.getItem('ds4-dashboard-theme'))}catch(e){setTheme('paper')}document.querySelectorAll('[data-theme-choice]').forEach(b=>b.addEventListener('click',()=>setTheme(b.dataset.themeChoice)));['callFilterCaller','callFilterApi','callFilterStatus'].forEach(id=>$(id).addEventListener('input',()=>paintCalls((lastSnapshot||{}).calls)));"
+"async function tick(){const generation=++pollGeneration;try{const response=await fetch('/ds4/status',{cache:'no-store'});if(!response.ok)throw new Error('status '+response.status);const snapshot=await response.json();if(generation===pollGeneration)paint(snapshot)}catch(e){if(generation===pollGeneration){online=false;dash.classList.add('stale');text('phase','离线');text('health',lastSnapshot?'数据已过期':'不可用');controls((lastSnapshot&&lastSnapshot.kv_cache)||{});contextControls()}}finally{if(generation===pollGeneration)setTimeout(tick,1000)}}$('kvApplyNow').addEventListener('click',applyNow);$('kvSaveRestart').addEventListener('click',saveRestart);$('contextSaveRestart').addEventListener('click',saveContext);tick();"
 "</script></body></html>\n";
 
 static bool send_dashboard_page(int fd, bool enable_cors) {
@@ -8363,8 +8379,9 @@ static void append_status_json(buf *b, const server_status *st,
 	if (current > limit) current = limit;
 	int remaining = limit > current ? limit - current : 0;
 	double utilization = limit > 0 ? (double)current / (double)limit : 0.0;
-	buf_printf(b, ",\"context\":{\"current_tokens\":%d,\"limit_tokens\":%d,\"remaining\":%d,\"utilization\":%.3f}",
-		current, limit, remaining, utilization);
+	int next_limit = st->next_ctx_size > 0 ? st->next_ctx_size : limit;
+	buf_printf(b, ",\"context\":{\"current_tokens\":%d,\"limit_tokens\":%d,\"next_limit_tokens\":%d,\"remaining\":%d,\"utilization\":%.3f}",
+		current, limit, next_limit, remaining, utilization);
 	const ds4_host_metrics unavailable = { .pressure = DS4_HOST_PRESSURE_UNKNOWN };
 	if (!host) host = &unavailable;
 	buf_printf(b, ",\"host\":{\"available\":%s,\"memory_total_bytes\":%llu,\"memory_used_bytes\":%llu,\"memory_available_bytes\":%llu,\"memory_pressure\":",
@@ -12778,6 +12795,11 @@ static bool context_admin_handle_authorized(server *s, int fd, bool cors,
 		(kv_admin_persist_result){0}, "context_persist_failed", "cannot resolve context persistence path");
 	char detail[160] = {0};
 	kv_admin_persist_result persisted = context_admin_persist_tokens_ex(target, tokens, detail, sizeof(detail));
+	if (persisted.committed && s) {
+		pthread_mutex_lock(&s->status_mu);
+		s->status.next_ctx_size = (int)tokens;
+		pthread_mutex_unlock(&s->status_mu);
+	}
 	return context_admin_response(fd, cors, persisted.ok ? 200 : 500, current, tokens, true,
 		persisted, persisted.ok ? NULL : "context_persist_failed", persisted.ok ? NULL : detail);
 }
@@ -13954,7 +13976,7 @@ static void test_dashboard_page_is_served_as_html(void) {
     char *out = read_socket_text(sv[1]);
     TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
     TEST_ASSERT(strstr(out, "Content-Type: text/html; charset=utf-8") != NULL);
-    TEST_ASSERT(strstr(out, "<title>DS4 Server</title>") != NULL);
+    TEST_ASSERT(strstr(out, "<title>DS4 运行报告</title>") != NULL);
     TEST_ASSERT(strstr(out, "/ds4/status") != NULL);
     TEST_ASSERT(strstr(out, "id=\"requestHitRate\"") != NULL);
     TEST_ASSERT(strstr(out, "id=\"processTokenHitRate\"") != NULL);
@@ -13964,8 +13986,18 @@ static void test_dashboard_page_is_served_as_html(void) {
     TEST_ASSERT(strstr(out, "id=\"kvApplyNow\"") != NULL);
     TEST_ASSERT(strstr(out, "id=\"kvSaveRestart\"") != NULL);
     TEST_ASSERT(strstr(out, "id=\"adminNotice\"") != NULL);
+    TEST_ASSERT(strstr(out, "data-theme=\"paper\"") != NULL);
+    TEST_ASSERT(strstr(out, "纸面运行报告") != NULL);
+    TEST_ASSERT(strstr(out, "id=\"contextNextInput\"") != NULL);
+    TEST_ASSERT(strstr(out, "id=\"contextSaveRestart\"") != NULL);
+    TEST_ASSERT(strstr(out, "id=\"contextNotice\"") != NULL);
+    TEST_ASSERT(strstr(out, "id=\"hostPhysical\"") != NULL);
+    TEST_ASSERT(strstr(out, "id=\"callsRecords\"") != NULL);
+    TEST_ASSERT(strstr(out, "data-call-filter=\"caller\"") != NULL);
+    TEST_ASSERT(strstr(out, "/ds4/admin/context") != NULL);
     TEST_ASSERT(strstr(out, "/ds4/admin/kv-cache") != NULL);
     TEST_ASSERT(strstr(out, "X-DS4-Admin") != NULL);
+    TEST_ASSERT(strstr(out, "document.createElement") != NULL);
     TEST_ASSERT(strstr(out, "ratio=(n,d)=>num(d)>0") != NULL);
     TEST_ASSERT(strstr(out, "v==null?'—'") != NULL);
     TEST_ASSERT(strstr(out, "!$('kvForm').contains(document.activeElement)") != NULL);
@@ -14382,6 +14414,8 @@ static void test_env_restore(test_env_value *env) {
 
 static void test_context_admin_persistence_path_env(void) {
 	test_env_value home = {0}, ctx_file = {0};
+	server s = {0};
+	pthread_mutex_init(&s.status_mu, NULL);
 	test_env_snapshot(&home, "HOME");
 	test_env_snapshot(&ctx_file, "DS4_CTX_FILE");
 	char tmpl[] = "/tmp/ds4-context-admin-env.XXXXXX";
@@ -14393,11 +14427,12 @@ static void test_context_admin_persistence_path_env(void) {
 	snprintf(default_path, sizeof(default_path), "%s/.ds4/context-tokens", root);
 	TEST_ASSERT(setenv("HOME", root, 1) == 0);
 	TEST_ASSERT(setenv("DS4_CTX_FILE", custom, 1) == 0);
-	server s = {0}; s.status.ctx_size = 65536;
+	s.status.ctx_size = 65536;
 	char *out = test_context_admin_core(&s, "{\"context_tokens\":131072}", NULL);
 	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
 	TEST_ASSERT(strstr(out, "\"current_context_tokens\":65536") != NULL);
 	TEST_ASSERT(strstr(out, "\"next_context_tokens\":131072") != NULL);
+	TEST_ASSERT(s.status.next_ctx_size == 131072);
 	TEST_ASSERT(access(custom, F_OK) == 0 && access(default_path, F_OK) != 0);
 	struct stat st;
 	TEST_ASSERT(stat(custom, &st) == 0 && (st.st_mode & 0777) == 0600);
@@ -14431,6 +14466,7 @@ static void test_context_admin_persistence_path_env(void) {
 	snprintf(default_dir, sizeof(default_dir), "%s/.ds4", root);
 	rmdir(custom_dir); rmdir(default_dir); rmdir(root);
 cleanup:
+	pthread_mutex_destroy(&s.status_mu);
 	test_env_restore(&ctx_file);
 	test_env_restore(&home);
 }
@@ -15098,6 +15134,7 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
         122.0, 3, "disk", "stop", NULL);
     ds4_call_history_snapshot calls = ds4_call_history_snapshot_take(&history, 123.5);
     s.status.ctx_size = 100;
+    s.status.next_ctx_size = 256;
     s.status.session_pos = 40;
     buf b = {0};
     append_status_json(&b, &s.status, &kv, &host, &calls, history.capacity, 0);
@@ -15107,7 +15144,8 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
     TEST_ASSERT(strstr(b.ptr, "\"kv_cache\":{\"enabled\":true,"
                               "\"budget_bytes\":4096,\"used_bytes\":1024,"
                               "\"entries\":3,\"revision\":\"7\"}") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"context\":{\"current_tokens\":40,\"limit_tokens\":100,\"remaining\":60,\"utilization\":0.400") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"context\":{\"current_tokens\":40,\"limit_tokens\":100,\"next_limit_tokens\":256,\"remaining\":60,\"utilization\":0.400") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "context-tokens") == NULL);
     TEST_ASSERT(strstr(b.ptr, "\"host\":{\"available\":true,\"memory_total_bytes\":1000,\"memory_used_bytes\":600,\"memory_available_bytes\":400,\"memory_pressure\":\"warning\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"calls\":{\"capacity\":200,\"active_request_id\":\"0\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"request_id\":\"1\",\"caller\":\"status-client\"") != NULL);
@@ -15121,14 +15159,14 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
     TEST_ASSERT(strstr(b.ptr, "\"kv_cache\":{\"enabled\":false,"
                               "\"budget_bytes\":0,\"used_bytes\":0,"
                               "\"entries\":0,\"revision\":\"0\"}") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"context\":{\"current_tokens\":100,\"limit_tokens\":100,\"remaining\":0,\"utilization\":1.000") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"context\":{\"current_tokens\":100,\"limit_tokens\":100,\"next_limit_tokens\":256,\"remaining\":0,\"utilization\":1.000") != NULL);
     buf_free(&b);
 
     b = (buf){0};
     s.status.ctx_size = -1;
     s.status.session_pos = 9;
     append_status_json(&b, &s.status, NULL, &host, &calls, history.capacity, 0);
-    TEST_ASSERT(strstr(b.ptr, "\"context\":{\"current_tokens\":0,\"limit_tokens\":0,\"remaining\":0,\"utilization\":0.000") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"context\":{\"current_tokens\":0,\"limit_tokens\":0,\"next_limit_tokens\":256,\"remaining\":0,\"utilization\":0.000") != NULL);
     buf_free(&b);
     ds4_call_history_snapshot_free(&calls);
     ds4_call_history_free(&history);

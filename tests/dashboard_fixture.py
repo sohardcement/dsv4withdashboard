@@ -9,7 +9,10 @@ page = "".join(ast.literal_eval(s) for s in re.findall(r'"(?:[^"\\]|\\.)*"', blo
 base_kv = {"enabled": True, "budget_bytes": 64 << 30, "used_bytes": 46 << 30, "entries": 116, "revision": "1"}
 state = {"kv": dict(base_kv), "admin": [], "status_active": 0, "status_max": 0,
          "status_delay_ms": 0, "admin_delay_ms": 0, "forbidden": False,
-         "malformed": False, "mismatch_once": False, "mismatch_remaining": 0, "mismatch_makes_eviction": False}
+         "malformed": False, "mismatch_once": False, "mismatch_remaining": 0, "mismatch_makes_eviction": False,
+         "context": {"current_tokens":48120,"limit_tokens":163840,"next_limit_tokens":163840,"remaining":115720,"utilization":.2937},
+         "context_admin": [], "context_forbidden": False, "context_durable": True,
+         "host_available": True, "offline": False}
 lock = threading.Lock()
 
 def status():
@@ -19,7 +22,9 @@ def status():
       "prefill":{"current":8192,"total":8192,"percent":100,"avg_tps":1850.4,"chunk_tps":2011.2,"elapsed_sec":4.4,"eta_sec":0},
       "decode":{"generated":814,"max_tokens":4096,"avg_tps":52.7,"chunk_tps":55.1,"elapsed_sec":14},
       "totals":{"requests":48,"completed":45,"failed":2,"cache":{"prompt_tokens":1264000,"cached_tokens":782000,"prompt_requests":47,"hit_requests":31}},
-      "kv_cache":dict(state["kv"])}
+      "kv_cache":dict(state["kv"]), "context":dict(state["context"]),
+      "host":{"available":state["host_available"],"memory_total_bytes":128<<30,"memory_used_bytes":96<<30,"memory_available_bytes":32<<30,"memory_pressure":"warning","swap_total_bytes":16<<30,"swap_used_bytes":2<<30,"process_rss_bytes":12<<30},
+      "calls":{"active_request_id":"99","records":[{"request_id":"99","caller":"direct","api":"responses","status":"active","error":"<img src=x>"},{"request_id":"98","caller":"<b>恶意调用方</b>","api":"chat","status":"failed","error":"<script>坏</script>"}],"callers":[{"caller":"direct","calls":4,"failed":0,"prompt_tokens":90},{"caller":"<b>恶意调用方</b>","calls":1,"failed":1,"prompt_tokens":8}]}}
 
 class Handler(BaseHTTPRequestHandler):
     def json(self, value, code=200):
@@ -29,6 +34,7 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 state["status_active"] += 1; state["status_max"] = max(state["status_max"], state["status_active"]); delay=state["status_delay_ms"]
             time.sleep(delay/1000)
+            if state["offline"]: self.send_error(503); return
             self.json(status())
             with lock: state["status_active"] -= 1
         elif self.path == "/fixture/state": self.json(state)
@@ -38,10 +44,18 @@ class Handler(BaseHTTPRequestHandler):
         body=json.loads(self.rfile.read(int(self.headers.get("Content-Length","0"))))
         if self.path == "/fixture/config":
             if body.get("reset"):
-                state.update(kv=dict(base_kv), admin=[], status_active=0, status_max=0, status_delay_ms=0, admin_delay_ms=0, forbidden=False, malformed=False, mismatch_once=False, mismatch_remaining=0, mismatch_makes_eviction=False, eviction_fail=False)
+                state.update(kv=dict(base_kv), admin=[], status_active=0, status_max=0, status_delay_ms=0, admin_delay_ms=0, forbidden=False, malformed=False, mismatch_once=False, mismatch_remaining=0, mismatch_makes_eviction=False, eviction_fail=False, context={"current_tokens":48120,"limit_tokens":163840,"next_limit_tokens":163840,"remaining":115720,"utilization":.2937}, context_admin=[], context_forbidden=False, context_durable=True, host_available=True, offline=False)
             for key,value in body.items():
                 if key != "reset": state[key]=value
             self.json(state); return
+        if self.path == "/ds4/admin/context":
+            state["context_admin"].append({"value":body.get("context_tokens"),"header":self.headers.get("X-DS4-Admin")})
+            if state["context_forbidden"]: self.json({"ok":False,"error":{"message":"fixture context forbidden"}},403); return
+            value=body.get("context_tokens")
+            if not isinstance(value,int) or value < 1: self.json({"ok":False,"error":{"message":"invalid context"}},400); return
+            durable=state["context_durable"]
+            state["context"]["next_limit_tokens"]=value
+            self.json({"ok":True,"current_context_tokens":state["context"]["limit_tokens"],"next_context_tokens":value,"persistent":{"attempted":True,"committed":True,"durable":durable,"ok":durable}}); return
         state["admin"].append({"mode":body.get("mode"),"revision":body.get("revision"),"header":self.headers.get("X-DS4-Admin")})
         time.sleep(state["admin_delay_ms"]/1000)
         if state["forbidden"]: self.json({"ok":False,"error":{"code":"forbidden","message":"fixture forbidden"}},403); return
