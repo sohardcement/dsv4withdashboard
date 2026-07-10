@@ -128,6 +128,7 @@ typedef struct {
 } ds4_kvstore_load_result;
 
 ds4_kvstore_options ds4_kvstore_default_options(void);
+void ds4_kvstore_set_unlink_file_for_tests(int (*unlink_file)(const char *path));
 uint8_t ds4_kvstore_reason_code(const char *reason);
 const char *ds4_kvstore_key_kind(uint8_t ext_flags);
 

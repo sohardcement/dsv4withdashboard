@@ -55,6 +55,8 @@
  * density to evict them. */
 #define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
 
+static int (*kv_test_unlink_file)(const char *path);
+
 typedef struct {
     char *ptr;
     size_t len;
@@ -169,6 +171,10 @@ ds4_kvstore_options ds4_kvstore_default_options(void) {
         .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
         .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
     };
+}
+
+void ds4_kvstore_set_unlink_file_for_tests(int (*unlink_file)(const char *path)) {
+	kv_test_unlink_file = unlink_file;
 }
 
 uint8_t ds4_kvstore_reason_code(const char *reason) {
@@ -671,6 +677,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->log_name = log_name;
     kc->log = log;
     kc->log_ud = log_ud;
+	kc->unlink_file = kv_test_unlink_file;
     if (!kv_mkdir_p(dir)) {
         kv_logf(kc, DS4_KVSTORE_LOG_DEFAULT,
                 "%s: failed to create KV cache directory %s: %s",
@@ -683,7 +690,13 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->budget_bytes = budget_mb * 1024ull * 1024ull;
     kc->reject_different_quant = reject_different_quant;
     kc->opt = opt;
-    ds4_kvstore_evict(kc, NULL, 0, NULL);
+    if (!ds4_kvstore_evict(kc, NULL, 0, NULL)) {
+		kv_logf(kc, DS4_KVSTORE_LOG_WARNING,
+				"%s: failed to enforce initial KV cache budget for %s",
+				kv_log_name(kc), kc->dir);
+		ds4_kvstore_close(kc);
+		return false;
+	}
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
             "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
             kv_log_name(kc),
@@ -989,6 +1002,11 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         size_t err_len) {
     if (!kc->enabled) return false;
     if (!tokens || store_len < kc->opt.min_tokens) return false;
+	if (!ds4_kvstore_evict(kc, NULL, 0, NULL)) {
+		if (err && err_len)
+			snprintf(err, err_len, "failed to evict KV cache to its current budget");
+		return false;
+	}
     const int original_len = tokens->len;
 
     ds4_tokens store_tokens = {0};
@@ -1104,7 +1122,18 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
     };
-    ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
+    if (!ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming)) {
+		kv_logf(kc, DS4_KVSTORE_LOG_WARNING,
+				"%s: kv cache skipped tokens=%d reason=%s because eviction could not enforce the cache budget",
+				kv_log_name(kc), store_tokens.len, reason);
+		if (err && err_len)
+			snprintf(err, err_len, "failed to evict KV cache for incoming store");
+		ds4_session_payload_file_free(&staged);
+		free(text);
+		free(path);
+		ds4_tokens_free(&store_tokens);
+		return false;
+	}
 
     kv_buf tmpb = {0};
     kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());

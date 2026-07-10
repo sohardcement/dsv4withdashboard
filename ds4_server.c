@@ -8969,7 +8969,7 @@ static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
 static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
                            uint64_t extra_bytes,
                            const ds4_kvstore_eviction_context *incoming) {
-    ds4_kvstore_evict(kc, live, extra_bytes, incoming);
+    (void)ds4_kvstore_evict(kc, live, extra_bytes, incoming);
 }
 #endif
 
@@ -15726,7 +15726,7 @@ static void test_kv_cache_budget_changes(void) {
 	kc.dir = xstrdup(dir);
 	kc.opt = kv_cache_default_options();
 	kc.budget_bytes = 1000;
-	ds4_kvstore_evict(&kc, NULL, 0, NULL);
+	(void)ds4_kvstore_evict(&kc, NULL, 0, NULL);
 	TEST_ASSERT(kc.len == 2);
 
 	ds4_kvstore_budget_result dry = ds4_kvstore_set_budget(&kc, 500, false);
@@ -15806,7 +15806,7 @@ static void test_kv_cache_budget_refreshes_external_files(void) {
 	kc.dir = xstrdup(dir);
 	kc.opt = kv_cache_default_options();
 	kc.budget_bytes = 1000;
-	ds4_kvstore_evict(&kc, NULL, 0, NULL);
+	(void)ds4_kvstore_evict(&kc, NULL, 0, NULL);
 	TEST_ASSERT(kc.len == 1);
 
 	/* Simulate another process adding a valid cache entry after our index. */
@@ -15867,7 +15867,7 @@ static void test_kv_cache_budget_reports_unlink_failure(void) {
 	kc.opt = kv_cache_default_options();
 	kc.budget_bytes = 1000;
 	kc.unlink_file = test_kv_cache_unlink_fails;
-	ds4_kvstore_evict(&kc, NULL, 0, NULL);
+	(void)ds4_kvstore_evict(&kc, NULL, 0, NULL);
 	TEST_ASSERT(kc.len == 2);
 
 	ds4_kvstore_budget_result result = ds4_kvstore_set_budget(&kc, 500, true);
@@ -15896,6 +15896,83 @@ static void test_kv_cache_budget_reports_unlink_failure(void) {
 	unlink(second_path);
 	free(first_path);
 	free(second_path);
+	rmdir(dir);
+}
+
+static int test_kv_cache_file_count(const char *dir) {
+	DIR *d = opendir(dir);
+	TEST_ASSERT(d != NULL);
+	if (!d) return -1;
+	int count = 0;
+	struct dirent *de;
+	while ((de = readdir(d)) != NULL) {
+		char sha[41];
+		if (sha_hex_name(de->d_name, sha)) count++;
+	}
+	closedir(d);
+	return count;
+}
+
+static void test_kv_cache_store_rejects_failed_eviction(void) {
+	char tmpl[] = "/tmp/ds4-kv-store-evict-fail-test.XXXXXX";
+	char *dir = mkdtemp(tmpl);
+	TEST_ASSERT(dir != NULL);
+	if (!dir) return;
+
+	uint64_t now = (uint64_t)time(NULL);
+	test_kv_stub_file(dir, "1111111111111111111111111111111111111111",
+					  KV_REASON_UNKNOWN, 512, 0, now, 248);
+	test_kv_stub_file(dir, "2222222222222222222222222222222222222222",
+					  KV_REASON_UNKNOWN, 1024, 0, now, 248);
+	ds4_kvstore kc = {0};
+	kc.enabled = true;
+	kc.dir = xstrdup(dir);
+	kc.opt = kv_cache_default_options();
+	kc.opt.min_tokens = 1;
+	kc.budget_bytes = 500;
+	kc.unlink_file = test_kv_cache_unlink_fails;
+
+	int token = 1;
+	ds4_tokens tokens = {.v = &token, .len = 1, .cap = 1};
+	char err[160] = {0};
+	TEST_ASSERT(!ds4_kvstore_store_live_prefix_text(&kc, NULL, NULL, &tokens, 1,
+														"cold", "new cache entry", 0, NULL,
+														NULL, err, sizeof(err)));
+	TEST_ASSERT(strstr(err, "evict") != NULL);
+	TEST_ASSERT(test_kv_cache_file_count(dir) == 2);
+
+	kc.unlink_file = NULL;
+	ds4_kvstore_close(&kc);
+	char *first = path_join(dir, "1111111111111111111111111111111111111111.kv");
+	char *second = path_join(dir, "2222222222222222222222222222222222222222.kv");
+	unlink(first);
+	unlink(second);
+	free(first);
+	free(second);
+	rmdir(dir);
+}
+
+static void test_kv_cache_open_rejects_failed_initial_eviction(void) {
+	char tmpl[] = "/tmp/ds4-kv-open-evict-fail-test.XXXXXX";
+	char *dir = mkdtemp(tmpl);
+	TEST_ASSERT(dir != NULL);
+	if (!dir) return;
+
+	const char *sha = "1111111111111111111111111111111111111111";
+	test_kv_stub_file(dir, sha, KV_REASON_UNKNOWN, 512, 0,
+					  (uint64_t)time(NULL), 1024u * 1024u);
+	ds4_kvstore_set_unlink_file_for_tests(test_kv_cache_unlink_fails);
+	ds4_kvstore kc = {0};
+	TEST_ASSERT(!ds4_kvstore_open(&kc, dir, 1, false,
+								 kv_cache_default_options(), "test", NULL, NULL));
+	ds4_kvstore_set_unlink_file_for_tests(NULL);
+	TEST_ASSERT(!kc.enabled);
+	TEST_ASSERT(kc.dir == NULL);
+	TEST_ASSERT(test_kv_cache_file_count(dir) == 1);
+
+	char *path = path_join(dir, "1111111111111111111111111111111111111111.kv");
+	unlink(path);
+	free(path);
 	rmdir(dir);
 }
 
@@ -16546,6 +16623,8 @@ static void ds4_server_unit_tests_run(void) {
 	test_kv_cache_budget_changes();
 	test_kv_cache_budget_refreshes_external_files();
 	test_kv_cache_budget_reports_unlink_failure();
+	test_kv_cache_store_rejects_failed_eviction();
+	test_kv_cache_open_rejects_failed_initial_eviction();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();
