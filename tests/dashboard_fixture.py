@@ -7,12 +7,13 @@ source = open(sys.argv[1] if len(sys.argv) > 1 else "ds4_server.c", encoding="ut
 block = source.split("static const char dashboard_html[] =", 1)[1].split("static bool send_dashboard_page", 1)[0]
 page = "".join(ast.literal_eval(s) for s in re.findall(r'"(?:[^"\\]|\\.)*"', block)).encode()
 base_kv = {"enabled": True, "budget_bytes": 64 << 30, "used_bytes": 46 << 30, "entries": 116, "revision": "1"}
+base_calls = {"active_request_id":"99","records":[{"request_id":"99","caller":"direct","api":"responses","status":"active","error":"<img src=x>"},{"request_id":"98","caller":"<b>恶意调用方</b>","api":"chat","status":"failed","error":"<script>坏</script>"}],"callers":[{"caller":"direct","calls":4,"failed":0,"prompt_tokens":90},{"caller":"<b>恶意调用方</b>","calls":1,"failed":1,"prompt_tokens":8}]}
 state = {"kv": dict(base_kv), "admin": [], "status_active": 0, "status_max": 0,
          "status_delay_ms": 0, "admin_delay_ms": 0, "forbidden": False,
          "malformed": False, "mismatch_once": False, "mismatch_remaining": 0, "mismatch_makes_eviction": False,
          "context": {"current_tokens":48120,"limit_tokens":163840,"next_limit_tokens":163840,"remaining":115720,"utilization":.2937},
          "context_admin": [], "context_forbidden": False, "context_durable": True, "context_fail_once": False,
-         "host_available": True, "offline": False}
+         "host_available": True, "offline": False, "calls": dict(base_calls)}
 lock = threading.Lock()
 
 def status():
@@ -24,7 +25,7 @@ def status():
       "totals":{"requests":48,"completed":45,"failed":2,"cache":{"prompt_tokens":1264000,"cached_tokens":782000,"prompt_requests":47,"hit_requests":31}},
       "kv_cache":dict(state["kv"]), "context":dict(state["context"]),
       "host":{"available":state["host_available"],"memory_total_bytes":128<<30,"memory_used_bytes":96<<30,"memory_available_bytes":32<<30,"memory_pressure":"warning","swap_total_bytes":16<<30,"swap_used_bytes":2<<30,"process_rss_bytes":12<<30},
-      "calls":{"active_request_id":"99","records":[{"request_id":"99","caller":"direct","api":"responses","status":"active","error":"<img src=x>"},{"request_id":"98","caller":"<b>恶意调用方</b>","api":"chat","status":"failed","error":"<script>坏</script>"}],"callers":[{"caller":"direct","calls":4,"failed":0,"prompt_tokens":90},{"caller":"<b>恶意调用方</b>","calls":1,"failed":1,"prompt_tokens":8}]}}
+      "calls":dict(state["calls"])}
 
 class Handler(BaseHTTPRequestHandler):
     def json(self, value, code=200):
@@ -44,7 +45,9 @@ class Handler(BaseHTTPRequestHandler):
         body=json.loads(self.rfile.read(int(self.headers.get("Content-Length","0"))))
         if self.path == "/fixture/config":
             if body.get("reset"):
-                state.update(kv=dict(base_kv), admin=[], status_active=0, status_max=0, status_delay_ms=0, admin_delay_ms=0, forbidden=False, malformed=False, mismatch_once=False, mismatch_remaining=0, mismatch_makes_eviction=False, eviction_fail=False, context={"current_tokens":48120,"limit_tokens":163840,"next_limit_tokens":163840,"remaining":115720,"utilization":.2937}, context_admin=[], context_forbidden=False, context_durable=True, context_fail_once=False, host_available=True, offline=False)
+                state.update(kv=dict(base_kv), admin=[], status_active=0, status_max=0, status_delay_ms=0, admin_delay_ms=0, forbidden=False, malformed=False, mismatch_once=False, mismatch_remaining=0, mismatch_makes_eviction=False, eviction_fail=False, context={"current_tokens":48120,"limit_tokens":163840,"next_limit_tokens":163840,"remaining":115720,"utilization":.2937}, context_admin=[], context_forbidden=False, context_durable=True, context_fail_once=False, host_available=True, offline=False, calls=dict(base_calls))
+            if "call_records" in body:
+                state["calls"] = dict(state["calls"], records=body["call_records"])
             for key,value in body.items():
                 if key != "reset": state[key]=value
             self.json(state); return

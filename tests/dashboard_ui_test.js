@@ -57,8 +57,17 @@ async page => {
     assert(themeMobile.w<=themeMobile.v,'mobile dashboard overflows in '+theme);
     await page.setViewportSize({width:1440,height:900});
   }
-  await page.reload(); assert(await page.locator('#dashboard').getAttribute('data-theme')==='calm','theme did not persist');
-  await page.locator('[data-theme-choice="paper"]').click();
+  for (const id of ['terminalCallStream','calmCallTimeline']) {
+    const labels=await page.locator('#'+id).innerText();
+    assert(labels.includes('进行中')&&labels.includes('失败')&&!/\b(active|completed|failed)\b/.test(labels),'theme event labels were not localized in '+id);
+  }
+  await cfg({call_records:[{"request_id":"97","caller":"更新后的调用方","api":"responses","status":"completed","error":""}]});
+  await page.locator('[data-theme-choice="paper"]').click(); await wait(1100);
+  for (const id of ['terminalCallStream','calmCallTimeline']) {
+    const labels=await page.locator('#'+id).innerText();
+    assert(labels.includes('#97')&&labels.includes('完成')&&!/\bcompleted\b/.test(labels),'hidden '+id+' did not receive localized status poll update');
+  }
+  await page.reload(); assert(await page.locator('#dashboard').getAttribute('data-theme')==='paper','theme did not persist');
   const forbidden=['Counters reset when','Token hit rate','Request hit rate','Outcomes','Used','Budget','Entries / utilization','Disk KV capacity','Current request','tokens per second'];
   const desktop=await page.evaluate(()=>({w:document.documentElement.scrollWidth,v:innerWidth,text:document.body.innerText})); assert(desktop.w<=desktop.v&&desktop.text.includes('纸面运行报告')&&desktop.text.includes('上下文窗口')&&desktop.text.includes('计数器会在此服务器进程重启时清零。')&&forbidden.every(s=>!desktop.text.includes(s)),'desktop layout or Chinese labels missing');
   await page.setViewportSize({width:390,height:844}); await wait(50); const mobile=await page.evaluate(()=>({w:document.documentElement.scrollWidth,v:innerWidth,text:document.body.innerText})); assert(mobile.w<=mobile.v&&forbidden.every(s=>!mobile.text.includes(s)),'mobile dashboard overflows or exposes English labels'); await page.setViewportSize({width:1440,height:900});
