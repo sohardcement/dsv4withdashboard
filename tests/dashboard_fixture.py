@@ -11,7 +11,7 @@ state = {"kv": dict(base_kv), "admin": [], "status_active": 0, "status_max": 0,
          "status_delay_ms": 0, "admin_delay_ms": 0, "forbidden": False,
          "malformed": False, "mismatch_once": False, "mismatch_remaining": 0, "mismatch_makes_eviction": False,
          "context": {"current_tokens":48120,"limit_tokens":163840,"next_limit_tokens":163840,"remaining":115720,"utilization":.2937},
-         "context_admin": [], "context_forbidden": False, "context_durable": True,
+         "context_admin": [], "context_forbidden": False, "context_durable": True, "context_fail_once": False,
          "host_available": True, "offline": False}
 lock = threading.Lock()
 
@@ -44,13 +44,16 @@ class Handler(BaseHTTPRequestHandler):
         body=json.loads(self.rfile.read(int(self.headers.get("Content-Length","0"))))
         if self.path == "/fixture/config":
             if body.get("reset"):
-                state.update(kv=dict(base_kv), admin=[], status_active=0, status_max=0, status_delay_ms=0, admin_delay_ms=0, forbidden=False, malformed=False, mismatch_once=False, mismatch_remaining=0, mismatch_makes_eviction=False, eviction_fail=False, context={"current_tokens":48120,"limit_tokens":163840,"next_limit_tokens":163840,"remaining":115720,"utilization":.2937}, context_admin=[], context_forbidden=False, context_durable=True, host_available=True, offline=False)
+                state.update(kv=dict(base_kv), admin=[], status_active=0, status_max=0, status_delay_ms=0, admin_delay_ms=0, forbidden=False, malformed=False, mismatch_once=False, mismatch_remaining=0, mismatch_makes_eviction=False, eviction_fail=False, context={"current_tokens":48120,"limit_tokens":163840,"next_limit_tokens":163840,"remaining":115720,"utilization":.2937}, context_admin=[], context_forbidden=False, context_durable=True, context_fail_once=False, host_available=True, offline=False)
             for key,value in body.items():
                 if key != "reset": state[key]=value
             self.json(state); return
         if self.path == "/ds4/admin/context":
             state["context_admin"].append({"value":body.get("context_tokens"),"header":self.headers.get("X-DS4-Admin")})
             if state["context_forbidden"]: self.json({"ok":False,"error":{"message":"fixture context forbidden"}},403); return
+            if state["context_fail_once"]:
+                state["context_fail_once"] = False
+                self.json({"ok":False,"error":{"message":"fixture context failure"}},500); return
             value=body.get("context_tokens")
             if not isinstance(value,int) or value < 1: self.json({"ok":False,"error":{"message":"invalid context"}},400); return
             durable=state["context_durable"]
