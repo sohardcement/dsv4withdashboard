@@ -59,6 +59,8 @@ typedef struct {
 
 void ds4_call_history_init(ds4_call_history *history);
 void ds4_call_history_free(ds4_call_history *history);
+/* When the fixed window contains only active requests, begin returns a unique
+ * untracked ID. Its later update/finish calls are intentionally safe no-ops. */
 uint64_t ds4_call_history_begin(ds4_call_history *history, const char *caller,
                                  const char *api, const char *kind, bool stream,
                                  bool has_tools, double started_at);

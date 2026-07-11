@@ -10,21 +10,21 @@ static void copy_text(char *dst, size_t dstlen, const char *src) {
 	dst[dstlen - 1] = '\0';
 }
 
-static void prune(ds4_call_history *history) {
-	if (!history) return;
-	while (history->len > history->capacity) {
-		size_t victim = history->len;
-		for (size_t i = 0; i < history->len; i++) {
-			if (history->records[i].status != DS4_CALL_ACTIVE) {
-				victim = i;
-				break;
-			}
-		}
-		if (victim == history->len) break;
+static bool evict_oldest_terminal(ds4_call_history *history) {
+	if (!history) return false;
+	for (size_t victim = 0; victim < history->len; victim++) {
+		if (history->records[victim].status == DS4_CALL_ACTIVE) continue;
 		memmove(&history->records[victim], &history->records[victim + 1],
 				(history->len - victim - 1) * sizeof(*history->records));
 		history->len--;
+		return true;
 	}
+	return false;
+}
+
+static void prune(ds4_call_history *history) {
+	if (!history) return;
+	while (history->len > history->capacity && evict_oldest_terminal(history)) {}
 }
 
 static ds4_call_record *find_record(ds4_call_history *history, uint64_t request_id) {
@@ -52,6 +52,14 @@ uint64_t ds4_call_history_begin(ds4_call_history *history, const char *caller,
 	if (!history) return 0;
 	if (!history->capacity) history->capacity = DS4_CALL_HISTORY_CAPACITY;
 	prune(history);
+	uint64_t request_id = ++history->next_request_id;
+	if (!request_id) request_id = ++history->next_request_id;
+	/* Do not evict an active request merely to make room for a newer one.
+	 * Overflow requests still receive an ID so their eventual update/finish
+	 * calls remain harmless no-ops, but are not retained in this fixed window. */
+	if (history->len >= history->capacity &&
+		(history->len > history->capacity || !evict_oldest_terminal(history)))
+		return request_id;
 	if (history->len == history->allocated) {
 		size_t allocated = history->allocated + DS4_CALL_HISTORY_CAPACITY;
 		ds4_call_record *records = realloc(history->records,
@@ -62,8 +70,7 @@ uint64_t ds4_call_history_begin(ds4_call_history *history, const char *caller,
 	}
 	ds4_call_record *record = &history->records[history->len++];
 	memset(record, 0, sizeof(*record));
-	record->request_id = ++history->next_request_id;
-	if (!record->request_id) record->request_id = ++history->next_request_id;
+	record->request_id = request_id;
 	copy_text(record->caller, sizeof(record->caller), caller);
 	copy_text(record->api, sizeof(record->api), api);
 	copy_text(record->kind, sizeof(record->kind), kind);

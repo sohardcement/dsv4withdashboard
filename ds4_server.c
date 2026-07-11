@@ -15225,17 +15225,69 @@ static void test_call_history_capacity_keeps_active_calls(void) {
     TEST_ASSERT(h.records[0].request_id == three || h.records[1].request_id == three);
     ds4_call_history_free(&h);
 
-    ds4_call_history_init(&h);
-    h.capacity = 2;
-    one = ds4_call_history_begin(&h, "one", "openai", "chat", false, false, 1.0);
-    two = ds4_call_history_begin(&h, "two", "openai", "chat", false, false, 2.0);
-    three = ds4_call_history_begin(&h, "three", "openai", "chat", false, false, 3.0);
-    TEST_ASSERT(h.len == 3);
-    ds4_call_history_finish(&h, one, DS4_CALL_COMPLETED, 4.0, 1, "none", "stop", NULL);
-    TEST_ASSERT(h.len == 2);
-    TEST_ASSERT(h.records[0].request_id == two || h.records[1].request_id == two);
-    TEST_ASSERT(h.records[0].request_id == three || h.records[1].request_id == three);
-    ds4_call_history_free(&h);
+	ds4_call_history_init(&h);
+	h.capacity = 2;
+	one = ds4_call_history_begin(&h, "one", "openai", "chat", false, false, 1.0);
+	two = ds4_call_history_begin(&h, "two", "openai", "chat", false, false, 2.0);
+	three = ds4_call_history_begin(&h, "three", "openai", "chat", false, false, 3.0);
+	/* A full active window never grows: overflow requests receive an ID but
+	 * are deliberately untracked, so their later finish is a safe no-op. */
+	TEST_ASSERT(three != 0);
+	TEST_ASSERT(h.len == 2);
+	TEST_ASSERT(h.records[0].request_id == one || h.records[1].request_id == one);
+	TEST_ASSERT(h.records[0].request_id == two || h.records[1].request_id == two);
+	ds4_call_history_finish(&h, three, DS4_CALL_COMPLETED, 3.5, 1, "none", "stop", NULL);
+	TEST_ASSERT(h.len == 2);
+	ds4_call_history_finish(&h, one, DS4_CALL_COMPLETED, 4.0, 1, "none", "stop", NULL);
+	TEST_ASSERT(h.len == 2);
+	TEST_ASSERT(h.records[0].request_id == two || h.records[1].request_id == two);
+	uint64_t four = ds4_call_history_begin(&h, "four", "openai", "chat", false, false, 5.0);
+	TEST_ASSERT(four != 0);
+	TEST_ASSERT(h.len == 2);
+	TEST_ASSERT(h.records[0].request_id == two || h.records[1].request_id == two);
+	TEST_ASSERT(h.records[0].request_id == four || h.records[1].request_id == four);
+	ds4_call_history_free(&h);
+}
+
+static void test_call_history_never_exceeds_full_active_window(void) {
+	ds4_call_history h = {0};
+	ds4_call_history_init(&h);
+	uint64_t first = 0, overflow = 0;
+	for (size_t i = 0; i < DS4_CALL_HISTORY_CAPACITY + 1; i++) {
+		uint64_t id = ds4_call_history_begin(&h, "bulk", "openai", "chat",
+			false, false, (double)i);
+		TEST_ASSERT(id != 0);
+		if (!i) first = id;
+		if (i == DS4_CALL_HISTORY_CAPACITY) overflow = id;
+	}
+	TEST_ASSERT(h.len == DS4_CALL_HISTORY_CAPACITY);
+	for (size_t i = 0; i < h.len; i++)
+		TEST_ASSERT(h.records[i].status == DS4_CALL_ACTIVE);
+	ds4_call_history_finish(&h, overflow, DS4_CALL_FAILED, 201.0, 0,
+		"none", "error", "untracked overflow");
+	TEST_ASSERT(h.len == DS4_CALL_HISTORY_CAPACITY);
+	ds4_call_history_finish(&h, first, DS4_CALL_COMPLETED, 202.0, 1,
+		"none", "stop", NULL);
+	uint64_t next = ds4_call_history_begin(&h, "next", "openai", "chat",
+		false, false, 203.0);
+	TEST_ASSERT(next != 0);
+	TEST_ASSERT(h.len == DS4_CALL_HISTORY_CAPACITY);
+	bool saw_first = false, saw_next = false;
+	for (size_t i = 0; i < h.len; i++) {
+		if (h.records[i].request_id == first) saw_first = true;
+		if (h.records[i].request_id == next) saw_next = true;
+	}
+	TEST_ASSERT(!saw_first);
+	TEST_ASSERT(saw_next);
+	ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(&h, 204.0);
+	TEST_ASSERT(snap.records_len == DS4_CALL_HISTORY_CAPACITY);
+	TEST_ASSERT(snap.callers_len == 2);
+	TEST_ASSERT(!strcmp(snap.callers[0].caller, "bulk"));
+	TEST_ASSERT(snap.callers[0].calls == DS4_CALL_HISTORY_CAPACITY - 1);
+	TEST_ASSERT(!strcmp(snap.callers[1].caller, "next"));
+	TEST_ASSERT(snap.callers[1].calls == 1);
+	ds4_call_history_snapshot_free(&snap);
+	ds4_call_history_free(&h);
 }
 
 static void test_call_history_clamps_tokens_and_aggregates_failures(void) {
@@ -19376,6 +19428,7 @@ static void ds4_server_unit_tests_run(void) {
     test_status_json_reports_idle_metrics_shape();
     test_status_json_reports_cache_totals_and_capacity();
     test_call_history_capacity_keeps_active_calls();
+	test_call_history_never_exceeds_full_active_window();
     test_call_history_clamps_tokens_and_aggregates_failures();
     test_call_history_snapshot_owns_copies();
 	test_status_worker_active_call_is_not_newest_queued_call();
