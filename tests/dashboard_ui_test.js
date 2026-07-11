@@ -39,14 +39,23 @@ async page => {
   assert(!(await page.locator('#kvBudgetInput').isDisabled())&&!(await page.locator('#kvBudgetUnit').isDisabled())&&!(await page.locator('#kvApplyNow').isDisabled())&&!(await page.locator('#kvSaveRestart').isDisabled()),'500 eviction failure disabled controls');
   s=await fixture(); assert(s.kv.entries===100&&s.kv.used_bytes===(40*2**30)&&s.kv.revision==='2','eviction failure fixture did not publish truthful partial state');
   await wait(1100); assert((await page.locator('#kvUsed').innerText())==='40.0 GB'&&(await page.locator('#kvEntries').innerText())==='100','next status poll did not paint partial-eviction stats');
-  await cfg({reset:true}); await page.reload(); await wait(150);
+  await cfg({reset:true}); await page.evaluate(()=>localStorage.setItem('ds4-dashboard-theme','not-a-theme')); await page.reload(); await wait(150);
   assert(await page.locator('#dashboard').getAttribute('data-theme')==='paper','paper must be the default theme');
+  assert(await page.locator('#paperConclusion').isVisible(),'paper is missing its conclusion-first lead');
+  assert((await page.locator('#paperHealthConclusion').innerText()).includes('运行'),'paper lead does not summarize current health');
+  assert((await page.locator('#paperContextSummary').innerText()).includes('/'),'paper lead does not summarize context');
+  assert((await page.locator('#paperCacheSummary').innerText()).includes('%'),'paper lead does not summarize cache');
+  assert((await page.locator('#paperConclusion').boundingBox()).y<(await page.locator('#requestHitRate').boundingBox()).y,'paper conclusion does not precede performance detail');
   for (const theme of ['paper','terminal','calm']) {
     await page.locator(`[data-theme-choice="${theme}"]`).click();
     assert(await page.locator('#dashboard').getAttribute('data-theme')===theme,'theme did not apply '+theme);
     const roots=['paperLayout','terminalLayout','calmLayout'];
     for (const root of roots) assert(await page.locator('#'+root).isVisible()===(root===theme+'Layout'),'theme root visibility did not switch '+root);
     assert(await page.locator('#dashboard').locator('#contextSaveRestart,#kvApplyNow,#kvSaveRestart').count()===3,'shared administration controls disappeared');
+    await page.setViewportSize({width:390,height:844}); await wait(50);
+    const themeMobile=await page.evaluate(()=>({w:document.documentElement.scrollWidth,v:innerWidth}));
+    assert(themeMobile.w<=themeMobile.v,'mobile dashboard overflows in '+theme);
+    await page.setViewportSize({width:1440,height:900});
   }
   await page.reload(); assert(await page.locator('#dashboard').getAttribute('data-theme')==='calm','theme did not persist');
   await page.locator('[data-theme-choice="paper"]').click();
