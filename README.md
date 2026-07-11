@@ -742,12 +742,18 @@ also include:
   that state rather than treating it as zero.
 - `calls`: the active request ID, up to 200 in-memory recent call records, and
   per-caller aggregates. A caller is the direct TCP peer address only; DS4 does
-  not read or trust `X-Forwarded-For`. Records deliberately omit prompts and
-  request bodies, and reset when the server restarts.
+  not read or trust `X-Forwarded-For`. Each record also has a display-only
+  client label: `X-DS4-Client` takes precedence, then `User-Agent`, then
+  **未标识服务**. This label is metadata, not authentication or authorization.
+  Records deliberately omit prompts and request bodies, and reset when the
+  server restarts.
 
-The dashboard has three equivalent local display themes: **纸面运行报告**,
-**深色控制台**, and **从容解释型**. The selected theme is saved only in that
-browser's `localStorage`; it does not change server configuration or data.
+The dashboard has three genuinely different local display themes: **纸面运行报告**
+(the default, a report-style operational summary), **深色控制台** (compact live
+event flow), and **从容解释型** (status and explanation focused). The selected
+theme is saved only in that browser's `localStorage`; it does not change server
+configuration or data. All three views expose the same live data and the same
+administrative actions.
 
 Two local-only JSON administration endpoints back the dashboard:
 

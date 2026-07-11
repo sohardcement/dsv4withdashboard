@@ -61,10 +61,12 @@ browser origins is unsafe.
 ## Runtime Dashboard, Context, and Call Details
 
 The Chinese dashboard is available at `GET /` and `GET /dashboard`; its
-machine-readable snapshot is `GET /ds4/status`. It has three browser-local
-themes (paper report, dark terminal, and calm explanatory). Theme choice is
-stored in the browser's `localStorage` only, so all themes show the same live
-server data and changing it has no server-side effect.
+machine-readable snapshot is `GET /ds4/status`. It has three browser-local,
+structurally distinct themes: **纸面运行报告** is the default report-style
+operations summary, **深色控制台** is a compact real-time event flow, and
+**从容解释型** emphasizes status and explanation. Theme choice is stored in the
+browser's `localStorage` only, so all themes show the same live server data and
+administrative actions; changing it has no server-side effect.
 
 `/ds4/status` supplements KV information with a `context` object (current,
 limit, remaining, utilization in tokens), a `host` object (physical memory,
@@ -74,6 +76,13 @@ Call records hold at most 200 recent requests in memory and are discarded on
 restart. They retain direct TCP peer address, API kind, outcome, token counts,
 and a short error when present, but never request body or prompt text. DS4 does
 not infer callers from or trust `X-Forwarded-For`.
+
+For a useful service label in the call table and aggregates, callers can send
+an optional `X-DS4-Client` header, for example `X-DS4-Client: hanako-agent`.
+DS4 chooses `X-DS4-Client`, then falls back to `User-Agent`, then displays
+**未标识服务**. This is observability metadata only: it is not trusted as an
+identity, does not grant access, and is not a substitute for authentication.
+The dashboard continues to show the direct peer IP beside the label.
 
 The context form uses `POST /ds4/admin/context` with JSON such as:
 
