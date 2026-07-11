@@ -40,8 +40,16 @@ async page => {
   s=await fixture(); assert(s.kv.entries===100&&s.kv.used_bytes===(40*2**30)&&s.kv.revision==='2','eviction failure fixture did not publish truthful partial state');
   await wait(1100); assert((await page.locator('#kvUsed').innerText())==='40.0 GB'&&(await page.locator('#kvEntries').innerText())==='100','next status poll did not paint partial-eviction stats');
   await cfg({reset:true}); await page.reload(); await wait(150);
-  for (const theme of ['paper','terminal','calm']) { await page.locator(`[data-theme-choice="${theme}"]`).click(); assert(await page.locator('#dashboard').getAttribute('data-theme')===theme,'theme did not apply '+theme); }
+  assert(await page.locator('#dashboard').getAttribute('data-theme')==='paper','paper must be the default theme');
+  for (const theme of ['paper','terminal','calm']) {
+    await page.locator(`[data-theme-choice="${theme}"]`).click();
+    assert(await page.locator('#dashboard').getAttribute('data-theme')===theme,'theme did not apply '+theme);
+    const roots=['paperLayout','terminalLayout','calmLayout'];
+    for (const root of roots) assert(await page.locator('#'+root).isVisible()===(root===theme+'Layout'),'theme root visibility did not switch '+root);
+    assert(await page.locator('#dashboard').locator('#contextSaveRestart,#kvApplyNow,#kvSaveRestart').count()===3,'shared administration controls disappeared');
+  }
   await page.reload(); assert(await page.locator('#dashboard').getAttribute('data-theme')==='calm','theme did not persist');
+  await page.locator('[data-theme-choice="paper"]').click();
   const forbidden=['Counters reset when','Token hit rate','Request hit rate','Outcomes','Used','Budget','Entries / utilization','Disk KV capacity','Current request','tokens per second'];
   const desktop=await page.evaluate(()=>({w:document.documentElement.scrollWidth,v:innerWidth,text:document.body.innerText})); assert(desktop.w<=desktop.v&&desktop.text.includes('纸面运行报告')&&desktop.text.includes('上下文窗口')&&desktop.text.includes('计数器会在此服务器进程重启时清零。')&&forbidden.every(s=>!desktop.text.includes(s)),'desktop layout or Chinese labels missing');
   await page.setViewportSize({width:390,height:844}); await wait(50); const mobile=await page.evaluate(()=>({w:document.documentElement.scrollWidth,v:innerWidth,text:document.body.innerText})); assert(mobile.w<=mobile.v&&forbidden.every(s=>!mobile.text.includes(s)),'mobile dashboard overflows or exposes English labels'); await page.setViewportSize({width:1440,height:900});
