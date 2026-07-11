@@ -58,6 +58,42 @@ dashboard bound to loopback and require `X-DS4-Admin` on updates. The header is
 an intent check, not authentication; exposing the endpoint to untrusted hosts or
 browser origins is unsafe.
 
+## Runtime Dashboard, Context, and Call Details
+
+The Chinese dashboard is available at `GET /` and `GET /dashboard`; its
+machine-readable snapshot is `GET /ds4/status`. It has three browser-local
+themes (paper report, dark terminal, and calm explanatory). Theme choice is
+stored in the browser's `localStorage` only, so all themes show the same live
+server data and changing it has no server-side effect.
+
+`/ds4/status` supplements KV information with a `context` object (current,
+limit, remaining, utilization in tokens), a `host` object (physical memory,
+pressure, swap, and DS4 RSS), and a `calls` object. Host sampling may be
+unavailable on a platform; that is an unknown measurement, not zero usage.
+Call records hold at most 200 recent requests in memory and are discarded on
+restart. They retain direct TCP peer address, API kind, outcome, token counts,
+and a short error when present, but never request body or prompt text. DS4 does
+not infer callers from or trust `X-Forwarded-For`.
+
+The context form uses `POST /ds4/admin/context` with JSON such as:
+
+```sh
+curl http://127.0.0.1:8077/ds4/admin/context \
+  -H 'Content-Type: application/json' \
+  -H 'X-DS4-Admin: 1' \
+  --data '{"context_tokens":131072}'
+```
+
+The accepted range is 4,096 through 2,147,483,647 tokens. This writes the
+next-start value atomically to `${DS4_CTX_FILE:-$HOME/.ds4/context-tokens}`;
+it does not modify the active session or resize live KV allocations. Restart
+through `start-server.sh` to apply it. On launch, valid `DS4_CTX` takes
+precedence over the saved file, which takes precedence over the selected profile
+default; invalid explicit or saved values are ignored with a warning. The
+context endpoint shares the KV endpoint's local-only boundary: loopback TCP,
+JSON `POST`, `X-DS4-Admin: 1`, local/same-origin browser checks, and no CORS.
+It is not suitable for remote administration.
+
 ## Model Choice
 
 The default `ds4flash.gguf` symlink should remain explicit in `start-server.sh`

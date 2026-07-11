@@ -728,6 +728,50 @@ The Flash and PRO model endpoints are compatibility aliases. They both report
 the model currently loaded from the GGUF passed with `-m`; the endpoint name does
 not select a different model.
 
+### Runtime dashboard and local administration
+
+`GET /` and `GET /dashboard` serve the Chinese runtime dashboard. It polls
+`GET /ds4/status`, which is also useful to local monitoring clients. The status
+document is additive: existing fields remain available, while newer snapshots
+also include:
+
+- `context`: current session tokens, the active context limit, remaining tokens,
+  and utilization. These are token counts, not an estimate of KV or RAM bytes.
+- `host`: physical-memory used/available/total, memory-pressure state, swap,
+  and DS4's RSS. Platform sampling can be unavailable; clients should display
+  that state rather than treating it as zero.
+- `calls`: the active request ID, up to 200 in-memory recent call records, and
+  per-caller aggregates. A caller is the direct TCP peer address only; DS4 does
+  not read or trust `X-Forwarded-For`. Records deliberately omit prompts and
+  request bodies, and reset when the server restarts.
+
+The dashboard has three equivalent local display themes: **纸面运行报告**,
+**深色控制台**, and **从容解释型**. The selected theme is saved only in that
+browser's `localStorage`; it does not change server configuration or data.
+
+Two local-only JSON administration endpoints back the dashboard:
+
+- `POST /ds4/admin/kv-cache` changes disk-KV capacity according to its selected
+  mode (including immediate application where requested) and can save a
+  next-start limit.
+- `POST /ds4/admin/context` accepts exactly
+  `{ "context_tokens": INTEGER }` in the range 4,096 through 2,147,483,647.
+  It saves a context limit for the next `start-server.sh` launch; it never
+  changes the live session or reallocates the running KV cache. Restart the
+  server before expecting the new limit to apply.
+
+These endpoints are deliberately not a general remote-admin API. They accept
+only loopback TCP peers (`127.0.0.1` or `::1`), require a JSON `POST` with
+`X-DS4-Admin: 1`, enforce local/same-origin browser checks, and never enable
+CORS (including preflight). The header is an intent/CSRF guard, not
+authentication: do not expose the server or dashboard to untrusted users.
+
+Context persistence uses `${DS4_CTX_FILE:-$HOME/.ds4/context-tokens}`. On the
+next launcher invocation, a valid explicit `DS4_CTX` wins over this saved value,
+which wins over the selected profile default. The analogous disk-KV file is
+`${DS4_KV_SPACE_FILE:-$HOME/.ds4/kv-space-mb}`, with valid `DS4_KV_SPACE`
+taking precedence. Invalid saved values are ignored with a launcher warning.
+
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
 `seed`, `stream`, `stream_options.include_usage`, `tools`, and `tool_choice`.
