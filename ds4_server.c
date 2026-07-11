@@ -12120,7 +12120,8 @@ static bool read_http_headers(int fd, http_request *r) {
 	(void)header_value(b.ptr, (size_t)hend, "User-Agent",
 				   r->user_agent, sizeof(r->user_agent));
     bool saw_cl = false, saw_admin = false, saw_origin = false;
-    bool saw_fetch_site = false, saw_content_type = false;
+    bool saw_fetch_site = false, saw_content_type = false, saw_client = false;
+	bool saw_user_agent = false;
     const char *p = b.ptr, *end = b.ptr + hend;
     while (p < end && *p != '\n') p++;
     if (p < end) p++;
@@ -12151,6 +12152,12 @@ static bool read_http_headers(int fd, http_request *r) {
         } else if (len >= 13 && !strncasecmp(line, "Content-Type:", 13)) {
             if (saw_content_type) goto fail;
             saw_content_type = true;
+		} else if (len >= 13 && !strncasecmp(line, "X-DS4-Client:", 13)) {
+			if (saw_client) goto fail;
+			saw_client = true;
+		} else if (len >= 11 && !strncasecmp(line, "User-Agent:", 11)) {
+			if (saw_user_agent) goto fail;
+			saw_user_agent = true;
         }
         if (p < end) p++;
     }
@@ -15063,6 +15070,46 @@ static void test_client_identity_header_precedence_and_fallback(void) {
 	snprintf(hr.client_header, sizeof(hr.client_header), "  open%cclaw  ", 1);
 	server_client_identity(&hr, client, sizeof(client));
 	TEST_ASSERT(!strcmp(client, "openclaw"));
+}
+
+static void test_client_identity_rejects_invalid_utf8_and_keeps_boundaries(void) {
+	char client[DS4_CALL_CLIENT_MAX];
+	const char invalid[] = {'o', 'k', (char)0xc0, (char)0xaf, '\0'};
+	TEST_ASSERT(!ds4_call_client_normalize(client, sizeof(client), invalid));
+
+	char boundary[DS4_CALL_CLIENT_MAX + 4];
+	memset(boundary, 'a', 126);
+	boundary[126] = (char)0xe4;
+	boundary[127] = (char)0xb8;
+	boundary[128] = (char)0xad;
+	boundary[129] = '\0';
+	TEST_ASSERT(ds4_call_client_normalize(client, sizeof(client), boundary));
+	TEST_ASSERT(strlen(client) == 126);
+	TEST_ASSERT(client[125] == 'a' && client[126] == '\0');
+}
+
+static void test_client_identity_rejects_duplicate_headers(void) {
+	int sv[2];
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	const char *headers =
+		"POST /v1/chat/completions HTTP/1.1\r\n"
+		"X-DS4-Client: hanako-agent\r\n"
+		"x-ds4-client: hermes-agent\r\nContent-Length: 0\r\n\r\n";
+	TEST_ASSERT(send_all(sv[0], headers, strlen(headers)));
+	http_request hr = {0};
+	TEST_ASSERT(!read_http_headers(sv[1], &hr));
+	http_request_free(&hr);
+	close(sv[0]); close(sv[1]);
+
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	headers = "POST /v1/chat/completions HTTP/1.1\r\n"
+		"User-Agent: hanako-agent\r\n"
+		"user-agent: hermes-agent\r\nContent-Length: 0\r\n\r\n";
+	TEST_ASSERT(send_all(sv[0], headers, strlen(headers)));
+	hr = (http_request){0};
+	TEST_ASSERT(!read_http_headers(sv[1], &hr));
+	http_request_free(&hr);
+	close(sv[0]); close(sv[1]);
 }
 
 static void test_kv_admin_handler_semantics(void) {
@@ -19603,6 +19650,8 @@ static void ds4_server_unit_tests_run(void) {
 	test_http_content_length_framing_is_strict();
 	test_http_chunked_headers_preserve_normal_route_body();
 	test_client_identity_header_precedence_and_fallback();
+	test_client_identity_rejects_invalid_utf8_and_keeps_boundaries();
+	test_client_identity_rejects_duplicate_headers();
 	test_kv_cache_budget_changes();
 	test_kv_cache_budget_refreshes_external_files();
 	test_kv_cache_budget_reports_unlink_failure();

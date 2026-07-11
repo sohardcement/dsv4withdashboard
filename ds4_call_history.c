@@ -11,17 +11,58 @@ static void copy_text(char *dst, size_t dstlen, const char *src) {
 	dst[dstlen - 1] = '\0';
 }
 
+static size_t utf8_codepoint_len(const unsigned char *p) {
+	if (p[0] < 0x80) return 1;
+	if (p[0] >= 0xc2 && p[0] <= 0xdf)
+		return (p[1] && p[1] >= 0x80 && p[1] <= 0xbf) ? 2 : 0;
+	if (p[0] == 0xe0)
+		return (p[1] && p[2] && p[1] >= 0xa0 && p[1] <= 0xbf &&
+				p[2] >= 0x80 && p[2] <= 0xbf) ? 3 : 0;
+	if ((p[0] >= 0xe1 && p[0] <= 0xec) || (p[0] >= 0xee && p[0] <= 0xef))
+		return (p[1] && p[2] && p[1] >= 0x80 && p[1] <= 0xbf &&
+				p[2] >= 0x80 && p[2] <= 0xbf) ? 3 : 0;
+	if (p[0] == 0xed)
+		return (p[1] && p[2] && p[1] >= 0x80 && p[1] <= 0x9f &&
+				p[2] >= 0x80 && p[2] <= 0xbf) ? 3 : 0;
+	if (p[0] == 0xf0)
+		return (p[1] && p[2] && p[3] && p[1] >= 0x90 && p[1] <= 0xbf &&
+				p[2] >= 0x80 && p[2] <= 0xbf &&
+				p[3] >= 0x80 && p[3] <= 0xbf) ? 4 : 0;
+	if (p[0] >= 0xf1 && p[0] <= 0xf3)
+		return (p[1] && p[2] && p[3] && p[1] >= 0x80 && p[1] <= 0xbf &&
+				p[2] >= 0x80 && p[2] <= 0xbf &&
+				p[3] >= 0x80 && p[3] <= 0xbf) ? 4 : 0;
+	if (p[0] == 0xf4)
+		return (p[1] && p[2] && p[3] && p[1] >= 0x80 && p[1] <= 0x8f &&
+				p[2] >= 0x80 && p[2] <= 0xbf &&
+				p[3] >= 0x80 && p[3] <= 0xbf) ? 4 : 0;
+	return 0;
+}
+
 bool ds4_call_client_normalize(char *dst, size_t dstlen, const char *src) {
 	if (!dst || !dstlen) return false;
 	dst[0] = '\0';
 	if (!src) return false;
 	size_t out = 0, last_non_space = 0;
-	for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
-		if (*p < 0x20 || *p == 0x7f) continue;
-		if (!out && isspace(*p)) continue;
-		if (out + 1 >= dstlen) break;
-		dst[out++] = (char)*p;
-		if (!isspace(*p)) last_non_space = out;
+	for (const unsigned char *p = (const unsigned char *)src; *p;) {
+		size_t n = utf8_codepoint_len(p);
+		if (!n) {
+			dst[0] = '\0';
+			return false;
+		}
+		if (*p < 0x20 || *p == 0x7f) {
+			p++;
+			continue;
+		}
+		if (n == 1 && !out && isspace(*p)) {
+			p++;
+			continue;
+		}
+		if (out + n >= dstlen) break;
+		memcpy(dst + out, p, n);
+		out += n;
+		if (n != 1 || !isspace(*p)) last_non_space = out;
+		p += n;
 	}
 	dst[last_non_space] = '\0';
 	return last_non_space != 0;
