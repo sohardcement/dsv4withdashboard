@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #define DS4_CALL_HISTORY_CAPACITY 200
+#define DS4_CALL_CLIENT_MAX 128
 
 typedef enum {
 	DS4_CALL_ACTIVE = 0,
@@ -16,6 +17,7 @@ typedef enum {
 typedef struct {
 	uint64_t request_id;
 	char caller[64];
+	char client[DS4_CALL_CLIENT_MAX];
 	char api[16];
 	char kind[16];
 	bool stream;
@@ -34,6 +36,7 @@ typedef struct {
 
 typedef struct {
 	char caller[64];
+	char client[DS4_CALL_CLIENT_MAX];
 	uint64_t calls;
 	uint64_t failures;
 	uint64_t prompt_tokens;
@@ -59,10 +62,13 @@ typedef struct {
 
 void ds4_call_history_init(ds4_call_history *history);
 void ds4_call_history_free(ds4_call_history *history);
+/* Copies a bounded client label after removing ASCII control characters and
+ * surrounding whitespace. Returns false when no usable label remains. */
+bool ds4_call_client_normalize(char *dst, size_t dstlen, const char *src);
 /* When the fixed window contains only active requests, begin returns a unique
  * untracked ID. Its later update/finish calls are intentionally safe no-ops. */
 uint64_t ds4_call_history_begin(ds4_call_history *history, const char *caller,
-                                 const char *api, const char *kind, bool stream,
+                                 const char *client, const char *api, const char *kind, bool stream,
                                  bool has_tools, double started_at);
 void ds4_call_history_update_prompt(ds4_call_history *history, uint64_t request_id,
                                     int prompt_tokens, int cached_tokens,

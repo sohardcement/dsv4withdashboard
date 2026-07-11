@@ -7909,6 +7909,7 @@ struct job {
     request req;
 	uint64_t call_request_id;
 	char caller[64];
+	char client[DS4_CALL_CLIENT_MAX];
 	double received_at;
     bool done;
     pthread_mutex_t mu;
@@ -8270,7 +8271,8 @@ static void append_status_calls_json(buf *b, const ds4_call_history_snapshot *ca
 		if (i) buf_putc(b, ',');
 		buf_puts(b, "{\"request_id\":");
 		buf_printf(b, "\"%llu\",\"caller\":", (unsigned long long)r->request_id);
-		json_escape(b, r->caller); buf_puts(b, ",\"api\":"); json_escape(b, r->api);
+		json_escape(b, r->caller); buf_puts(b, ",\"client\":"); json_escape(b, r->client);
+		buf_puts(b, ",\"api\":"); json_escape(b, r->api);
 		buf_puts(b, ",\"kind\":"); json_escape(b, r->kind);
 		buf_printf(b, ",\"stream\":%s,\"tools\":%s,\"status\":",
 			r->stream ? "true" : "false", r->has_tools ? "true" : "false");
@@ -8287,6 +8289,7 @@ static void append_status_calls_json(buf *b, const ds4_call_history_snapshot *ca
 		const ds4_call_caller *c = &calls->callers[i];
 		if (i) buf_putc(b, ',');
 		buf_puts(b, "{\"caller\":"); json_escape(b, c->caller);
+		buf_puts(b, ",\"client\":"); json_escape(b, c->client);
 		buf_printf(b, ",\"calls\":%llu,\"failed\":%llu,\"prompt_tokens\":%llu,\"cached_tokens\":%llu,\"average_duration_sec\":%.3f,\"recent_at\":%.3f}",
 			(unsigned long long)c->calls, (unsigned long long)c->failures,
 			(unsigned long long)c->prompt_tokens, (unsigned long long)c->cached_tokens,
@@ -11997,12 +12000,20 @@ typedef struct {
     char admin_header[16];
     char origin[256];
     char sec_fetch_site[64];
+	char client_header[256];
+	char user_agent[512];
     size_t content_length;
     char *prebody;
     size_t prebody_len;
     char *body;
     size_t body_len;
 } http_request;
+
+static void server_client_identity(const http_request *r, char *out, size_t outlen) {
+	if (r && (ds4_call_client_normalize(out, outlen, r->client_header) ||
+			  ds4_call_client_normalize(out, outlen, r->user_agent))) return;
+	if (outlen) snprintf(out, outlen, "%s", "未标识服务");
+}
 
 static void http_request_free(http_request *r) {
     free(r->prebody);
@@ -12104,6 +12115,10 @@ static bool read_http_headers(int fd, http_request *r) {
                        r->origin, sizeof(r->origin));
     (void)header_value(b.ptr, (size_t)hend, "Sec-Fetch-Site",
                        r->sec_fetch_site, sizeof(r->sec_fetch_site));
+	(void)header_value(b.ptr, (size_t)hend, "X-DS4-Client",
+				   r->client_header, sizeof(r->client_header));
+	(void)header_value(b.ptr, (size_t)hend, "User-Agent",
+				   r->user_agent, sizeof(r->user_agent));
     bool saw_cl = false, saw_admin = false, saw_origin = false;
     bool saw_fetch_site = false, saw_content_type = false;
     const char *p = b.ptr, *end = b.ptr + hend;
@@ -12957,6 +12972,7 @@ static void *client_main(void *arg) {
 
     request req;
     char err[160];
+	char client[DS4_CALL_CLIENT_MAX] = {0};
     bool ok = false;
     const int ctx_size = ds4_session_ctx(s->session);
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
@@ -12977,6 +12993,7 @@ static void *client_main(void *arg) {
         goto done;
     }
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+	server_client_identity(&hr, client, sizeof(client));
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
@@ -12996,11 +13013,12 @@ static void *client_main(void *arg) {
     job j;
     memset(&j, 0, sizeof(j));
     j.fd = fd;
-    j.req = req;
+	j.req = req;
 	server_peer_caller(fd, j.caller, sizeof(j.caller));
+	memcpy(j.client, client, sizeof(j.client));
 	j.received_at = ds4_wall_time_sec();
 	pthread_mutex_lock(&s->call_history_mu);
-	j.call_request_id = ds4_call_history_begin(&s->call_history, j.caller,
+	j.call_request_id = ds4_call_history_begin(&s->call_history, j.caller, j.client,
 		request_api_name(j.req.api), request_kind_name(j.req.kind), j.req.stream,
 		j.req.has_tools, j.received_at);
 	pthread_mutex_unlock(&s->call_history_mu);
@@ -15012,6 +15030,41 @@ static void test_http_chunked_headers_preserve_normal_route_body(void) {
 	close(sv[0]); close(sv[1]);
 }
 
+static void test_client_identity_header_precedence_and_fallback(void) {
+	int sv[2];
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	const char *headers =
+		"POST /v1/chat/completions HTTP/1.1\r\n"
+		"X-DS4-Client:  hanako-agent  \r\n"
+		"User-Agent: Hermes/1.0\r\nContent-Length: 0\r\n\r\n";
+	TEST_ASSERT(send_all(sv[0], headers, strlen(headers)));
+	http_request hr = {0};
+	char client[DS4_CALL_CLIENT_MAX];
+	TEST_ASSERT(read_http_headers(sv[1], &hr));
+	server_client_identity(&hr, client, sizeof(client));
+	TEST_ASSERT(!strcmp(client, "hanako-agent"));
+	http_request_free(&hr);
+	close(sv[0]); close(sv[1]);
+
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	headers = "POST /v1/chat/completions HTTP/1.1\r\n"
+		"User-Agent: Hermes/1.0\r\nContent-Length: 0\r\n\r\n";
+	TEST_ASSERT(send_all(sv[0], headers, strlen(headers)));
+	hr = (http_request){0};
+	TEST_ASSERT(read_http_headers(sv[1], &hr));
+	server_client_identity(&hr, client, sizeof(client));
+	TEST_ASSERT(!strcmp(client, "Hermes/1.0"));
+	http_request_free(&hr);
+	close(sv[0]); close(sv[1]);
+
+	hr = (http_request){0};
+	server_client_identity(&hr, client, sizeof(client));
+	TEST_ASSERT(!strcmp(client, "未标识服务"));
+	snprintf(hr.client_header, sizeof(hr.client_header), "  open%cclaw  ", 1);
+	server_client_identity(&hr, client, sizeof(client));
+	TEST_ASSERT(!strcmp(client, "openclaw"));
+}
+
 static void test_kv_admin_handler_semantics(void) {
 	server s = {0};
 	server_kv_init(&s);
@@ -15128,7 +15181,7 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
     ds4_call_history history = {0};
     ds4_call_history_init(&history);
     uint64_t request_id = ds4_call_history_begin(&history, "status-client",
-        "openai", "chat", true, true, 120.0);
+        "hanako-agent", "openai", "chat", true, true, 120.0);
     ds4_call_history_update_prompt(&history, request_id, 10, 4, "disk");
     ds4_call_history_finish(&history, request_id, DS4_CALL_COMPLETED,
         122.0, 3, "disk", "stop", NULL);
@@ -15148,8 +15201,9 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
     TEST_ASSERT(strstr(b.ptr, "context-tokens") == NULL);
     TEST_ASSERT(strstr(b.ptr, "\"host\":{\"available\":true,\"memory_total_bytes\":1000,\"memory_used_bytes\":600,\"memory_available_bytes\":400,\"memory_pressure\":\"warning\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"calls\":{\"capacity\":200,\"active_request_id\":\"0\"") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"request_id\":\"1\",\"caller\":\"status-client\"") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"callers\":[{\"caller\":\"status-client\",\"calls\":1,\"failed\":0") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"request_id\":\"1\",\"caller\":\"status-client\",\"client\":\"hanako-agent\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"client\":\"hanako-agent\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"callers\":[{\"caller\":\"status-client\",\"client\":\"hanako-agent\",\"calls\":1,\"failed\":0") != NULL);
     TEST_ASSERT(strstr(b.ptr, "X-Forwarded") == NULL);
     buf_free(&b);
 
@@ -15214,12 +15268,12 @@ static void test_call_history_capacity_keeps_active_calls(void) {
     ds4_call_history h = {0};
     ds4_call_history_init(&h);
     h.capacity = 2;
-    uint64_t one = ds4_call_history_begin(&h, "one", "openai", "chat", false, false, 1.0);
-    uint64_t two = ds4_call_history_begin(&h, "two", "openai", "chat", false, false, 2.0);
+    uint64_t one = ds4_call_history_begin(&h, "one", NULL, "openai", "chat", false, false, 1.0);
+    uint64_t two = ds4_call_history_begin(&h, "two", NULL, "openai", "chat", false, false, 2.0);
     TEST_ASSERT(one != 0 && two != 0);
     ds4_call_history_finish(&h, one, DS4_CALL_COMPLETED, 3.0, 1, "none", "stop", NULL);
     ds4_call_history_finish(&h, two, DS4_CALL_COMPLETED, 4.0, 1, "none", "stop", NULL);
-    uint64_t three = ds4_call_history_begin(&h, "three", "openai", "chat", false, false, 5.0);
+    uint64_t three = ds4_call_history_begin(&h, "three", NULL, "openai", "chat", false, false, 5.0);
     TEST_ASSERT(h.len == 2);
     TEST_ASSERT(h.records[0].request_id == two || h.records[1].request_id == two);
     TEST_ASSERT(h.records[0].request_id == three || h.records[1].request_id == three);
@@ -15227,9 +15281,9 @@ static void test_call_history_capacity_keeps_active_calls(void) {
 
 	ds4_call_history_init(&h);
 	h.capacity = 2;
-	one = ds4_call_history_begin(&h, "one", "openai", "chat", false, false, 1.0);
-	two = ds4_call_history_begin(&h, "two", "openai", "chat", false, false, 2.0);
-	three = ds4_call_history_begin(&h, "three", "openai", "chat", false, false, 3.0);
+	one = ds4_call_history_begin(&h, "one", NULL, "openai", "chat", false, false, 1.0);
+	two = ds4_call_history_begin(&h, "two", NULL, "openai", "chat", false, false, 2.0);
+	three = ds4_call_history_begin(&h, "three", NULL, "openai", "chat", false, false, 3.0);
 	/* A full active window never grows: overflow requests receive an ID but
 	 * are deliberately untracked, so their later finish is a safe no-op. */
 	TEST_ASSERT(three != 0);
@@ -15241,7 +15295,7 @@ static void test_call_history_capacity_keeps_active_calls(void) {
 	ds4_call_history_finish(&h, one, DS4_CALL_COMPLETED, 4.0, 1, "none", "stop", NULL);
 	TEST_ASSERT(h.len == 2);
 	TEST_ASSERT(h.records[0].request_id == two || h.records[1].request_id == two);
-	uint64_t four = ds4_call_history_begin(&h, "four", "openai", "chat", false, false, 5.0);
+	uint64_t four = ds4_call_history_begin(&h, "four", NULL, "openai", "chat", false, false, 5.0);
 	TEST_ASSERT(four != 0);
 	TEST_ASSERT(h.len == 2);
 	TEST_ASSERT(h.records[0].request_id == two || h.records[1].request_id == two);
@@ -15254,7 +15308,7 @@ static void test_call_history_never_exceeds_full_active_window(void) {
 	ds4_call_history_init(&h);
 	uint64_t first = 0, overflow = 0;
 	for (size_t i = 0; i < DS4_CALL_HISTORY_CAPACITY + 1; i++) {
-		uint64_t id = ds4_call_history_begin(&h, "bulk", "openai", "chat",
+		uint64_t id = ds4_call_history_begin(&h, "bulk", NULL, "openai", "chat",
 			false, false, (double)i);
 		TEST_ASSERT(id != 0);
 		if (!i) first = id;
@@ -15268,7 +15322,7 @@ static void test_call_history_never_exceeds_full_active_window(void) {
 	TEST_ASSERT(h.len == DS4_CALL_HISTORY_CAPACITY);
 	ds4_call_history_finish(&h, first, DS4_CALL_COMPLETED, 202.0, 1,
 		"none", "stop", NULL);
-	uint64_t next = ds4_call_history_begin(&h, "next", "openai", "chat",
+	uint64_t next = ds4_call_history_begin(&h, "next", NULL, "openai", "chat",
 		false, false, 203.0);
 	TEST_ASSERT(next != 0);
 	TEST_ASSERT(h.len == DS4_CALL_HISTORY_CAPACITY);
@@ -15293,7 +15347,7 @@ static void test_call_history_never_exceeds_full_active_window(void) {
 static void test_call_history_clamps_tokens_and_aggregates_failures(void) {
     ds4_call_history h = {0};
     ds4_call_history_init(&h);
-    uint64_t id = ds4_call_history_begin(&h, "client", "openai", "chat", true, true, 10.0);
+    uint64_t id = ds4_call_history_begin(&h, "client", NULL, "openai", "chat", true, true, 10.0);
     ds4_call_history_update_prompt(&h, id, -5, 8, "disk");
     ds4_call_history_update_prompt(&h, id, 10, 99, "disk");
     ds4_call_history_finish(&h, id, DS4_CALL_FAILED, 14.0, -2, "disk", "error", "failure");
@@ -15311,10 +15365,35 @@ static void test_call_history_clamps_tokens_and_aggregates_failures(void) {
     ds4_call_history_free(&h);
 }
 
+static void test_call_history_keeps_clients_separate_per_caller(void) {
+    ds4_call_history h = {0};
+    ds4_call_history_init(&h);
+    uint64_t hanako = ds4_call_history_begin(&h, "192.0.2.7", "hanako-agent", "openai", "chat", false, false, 1.0);
+    uint64_t hermes = ds4_call_history_begin(&h, "192.0.2.7", "Hermes/1.0", "openai", "chat", false, false, 2.0);
+    uint64_t unnamed = ds4_call_history_begin(&h, "192.0.2.8", NULL, "openai", "chat", false, false, 3.0);
+    ds4_call_history_finish(&h, hanako, DS4_CALL_COMPLETED, 2.0, 1, "none", "stop", NULL);
+    ds4_call_history_finish(&h, hermes, DS4_CALL_FAILED, 4.0, 0, "none", "error", "failure");
+    ds4_call_history_finish(&h, unnamed, DS4_CALL_COMPLETED, 5.0, 1, "none", "stop", NULL);
+    ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(&h, 6.0);
+    TEST_ASSERT(snap.records_len == 3);
+    TEST_ASSERT(!strcmp(snap.records[0].client, "hanako-agent"));
+    TEST_ASSERT(!strcmp(snap.records[1].client, "Hermes/1.0"));
+    TEST_ASSERT(!strcmp(snap.records[2].client, "未标识服务"));
+    TEST_ASSERT(snap.callers_len == 3);
+    TEST_ASSERT(!strcmp(snap.callers[0].caller, "192.0.2.7"));
+    TEST_ASSERT(!strcmp(snap.callers[0].client, "hanako-agent"));
+    TEST_ASSERT(!strcmp(snap.callers[1].caller, "192.0.2.7"));
+    TEST_ASSERT(!strcmp(snap.callers[1].client, "Hermes/1.0"));
+    TEST_ASSERT(snap.callers[1].failures == 1);
+    TEST_ASSERT(!strcmp(snap.callers[2].client, "未标识服务"));
+    ds4_call_history_snapshot_free(&snap);
+    ds4_call_history_free(&h);
+}
+
 static void test_call_history_snapshot_owns_copies(void) {
     ds4_call_history h = {0};
     ds4_call_history_init(&h);
-    uint64_t id = ds4_call_history_begin(&h, "caller", "openai", "chat", false, false, 1.0);
+    uint64_t id = ds4_call_history_begin(&h, "caller", NULL, "openai", "chat", false, false, 1.0);
     ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(&h, 2.0);
     TEST_ASSERT(snap.records_len == 1 && !strcmp(snap.records[0].caller, "caller"));
     ds4_call_history_finish(&h, id, DS4_CALL_COMPLETED, 3.0, 4, "none", "stop", NULL);
@@ -15329,9 +15408,9 @@ static void test_status_worker_active_call_is_not_newest_queued_call(void) {
 	server s = {0};
 	pthread_mutex_init(&s.call_history_mu, NULL);
 	ds4_call_history_init(&s.call_history);
-	uint64_t a = ds4_call_history_begin(&s.call_history, "a", "openai", "chat", false, false, 1.0);
-	uint64_t b = ds4_call_history_begin(&s.call_history, "b", "openai", "chat", false, false, 2.0);
-	uint64_t c = ds4_call_history_begin(&s.call_history, "c", "openai", "chat", false, false, 3.0);
+	uint64_t a = ds4_call_history_begin(&s.call_history, "a", NULL, "openai", "chat", false, false, 1.0);
+	uint64_t b = ds4_call_history_begin(&s.call_history, "b", NULL, "openai", "chat", false, false, 2.0);
+	uint64_t c = ds4_call_history_begin(&s.call_history, "c", NULL, "openai", "chat", false, false, 3.0);
 	server_worker_active_call_set(&s, a);
 	pthread_mutex_lock(&s.call_history_mu);
 	TEST_ASSERT(s.worker_active_call_request_id == a);
@@ -15395,7 +15474,7 @@ static void test_status_external_timestamps_are_wall_clock(void) {
 	ds4_call_history h = {0};
 	ds4_call_history_init(&h);
 	double started = ds4_time_sec_from_parts(1700000000, 250000000);
-	uint64_t id = ds4_call_history_begin(&h, "clock", "openai", "chat", false, false, started);
+	uint64_t id = ds4_call_history_begin(&h, "clock", NULL, "openai", "chat", false, false, started);
 	ds4_call_history_finish(&h, id, DS4_CALL_COMPLETED, started - 1.0,
 		0, "none", "stop", NULL);
 	ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(&h, 1700000002.0);
@@ -15412,7 +15491,7 @@ static void test_call_history_marks_final_stream_write_failure(void) {
 	pthread_mutex_init(&s.call_history_mu, NULL);
 	ds4_call_history_init(&s.call_history);
 	job j = {0};
-	j.call_request_id = ds4_call_history_begin(&s.call_history, "caller",
+	j.call_request_id = ds4_call_history_begin(&s.call_history, "caller", NULL,
 		"openai", "chat", true, false, 1.0);
 	ds4_call_history_update_prompt(&s.call_history, j.call_request_id, 5, 2, "memory-token");
 	const char *final_finish = "stop";
@@ -19430,6 +19509,7 @@ static void ds4_server_unit_tests_run(void) {
     test_call_history_capacity_keeps_active_calls();
 	test_call_history_never_exceeds_full_active_window();
     test_call_history_clamps_tokens_and_aggregates_failures();
+    test_call_history_keeps_clients_separate_per_caller();
     test_call_history_snapshot_owns_copies();
 	test_status_worker_active_call_is_not_newest_queued_call();
 	test_status_host_snapshot_does_not_wait_for_sampler();
@@ -19522,6 +19602,7 @@ static void ds4_server_unit_tests_run(void) {
 	test_kv_admin_rejects_headers_before_body();
 	test_http_content_length_framing_is_strict();
 	test_http_chunked_headers_preserve_normal_route_body();
+	test_client_identity_header_precedence_and_fallback();
 	test_kv_cache_budget_changes();
 	test_kv_cache_budget_refreshes_external_files();
 	test_kv_cache_budget_reports_unlink_failure();

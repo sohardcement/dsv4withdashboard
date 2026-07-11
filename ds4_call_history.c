@@ -1,5 +1,6 @@
 #include "ds4_call_history.h"
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -8,6 +9,22 @@ static void copy_text(char *dst, size_t dstlen, const char *src) {
 	if (!src) src = "";
 	strncpy(dst, src, dstlen - 1);
 	dst[dstlen - 1] = '\0';
+}
+
+bool ds4_call_client_normalize(char *dst, size_t dstlen, const char *src) {
+	if (!dst || !dstlen) return false;
+	dst[0] = '\0';
+	if (!src) return false;
+	size_t out = 0, last_non_space = 0;
+	for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+		if (*p < 0x20 || *p == 0x7f) continue;
+		if (!out && isspace(*p)) continue;
+		if (out + 1 >= dstlen) break;
+		dst[out++] = (char)*p;
+		if (!isspace(*p)) last_non_space = out;
+	}
+	dst[last_non_space] = '\0';
+	return last_non_space != 0;
 }
 
 static bool evict_oldest_terminal(ds4_call_history *history) {
@@ -47,7 +64,7 @@ void ds4_call_history_free(ds4_call_history *history) {
 }
 
 uint64_t ds4_call_history_begin(ds4_call_history *history, const char *caller,
-                                 const char *api, const char *kind, bool stream,
+                                 const char *client, const char *api, const char *kind, bool stream,
                                  bool has_tools, double started_at) {
 	if (!history) return 0;
 	if (!history->capacity) history->capacity = DS4_CALL_HISTORY_CAPACITY;
@@ -72,6 +89,8 @@ uint64_t ds4_call_history_begin(ds4_call_history *history, const char *caller,
 	memset(record, 0, sizeof(*record));
 	record->request_id = request_id;
 	copy_text(record->caller, sizeof(record->caller), caller);
+	if (!ds4_call_client_normalize(record->client, sizeof(record->client), client))
+		copy_text(record->client, sizeof(record->client), "未标识服务");
 	copy_text(record->api, sizeof(record->api), api);
 	copy_text(record->kind, sizeof(record->kind), kind);
 	record->stream = stream;
@@ -125,9 +144,11 @@ ds4_call_history_snapshot ds4_call_history_snapshot_take(
 		const ds4_call_record *record = &history->records[i];
 		size_t j;
 		for (j = 0; j < snapshot.callers_len; j++)
-			if (!strcmp(snapshot.callers[j].caller, record->caller)) break;
+			if (!strcmp(snapshot.callers[j].caller, record->caller) &&
+				!strcmp(snapshot.callers[j].client, record->client)) break;
 		if (j == snapshot.callers_len) {
 			copy_text(snapshot.callers[j].caller, sizeof(snapshot.callers[j].caller), record->caller);
+			copy_text(snapshot.callers[j].client, sizeof(snapshot.callers[j].client), record->client);
 			snapshot.callers_len++;
 		}
 		ds4_call_caller *caller = &snapshot.callers[j];
@@ -144,6 +165,7 @@ ds4_call_history_snapshot ds4_call_history_snapshot_take(
 		for (size_t i = 0; i < history->len; i++) {
 			const ds4_call_record *record = &history->records[i];
 			if (strcmp(record->caller, snapshot.callers[j].caller) ||
+				strcmp(record->client, snapshot.callers[j].client) ||
 				record->status == DS4_CALL_ACTIVE) continue;
 			double duration = record->finished_at - record->started_at;
 			total += duration < 0.0 ? 0.0 : duration;
