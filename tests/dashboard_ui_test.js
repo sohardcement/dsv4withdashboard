@@ -89,7 +89,7 @@ async page => {
   assert(await page.locator('#paperLayout,#terminalLayout,#calmLayout').count()===0,'legacy theme roots must be absent');
   const tokens=await page.evaluate(()=>{const s=getComputedStyle(document.documentElement);return ['paper','surface','ink','muted','line','accent','success','danger'].map(name=>s.getPropertyValue('--'+name).trim())});
   assert(tokens.join(',')==='#f3f0e7,#f8f5ed,#171a1d,#706d65,#c4bfb4,#df4932,#28734b,#a52a1c','precision instrument tokens do not match the approved palette');
-  const headings=page.locator('h1'); assert(await headings.count()===1&&(await headings.innerText())==='运行与容量','dashboard must have one management page heading');
+  const headings=page.locator('h1'); assert(await headings.count()===2&&await page.locator('h1:visible').count()===1&&(await page.locator('h1:visible').innerText())==='运行与容量','management mode must expose exactly one visible page heading');
   const brand=page.locator('.brand a[href="#managementSummary"]');
   assert(await brand.count()===1&&await brand.locator('[aria-hidden="true"]').count()===1,'brand anchor or status glyph is missing');
   assert(await page.getByRole('navigation',{name:'Dashboard 模式'}).locator('[data-mode-choice]').count()===2,'labeled mode navigation is missing');
@@ -105,6 +105,7 @@ async page => {
   await page.locator('[data-mode-choice="monitor"]').click();
   assert(await page.locator('#dashboard').getAttribute('data-mode')==='monitor','monitor mode did not apply');
   assert(await page.locator('#managementLayout').getAttribute('hidden')===''&&await page.locator('#managementLayout').getAttribute('aria-hidden')==='true'&&await page.locator('#monitorLayout').getAttribute('hidden')===null&&await page.locator('#monitorLayout').getAttribute('aria-hidden')==='false','mode roots did not switch to monitor');
+  assert(await page.locator('h1:visible').count()===1&&(await page.locator('h1:visible').innerText())==='实时运行','monitor mode must expose exactly one visible page heading');
   assert(await page.locator('[data-call-filter]').count()===4&&await page.locator('#callFilterCaller').count()===1,'monitor must own the single four-filter set');
   await page.locator('#callFilterCaller').fill('direct');
   const preserved=await page.evaluate(()=>({kv:document.getElementById('kvBudgetInput').value,unit:document.getElementById('kvBudgetUnit').value,context:document.getElementById('contextNextInput').value,filter:document.getElementById('callFilterCaller').value,notice:document.getElementById('adminNotice').textContent}));
@@ -116,7 +117,8 @@ async page => {
   await page.reload(); await wait(150);
   assert(await page.locator('#dashboard').getAttribute('data-mode')==='monitor','monitor mode did not persist');
   assert(await page.locator('#monitorLayout').getAttribute('hidden')===null&&await page.locator('#monitorLayout').getAttribute('aria-hidden')==='false','persisted monitor root state is wrong');
-  assert((await page.locator('#monitorMetrics').innerText()).includes('52.7 t/s')&&(await page.locator('#monitorMetrics').innerText()).includes('75.0%'),'monitor metrics are missing decode speed or request KV hit');
+  const monitorMetricsText=await page.locator('#monitorMetrics').innerText(); assert(monitorMetricsText.includes('52.7 t/s')&&monitorMetricsText.includes('75.0%')&&monitorMetricsText.includes('解码中 · 运行中')&&monitorMetricsText.includes('hanako-agent'),'monitor metrics are missing decode speed, request KV hit, activity, or service');
+  assert(await page.locator('#monitorHost').count()===1,'monitor host section is missing its stable ID');
   assert(await page.locator('#monitorCalls tr[data-request-id]').count()===5,'monitor must show exactly five fixture calls');
   assert((await page.locator('[data-request-id="98"]').innerText()).includes('42.1s')&&(await page.locator('[data-request-id="99"]').innerText()).includes('18.4s'),'finished or active row duration is missing');
   await page.locator('[data-request-id="98"] .request-select').click();
@@ -137,6 +139,7 @@ async page => {
   await page.locator('[data-mode-choice="management"]').click();
   assert(await page.locator('#dashboard').getAttribute('data-mode')==='management','management mode did not reapply');
   assert(await page.locator('#managementLayout').isVisible()&&await page.locator('#monitorLayout').getAttribute('hidden')===''&&await page.locator('#monitorLayout').getAttribute('aria-hidden')==='true','mode roots did not switch back to management');
+  assert(await page.locator('h1:visible').count()===1&&(await page.locator('h1:visible').innerText())==='运行与容量','management mode did not restore its sole visible page heading');
   assert(await page.locator('#managementTitle').count()===1&&(await page.locator('#managementTitle').innerText())==='运行与容量','management title is missing');
   assert((await page.locator('#managementPhase').innerText()).includes('解码'),'management phase was not localized');
   assert((await page.locator('#managementContext').innerText()).includes('115,720'),'management context remaining is missing');
