@@ -748,12 +748,16 @@ also include:
   Records deliberately omit prompts and request bodies, and reset when the
   server restarts.
 
-The dashboard has three genuinely different local display themes: **纸面运行报告**
-(the default, a report-style operational summary), **深色控制台** (compact live
-event flow), and **从容解释型** (status and explanation focused). The selected
-theme is saved only in that browser's `localStorage`; it does not change server
-configuration or data. All three views expose the same live data and the same
-administrative actions.
+The dashboard has two task modes under one visual system. **管理** is the default
+for runtime state, disk-KV and context settings, their effects, and operation
+results. **监控** focuses on live metrics, filterable recent calls, the request
+inspector, and host resources. The selected mode is saved only in that browser's
+`localStorage`; it does not change server configuration or data.
+
+Disk-KV runtime changes first use an inline dry-run review that shows the old and
+new limits and any required eviction before explicit confirmation. Persisting a
+disk-KV limit or context limit is a separate, explicit next-start action; its
+success message does not imply that the current server process changed.
 
 Two local-only JSON administration endpoints back the dashboard:
 
