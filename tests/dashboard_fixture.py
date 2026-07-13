@@ -11,7 +11,8 @@ base_calls = {"active_request_id":"99","records":[{"request_id":"99","caller":"d
 state = {"kv": dict(base_kv), "admin": [], "status_active": 0, "status_max": 0,
          "status_delay_ms": 0, "admin_delay_ms": 0, "forbidden": False,
          "malformed": False, "mismatch_once": False, "mismatch_remaining": 0, "mismatch_makes_eviction": False,
-         "runtime_patch": {}, "mismatch_runtime_patch": {}, "mismatch_patch_active": False,
+         "runtime_patch": {}, "dry_runtime_patch": {}, "apply_runtime_patch": {},
+         "mismatch_runtime_patch": {}, "mismatch_patch_active": False,
          "context": {"current_tokens":48120,"limit_tokens":163840,"next_limit_tokens":163840,"remaining":115720,"utilization":.2937},
          "context_admin": [], "context_forbidden": False, "context_durable": True, "context_fail_once": False,
          "host_available": True, "offline": False, "calls": dict(base_calls)}
@@ -27,6 +28,16 @@ def status():
       "kv_cache":dict(state["kv"]), "context":dict(state["context"]),
       "host":{"available":state["host_available"],"memory_total_bytes":128<<30,"memory_used_bytes":96<<30,"memory_available_bytes":32<<30,"memory_pressure":"warning","swap_total_bytes":16<<30,"swap_used_bytes":2<<30,"process_rss_bytes":12<<30},
       "calls":dict(state["calls"])}
+
+def response_runtime(runtime, mode):
+    result = dict(runtime)
+    patches = [state["mismatch_runtime_patch"] if state["mismatch_patch_active"] else state["runtime_patch"]]
+    patches.append(state["apply_runtime_patch"] if mode == "apply" else state["dry_runtime_patch"])
+    for patch in patches:
+        for key,value in patch.items():
+            if value is None: result.pop(key, None)
+            else: result[key] = value
+    return result
 
 class Handler(BaseHTTPRequestHandler):
     def json(self, value, code=200):
@@ -46,7 +57,7 @@ class Handler(BaseHTTPRequestHandler):
         body=json.loads(self.rfile.read(int(self.headers.get("Content-Length","0"))))
         if self.path == "/fixture/config":
             if body.get("reset"):
-                state.update(kv=dict(base_kv), admin=[], status_active=0, status_max=0, status_delay_ms=0, admin_delay_ms=0, forbidden=False, malformed=False, mismatch_once=False, mismatch_remaining=0, mismatch_makes_eviction=False, mismatch_patch_active=False, runtime_patch={}, mismatch_runtime_patch={}, eviction_fail=False, context={"current_tokens":48120,"limit_tokens":163840,"next_limit_tokens":163840,"remaining":115720,"utilization":.2937}, context_admin=[], context_forbidden=False, context_durable=True, context_fail_once=False, host_available=True, offline=False, calls=dict(base_calls))
+                state.update(kv=dict(base_kv), admin=[], status_active=0, status_max=0, status_delay_ms=0, admin_delay_ms=0, forbidden=False, malformed=False, mismatch_once=False, mismatch_remaining=0, mismatch_makes_eviction=False, mismatch_patch_active=False, runtime_patch={}, dry_runtime_patch={}, apply_runtime_patch={}, mismatch_runtime_patch={}, eviction_fail=False, context={"current_tokens":48120,"limit_tokens":163840,"next_limit_tokens":163840,"remaining":115720,"utilization":.2937}, context_admin=[], context_forbidden=False, context_durable=True, context_fail_once=False, host_available=True, offline=False, calls=dict(base_calls))
             if "call_records" in body:
                 state["calls"] = dict(state["calls"], records=body["call_records"])
             for key,value in body.items():
@@ -70,22 +81,18 @@ class Handler(BaseHTTPRequestHandler):
             raw=b"{"; self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length","1"); self.end_headers(); self.wfile.write(raw); return
         mb=body["budget_mb"]; new=mb<<20; kv=state["kv"]
         runtime={"attempted":True,"ok":True,"applied":body["mode"]=="apply","old_budget_bytes":kv["budget_bytes"],"new_budget_bytes":new,"before_bytes":kv["used_bytes"],"after_bytes":min(kv["used_bytes"],new),"before_entries":kv["entries"],"after_entries":88 if new<kv["used_bytes"] else kv["entries"],"eviction_required":new<kv["used_bytes"],"revision":kv["revision"]}
-        patch = state["mismatch_runtime_patch"] if state["mismatch_patch_active"] else state["runtime_patch"]
-        for key,value in patch.items():
-            if value is None: runtime.pop(key, None)
-            else: runtime[key] = value
         if body["mode"]=="apply" and (state["mismatch_once"] or state["mismatch_remaining"]>0):
             state["mismatch_once"]=False; state["mismatch_remaining"]=max(0,state["mismatch_remaining"]-1); kv["revision"]=str(int(kv["revision"])+1)
             if state["mismatch_makes_eviction"]: kv["used_bytes"]=90<<30; kv["entries"]=150
             state["mismatch_patch_active"] = True
-            self.json({"ok":False,"runtime":runtime,"current_revision":kv["revision"],"error":{"code":"kv_state_changed","message":"state changed"}},409); return
+            self.json({"ok":False,"runtime":response_runtime(runtime, body["mode"]),"current_revision":kv["revision"],"error":{"code":"kv_state_changed","message":"state changed"}},409); return
         if body["mode"]=="apply" and state.get("eviction_fail"):
             kv.update(used_bytes=40<<30,entries=100,revision=str(int(kv["revision"])+1)); runtime.update(ok=False,applied=False,after_bytes=kv["used_bytes"],after_entries=kv["entries"],revision=kv["revision"])
-            self.json({"ok":False,"runtime":runtime,"error":{"code":"kv_eviction_failed","message":"KV cache eviction failed; the previous limit was restored"}},500); return
+            self.json({"ok":False,"runtime":response_runtime(runtime, body["mode"]),"error":{"code":"kv_eviction_failed","message":"KV cache eviction failed; the previous limit was restored"}},500); return
         if body["mode"]=="apply":
             kv.update(budget_bytes=new,used_bytes=runtime["after_bytes"],entries=runtime["after_entries"],revision=str(int(kv["revision"])+1)); runtime["revision"]=kv["revision"]
         persistent={"attempted":body["mode"]=="persist","ok":True,"committed":body["mode"]=="persist","durable":body["mode"]=="persist","budget_mb":mb}
-        self.json({"ok":True,"runtime":runtime,"persistent":persistent})
+        self.json({"ok":True,"runtime":response_runtime(runtime, body["mode"]),"persistent":persistent})
     def log_message(self,*_): pass
 
 ThreadingHTTPServer(("127.0.0.1", int(sys.argv[2]) if len(sys.argv)>2 else 8766), Handler).serve_forever()
