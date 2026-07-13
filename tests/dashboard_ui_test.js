@@ -101,7 +101,7 @@ async page => {
   assert(await page.locator('#managementLayout').isVisible(),'management layout must be visible by default');
   assert(await page.locator('#monitorLayout').getAttribute('hidden')===''&&await page.locator('#monitorLayout').getAttribute('aria-hidden')==='true','monitor layout must be hidden by default');
   assert(await page.locator('[data-mode-choice="management"]').getAttribute('aria-pressed')==='true','management mode button must be pressed by default');
-  assert(await page.locator('#paperLayout,#terminalLayout,#calmLayout').count()===0,'legacy theme roots must be absent');
+  const legacyLayoutSelector=['paper','terminal','calm'].map(name=>'#'+name+'Layout').join(','); assert(await page.locator(legacyLayoutSelector).count()===0,'legacy theme roots must be absent');
   const tokens=await page.evaluate(()=>{const s=getComputedStyle(document.documentElement);return ['paper','surface','ink','muted','line','accent','success','danger'].map(name=>s.getPropertyValue('--'+name).trim())});
   assert(tokens.join(',')==='#f3f0e7,#f8f5ed,#171a1d,#706d65,#c4bfb4,#df4932,#28734b,#a52a1c','precision instrument tokens do not match the approved palette');
   const headings=page.locator('h1'); assert(await headings.count()===2&&await page.locator('h1:visible').count()===1&&(await page.locator('h1:visible').innerText())==='运行与容量','management mode must expose exactly one visible page heading');
@@ -210,5 +210,24 @@ async page => {
   assert(await page.locator('#kvBudgetInput').isDisabled()&&await page.locator('#kvBudgetUnit').isDisabled()&&await page.locator('#kvApplyNow').isDisabled()&&await page.locator('#kvSaveRestart').isDisabled()&&await page.locator('#contextNextInput').isDisabled()&&await page.locator('#contextSaveRestart').isDisabled(),'offline state did not disable both administration groups');
   await cfg({offline:false}); await page.waitForFunction(()=>document.getElementById('health').textContent!=='数据已过期'&&!document.getElementById('kvApplyNow').disabled&&!document.getElementById('contextSaveRestart').disabled); assert(!await page.locator('#dashboard').evaluate(e=>e.classList.contains('stale'))&&(await page.locator('#updatedAt').innerText()).includes('更新')&&(await page.locator('#kvBudgetInput').inputValue())==='80'&&(await page.locator('#contextNextInput').inputValue())==='131072','successful recovery did not clear stale state, restore controls, or preserve touched targets');
   await cfg({reset:true,offline:true}); await page.reload(); await page.waitForFunction(()=>document.getElementById('health').textContent==='不可用'); assert((await page.locator('#updatedAt').innerText())==='尚未更新'&&!(await page.locator('#connectionState').innerText()).includes('数据已过期'),'first-load unavailable state was confused with a stale snapshot');
+
+  const acceptanceState=await cfg({reset:true});
+  await cfg({call_records:acceptanceState.calls.records.map((record,index)=>({...record,caller:index===3?'198.51.100.8':record.caller,client:index===3?'safety-probe':record.client,error:''}))});
+  await page.evaluate(()=>localStorage.setItem('ds4-dashboard-mode','management')); await reloadReady();
+  await page.setViewportSize({width:1440,height:900});
+  await page.waitForFunction(()=>document.getElementById('dashboard').dataset.mode==='management'&&!document.getElementById('dashboard').classList.contains('stale')&&document.getElementById('health').textContent!=='等待中'&&document.querySelectorAll('#managementRecentCalls tr[data-call-id]').length===3&&!document.getElementById('kvApplyNow').disabled);
+  const uniqueControlIds=['callFilterCaller','callFilterClient','callFilterApi','callFilterStatus','kvApplyNow','kvSaveRestart','contextSaveRestart'];
+  assert(await page.evaluate(ids=>ids.every(id=>document.querySelectorAll('#'+id).length===1),uniqueControlIds),'filter or administration control IDs are duplicated');
+  await page.screenshot({path:'output/playwright/dashboard-management-desktop.png',fullPage:true});
+  await page.locator('[data-mode-choice="monitor"]').click();
+  await page.locator('[data-request-id="98"] .request-select').click();
+  await page.waitForFunction(()=>document.getElementById('dashboard').dataset.mode==='monitor'&&document.querySelectorAll('#monitorCalls tr[data-request-id]').length===5&&document.getElementById('requestInspector').textContent.includes('hermes-agent'));
+  const fifthRowBox=await page.locator('[data-request-id="95"]').boundingBox();
+  assert(fifthRowBox&&fifthRowBox.y+fifthRowBox.height<=901,'fifth monitor call must fit within the 1440x900 acceptance viewport');
+  assert(await page.locator('#monitorMetrics').isVisible()&&await page.locator('#requestInspector').isVisible(),'monitor metrics or selected request inspector are not visible in the acceptance view');
+  await page.screenshot({path:'output/playwright/dashboard-monitor-desktop.png',fullPage:true});
+  await page.setViewportSize({width:390,height:844}); await page.locator('[data-mode-choice="management"]').click();
+  await page.waitForFunction(()=>document.getElementById('dashboard').dataset.mode==='management'&&!document.getElementById('managementLayout').hidden&&document.documentElement.scrollWidth<=innerWidth&&document.querySelectorAll('#managementRecentCalls tr[data-call-id]').length===3);
+  await page.screenshot({path:'output/playwright/dashboard-management-mobile.png',fullPage:true});
   return {ok:true,double_apply:'one transaction',apply_save:'one transaction',poll_max_active:1,revision_sequence:s.admin.map(x=>x.mode)};
 }
