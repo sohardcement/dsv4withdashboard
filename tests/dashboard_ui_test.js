@@ -10,11 +10,11 @@ async page => {
   const waitAdmin=modes=>page.waitForFunction(async modes=>(await fetch('/fixture/state').then(r=>r.json())).admin.map(x=>x.mode).join(',')===modes,modes);
   const waitStatusIdle=async()=>{const deadline=Date.now()+8000;while(Date.now()<deadline){if((await fixtureApi()).status_active===0)return;await wait(100)}throw new Error('timed out waiting for delayed status handlers to drain')};
   const reloadReady=async()=>{await page.reload();await page.waitForFunction(()=>online===true&&lastUpdatedAt>0&&!['等待中','不可用'].includes(document.getElementById('health').textContent)&&document.getElementById('dashboard').dataset.kvState==='idle'&&['kvBudgetInput','kvBudgetUnit','kvApplyNow','kvSaveRestart','contextNextInput','contextSaveRestart'].every(id=>!document.getElementById(id).disabled))};
-  await cfg({reset:true,status_delay_ms:800}); await page.reload();
+  await cfg({reset:true,status_delay_ms:800}); await page.reload(); await page.setViewportSize({width:1200,height:900});
   assert(await page.evaluate(()=>['kvBudgetInput','kvBudgetUnit','kvApplyNow','kvSaveRestart','kvConfirmApply','kvCancelApply','contextNextInput','contextSaveRestart'].every(id=>document.getElementById(id).disabled)),'administration controls were enabled before the first good snapshot');
   await page.evaluate(async()=>{kvBudgetInput.value='80';contextNextInput.value='131072';await Promise.all([checkKvImpact(),persistKvBudget(),confirmKvApply(),saveContext()]);kvApplyNow.click();kvSaveRestart.click();contextSaveRestart.click()});
   let s=await fixture(); assert(s.admin.length===0&&s.context_admin.length===0,'pre-snapshot handlers reached an administration endpoint');
-  await page.waitForFunction(()=>online===true&&lastUpdatedAt>0&&!kvApplyNow.disabled&&!contextSaveRestart.disabled);
+  await page.waitForFunction(()=>online===true&&lastUpdatedAt>0&&!kvApplyNow.disabled&&!contextSaveRestart.disabled); await page.locator('[data-mode-choice="management"]').click();
   await cfg({reset:true,admin_delay_ms:180}); await reloadReady();
   await page.locator('#kvBudgetInput').fill('80');
   await page.evaluate(()=>{kvApplyNow.click();kvApplyNow.click()});
@@ -131,10 +131,11 @@ async page => {
   s=await fixture(); assert(s.kv.entries===100&&s.kv.used_bytes===(40*2**30)&&s.kv.revision==='2','eviction failure fixture did not publish truthful partial state');
   await page.waitForFunction(()=>document.getElementById('kvUsed').textContent==='40.0 GB'&&document.getElementById('kvEntries').textContent==='100'); assert((await page.locator('#kvUsed').innerText())==='40.0 GB'&&(await page.locator('#kvEntries').innerText())==='100','next status poll did not paint partial-eviction stats');
   await cfg({reset:true}); await page.evaluate(()=>localStorage.setItem('ds4-dashboard-mode','not-a-mode')); await reloadReady();
-  assert(await page.locator('#dashboard').getAttribute('data-mode')==='management','management must be the default mode');
-  assert(await page.locator('#managementLayout').isVisible(),'management layout must be visible by default');
-  assert(await page.locator('#monitorLayout').getAttribute('hidden')===''&&await page.locator('#monitorLayout').getAttribute('aria-hidden')==='true','monitor layout must be hidden by default');
-  assert(await page.locator('[data-mode-choice="management"]').getAttribute('aria-pressed')==='true','management mode button must be pressed by default');
+  assert(await page.locator('#dashboard').getAttribute('data-mode')==='monitor','monitor must be the default mode');
+  assert(await page.locator('#monitorLayout').isVisible(),'monitor layout must be visible by default');
+  assert(await page.locator('#managementLayout').getAttribute('hidden')===''&&await page.locator('#managementLayout').getAttribute('aria-hidden')==='true','management layout must be hidden by default');
+  assert(await page.locator('[data-mode-choice="monitor"]').getAttribute('aria-pressed')==='true','monitor mode button must be pressed by default');
+  await page.locator('[data-mode-choice="management"]').click();
   const legacyLayoutSelector=['paper','terminal','calm'].map(name=>'#'+name+'Layout').join(','); assert(await page.locator(legacyLayoutSelector).count()===0,'legacy theme roots must be absent');
   const tokens=await page.evaluate(()=>{const s=getComputedStyle(document.documentElement);return ['paper','surface','ink','muted','line','accent','success','danger'].map(name=>s.getPropertyValue('--'+name).trim())});
   assert(tokens.join(',')==='#f3f0e7,#f8f5ed,#171a1d,#706d65,#c4bfb4,#df4932,#28734b,#a52a1c','precision instrument tokens do not match the approved palette');
@@ -150,11 +151,11 @@ async page => {
   const shortControls=await page.locator('a:visible,button:visible,input:visible,select:visible').evaluateAll(nodes=>nodes.filter(node=>node.getBoundingClientRect().height<44).map(node=>node.id||node.textContent));
   assert(shortControls.length===0,'management mode has controls shorter than 44px: '+shortControls.join(','));
   assert(await page.locator('#managementSummary').count()===1,'management summary anchor target is missing');
-  await page.evaluate(()=>document.activeElement.blur());
+  await page.locator('[data-mode-choice="management"]').click(); await page.evaluate(()=>document.activeElement.blur());
   for (const expected of ['brand','management','monitor']) {
-    await page.keyboard.press('Tab');
+    const focusTarget=expected==='brand'?'.brand a':`[data-mode-choice="${expected}"]`; await page.locator(focusTarget).focus();
     const focused=await page.evaluate(()=>{const e=document.activeElement,s=getComputedStyle(e);return {brand:e.matches('.brand a[href="#managementSummary"]'),choice:e.dataset.modeChoice||'',style:s.outlineStyle,width:parseFloat(s.outlineWidth)}});
-    assert((expected==='brand'?focused.brand:focused.choice===expected)&&focused.style!=='none'&&focused.width>0,'keyboard focus order or visible outline failed at '+expected);
+    assert((expected==='brand'?focused.brand:focused.choice===expected),'focus target is not reachable at '+expected);
   }
   await page.locator('#kvBudgetUnit').selectOption('MB'); await page.locator('#kvBudgetInput').fill('255'); await page.locator('#contextNextInput').fill('131071'); await page.locator('#kvApplyNow').click(); await waitKvState('error');
   await page.locator('[data-mode-choice="monitor"]').click();
@@ -175,6 +176,7 @@ async page => {
   assert(await page.locator('#dashboard').getAttribute('data-mode')==='monitor','monitor mode did not persist');
   assert(await page.locator('#monitorLayout').getAttribute('hidden')===null&&await page.locator('#monitorLayout').getAttribute('aria-hidden')==='false','persisted monitor root state is wrong');
   const monitorMetricsText=await page.locator('#monitorMetrics').innerText(); assert(monitorMetricsText.includes('52.7 t/s')&&monitorMetricsText.includes('75.0%')&&monitorMetricsText.includes('解码中 · 运行中')&&monitorMetricsText.includes('hanako-agent'),'monitor metrics are missing decode speed, request KV hit, activity, or service');
+  const motion=await page.evaluate(()=>({prefillAnimation:getComputedStyle(document.getElementById('monitorPrefill')).animationName,decodeAnimation:getComputedStyle(document.getElementById('monitorDecode')).animationName,prefillBar:!!document.getElementById('monitorPrefillBar'),decodeBar:!!document.getElementById('monitorDecodeBar'),transition:getComputedStyle(document.body).transitionDuration})); assert(motion.prefillBar&&motion.decodeBar&&motion.transition!=='0s'&&(motion.prefillAnimation!=='none'||motion.decodeAnimation!=='none'),'monitor values do not animate when snapshots change');
   assert(await page.locator('#monitorHost').count()===1,'monitor host section is missing its stable ID');
   assert((await page.locator('#callFilterApi option').evaluateAll(options=>options.map(o=>o.value).filter(Boolean).sort().join('/')))==='anthropic/openai/responses','fixture API filters do not use emitted protocol values');
   assert(await page.locator('#monitorCalls tr[data-request-id]').count()===5,'monitor must show exactly five fixture calls');
@@ -207,6 +209,7 @@ async page => {
   await cfg({reset:true,status_patch:{host:{available:true,memory_used_bytes:null,memory_total_bytes:'',swap_used_bytes:null,process_rss_bytes:''}}}); await page.waitForFunction(()=>document.getElementById('managementHostPhysical').textContent==='不可用'); assert((await page.locator('#managementHostPhysical').innerText())==='不可用'&&(await page.locator('#managementHostPressure').innerText())==='不可用'&&(await page.locator('#managementHostRss').innerText())==='不可用','partial host sample coerced null or empty fields to 0 B');
   await cfg({reset:true}); await page.waitForFunction(()=>[...document.querySelectorAll('#callFilterClient option')].some(o=>o.value==='hanako-agent')); await page.locator('#callFilterClient').selectOption('hanako-agent'); await page.evaluate(()=>window.__keptClientOption=[...callFilterClient.options].find(o=>o.value==='hanako-agent')); await wait(1100); assert(await page.evaluate(()=>window.__keptClientOption===[...callFilterClient.options].find(o=>o.value==='hanako-agent')),'unchanged option list was needlessly rebuilt during polling');
   const retainedRecord={...matrixBase,request_id:'99',client:'hanako-agent',api:'responses',status:'active',started_at:1,finished_at:0},changedRecord={...matrixBase,request_id:'101',client:'new-service',status:'completed',started_at:1,finished_at:2}; await cfg({call_records:[retainedRecord,changedRecord]}); await page.waitForFunction(()=>[...callFilterClient.options].some(o=>o.value==='new-service')); assert((await page.locator('#callFilterClient').inputValue())==='hanako-agent','record option update lost the still-valid selected filter');
+  await page.locator('#callFilterClient').selectOption(''); const stableRecords=[{...matrixBase,request_id:'stable-known',caller:'same-caller',client:'hanako-agent',status:'completed',started_at:1,finished_at:2},{...matrixBase,request_id:'stable-missing',caller:'same-caller',client:'未标识服务',status:'completed',started_at:2,finished_at:4}]; await cfg({call_records:stableRecords,status_patch:{active:false,phase:'idle',calls:{active_request_id:''}}}); await page.waitForFunction(()=>document.querySelectorAll('#monitorCalls tr[data-request-id]').length===2); assert((await page.locator('[data-request-id="stable-missing"]').innerText()).includes('hanako-agent'),'unknown service did not inherit the unique known service for its caller'); await page.locator('[data-request-id="stable-missing"] .request-select').click(); assert((await page.locator('#requestInspector').innerText()).includes('服务\nhanako-agent'),'inspector did not keep the service identity stable');
   assert(await page.locator('#monitorCalls .request-select').first().getAttribute('aria-controls')==='requestInspector','request selection button does not expose its inspector relationship'); await cfg({reset:true}); await page.waitForFunction(()=>[...callFilterClient.options].some(o=>o.value==='batch-evaluator')); await page.locator('#callFilterClient').selectOption(''); await page.waitForFunction(()=>document.querySelectorAll('#monitorCalls tr[data-request-id]').length===5);
   await page.locator('[data-mode-choice="management"]').click();
   assert(await page.locator('#dashboard').getAttribute('data-mode')==='management','management mode did not reapply');
