@@ -45,6 +45,15 @@ async page => {
   assert(await page.locator('#monitorLayout').isHidden(),'monitor layout must be hidden by default');
   assert(await page.locator('[data-mode-choice="management"]').getAttribute('aria-pressed')==='true','management mode button must be pressed by default');
   assert(await page.locator('#paperLayout,#terminalLayout,#calmLayout').count()===0,'legacy theme roots must be absent');
+  const tokens=await page.evaluate(()=>{const s=getComputedStyle(document.documentElement);return ['paper','surface','ink','muted','line','accent','success','danger'].map(name=>s.getPropertyValue('--'+name).trim())});
+  assert(tokens.join(',')==='#f3f0e7,#f8f5ed,#171a1d,#706d65,#c4bfb4,#df4932,#28734b,#a52a1c','precision instrument tokens do not match the approved palette');
+  const brand=page.locator('.topbar>a.brand[href="#managementSummary"]');
+  assert(await brand.count()===1&&await brand.locator('[aria-hidden="true"]').count()===1,'brand anchor or status glyph is missing');
+  assert(await page.locator('.topbar>nav[aria-label="Dashboard 模式"] [data-mode-choice]').count()===2,'labeled mode navigation is missing');
+  assert(await page.locator('#connectionState>[aria-hidden="true"]').count()===1&&await page.locator('#connectionState>#health').count()===1&&await page.locator('#connectionState>#updatedAt').count()===1,'connection scaffold is incomplete');
+  assert(await page.locator('#managementSummary').count()===1,'management summary anchor target is missing');
+  await brand.focus(); const focus=await brand.evaluate(e=>{const s=getComputedStyle(e);return [s.outlineWidth,s.outlineColor,s.outlineOffset]});
+  assert(focus.join(',')==='3px,rgb(37, 99, 235),3px','global focus-visible treatment is missing from the brand link');
   await page.locator('[data-mode-choice="monitor"]').click();
   assert(await page.locator('#dashboard').getAttribute('data-mode')==='monitor','monitor mode did not apply');
   assert(await page.locator('#managementLayout').isHidden()&&await page.locator('#monitorLayout').isVisible(),'mode roots did not switch to monitor');
