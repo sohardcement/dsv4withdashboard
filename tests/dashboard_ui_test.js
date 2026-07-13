@@ -39,37 +39,23 @@ async page => {
   assert(!(await page.locator('#kvBudgetInput').isDisabled())&&!(await page.locator('#kvBudgetUnit').isDisabled())&&!(await page.locator('#kvApplyNow').isDisabled())&&!(await page.locator('#kvSaveRestart').isDisabled()),'500 eviction failure disabled controls');
   s=await fixture(); assert(s.kv.entries===100&&s.kv.used_bytes===(40*2**30)&&s.kv.revision==='2','eviction failure fixture did not publish truthful partial state');
   await wait(1100); assert((await page.locator('#kvUsed').innerText())==='40.0 GB'&&(await page.locator('#kvEntries').innerText())==='100','next status poll did not paint partial-eviction stats');
-  await cfg({reset:true}); await page.evaluate(()=>localStorage.setItem('ds4-dashboard-theme','not-a-theme')); await page.reload(); await wait(150);
-  assert(await page.locator('#dashboard').getAttribute('data-theme')==='paper','paper must be the default theme');
-  assert(await page.locator('#paperConclusion').isVisible(),'paper is missing its conclusion-first lead');
-  assert((await page.locator('#paperHealthConclusion').innerText()).includes('运行'),'paper lead does not summarize current health');
-  assert((await page.locator('#paperContextSummary').innerText()).includes('/'),'paper lead does not summarize context');
-  assert((await page.locator('#paperCacheSummary').innerText()).includes('%'),'paper lead does not summarize cache');
-  assert((await page.locator('#paperConclusion').boundingBox()).y<(await page.locator('#requestHitRate').boundingBox()).y,'paper conclusion does not precede performance detail');
-  for (const theme of ['paper','terminal','calm']) {
-    await page.locator(`[data-theme-choice="${theme}"]`).click();
-    assert(await page.locator('#dashboard').getAttribute('data-theme')===theme,'theme did not apply '+theme);
-    const roots=['paperLayout','terminalLayout','calmLayout'];
-    for (const root of roots) assert(await page.locator('#'+root).isVisible()===(root===theme+'Layout'),'theme root visibility did not switch '+root);
-    assert(await page.locator('#dashboard').locator('#contextSaveRestart,#kvApplyNow,#kvSaveRestart').count()===3,'shared administration controls disappeared');
-    await page.setViewportSize({width:390,height:844}); await wait(50);
-    const themeMobile=await page.evaluate(()=>({w:document.documentElement.scrollWidth,v:innerWidth}));
-    assert(themeMobile.w<=themeMobile.v,'mobile dashboard overflows in '+theme);
-    await page.setViewportSize({width:1440,height:900});
-  }
-  for (const id of ['terminalCallStream','calmCallTimeline']) {
-    const labels=await page.locator('#'+id).innerText();
-    assert(labels.includes('进行中')&&labels.includes('失败')&&!/\b(active|completed|failed)\b/.test(labels),'theme event labels were not localized in '+id);
-  }
-  await cfg({call_records:[{"request_id":"97","caller":"更新后的调用方","api":"responses","status":"completed","error":""}]});
-  await page.locator('[data-theme-choice="paper"]').click(); await wait(1100);
-  for (const id of ['terminalCallStream','calmCallTimeline']) {
-    const labels=await page.locator('#'+id).innerText();
-    assert(labels.includes('#97')&&labels.includes('完成')&&!/\bcompleted\b/.test(labels),'hidden '+id+' did not receive localized status poll update');
-  }
-  await page.reload(); assert(await page.locator('#dashboard').getAttribute('data-theme')==='paper','theme did not persist');
+  await cfg({reset:true}); await page.evaluate(()=>localStorage.setItem('ds4-dashboard-mode','not-a-mode')); await page.reload(); await wait(150);
+  assert(await page.locator('#dashboard').getAttribute('data-mode')==='management','management must be the default mode');
+  assert(await page.locator('#managementLayout').isVisible(),'management layout must be visible by default');
+  assert(await page.locator('#monitorLayout').isHidden(),'monitor layout must be hidden by default');
+  assert(await page.locator('[data-mode-choice="management"]').getAttribute('aria-pressed')==='true','management mode button must be pressed by default');
+  assert(await page.locator('#paperLayout,#terminalLayout,#calmLayout').count()===0,'legacy theme roots must be absent');
+  await page.locator('[data-mode-choice="monitor"]').click();
+  assert(await page.locator('#dashboard').getAttribute('data-mode')==='monitor','monitor mode did not apply');
+  assert(await page.locator('#managementLayout').isHidden()&&await page.locator('#monitorLayout').isVisible(),'mode roots did not switch to monitor');
+  await page.reload(); await wait(150);
+  assert(await page.locator('#dashboard').getAttribute('data-mode')==='monitor','monitor mode did not persist');
+  await page.locator('[data-mode-choice="management"]').click();
+  assert(await page.locator('#dashboard').getAttribute('data-mode')==='management','management mode did not reapply');
+  assert(await page.locator('#managementLayout').isVisible()&&await page.locator('#monitorLayout').isHidden(),'mode roots did not switch back to management');
+  assert(await page.locator('#dashboard').locator('#contextSaveRestart,#kvApplyNow,#kvSaveRestart').count()===3,'shared administration controls disappeared');
   const forbidden=['Counters reset when','Token hit rate','Request hit rate','Outcomes','Used','Budget','Entries / utilization','Disk KV capacity','Current request','tokens per second'];
-  const desktop=await page.evaluate(()=>({w:document.documentElement.scrollWidth,v:innerWidth,text:document.body.innerText})); assert(desktop.w<=desktop.v&&desktop.text.includes('纸面运行报告')&&desktop.text.includes('上下文窗口')&&desktop.text.includes('计数器会在此服务器进程重启时清零。')&&forbidden.every(s=>!desktop.text.includes(s)),'desktop layout or Chinese labels missing');
+  const desktop=await page.evaluate(()=>({w:document.documentElement.scrollWidth,v:innerWidth,text:document.body.innerText})); assert(desktop.w<=desktop.v&&desktop.text.includes('管理模式')&&desktop.text.includes('上下文窗口')&&desktop.text.includes('计数器会在此服务器进程重启时清零。')&&forbidden.every(s=>!desktop.text.includes(s)),'desktop layout or Chinese labels missing');
   await page.setViewportSize({width:390,height:844}); await wait(50); const mobile=await page.evaluate(()=>({w:document.documentElement.scrollWidth,v:innerWidth,text:document.body.innerText})); assert(mobile.w<=mobile.v&&forbidden.every(s=>!mobile.text.includes(s)),'mobile dashboard overflows or exposes English labels'); await page.setViewportSize({width:1440,height:900});
   assert((await page.locator('#contextNextInput').getAttribute('min'))==='4096','context input minimum does not match server');
   await page.locator('#contextNextInput').fill('4095'); await page.locator('#contextSaveRestart').click(); await wait(50); s=await fixture(); assert(s.context_admin.length===0,'below-minimum context reached server'); assert((await page.locator('#contextNotice').innerText()).includes('4,096 到 2,147,483,647')&&await page.locator('#contextNotice').evaluate(e=>e.className==='notice bad'),'invalid context did not show actionable Chinese error');
@@ -78,8 +64,8 @@ async page => {
   await cfg({reset:true,context_fail_once:true}); await page.reload(); await wait(100); await page.locator('#contextNextInput').fill('131072'); await page.locator('#contextSaveRestart').click(); await wait(50); assert((await page.locator('#contextNotice').innerText()).includes('上下文设置失败，请检查数值后重试。')&&await page.locator('#contextNotice').evaluate(e=>e.className==='notice bad'),'context failure was not localized or marked bad'); await page.locator('#contextSaveRestart').click(); await wait(50); s=await fixture(); assert(s.context_admin.length===2&&(await page.locator('#contextNotice').innerText()).includes('下次启动生效，需要重启。')&&await page.locator('#contextNotice').evaluate(e=>e.className==='notice'),'context success retry did not clear error notice');
   await cfg({reset:true,context_forbidden:true}); await page.reload(); await wait(100); await page.locator('#contextSaveRestart').click(); await wait(50); assert(await page.locator('#contextSaveRestart').isDisabled()&&!await page.locator('#kvApplyNow').isDisabled(),'context 403 did not isolate controls');
   await cfg({reset:true,context_durable:false}); await page.reload(); await wait(100); await page.locator('#contextSaveRestart').click(); await wait(50); assert((await page.locator('#contextNotice').innerText()).includes('已提交，但尚未确认已持久化'),'context durable failure was not truthful');
-  await cfg({reset:true}); await page.reload(); await wait(100); assert(await page.locator('#callFilterClient').count()===1,'service filter missing'); assert((await page.locator('#callsRecords').innerText()).includes('hanako-agent'),'service column missing'); assert((await page.locator('#callsCallers').innerText()).includes('hermes-agent'),'service/IP aggregate missing'); await page.locator('#callFilterClient').selectOption('hanako-agent'); assert((await page.locator('#callsRecords').innerText()).includes('hanako-agent')&&!(await page.locator('#callsRecords').innerText()).includes('hermes-agent'),'service filter did not narrow records'); for (const id of ['terminalCallStream','calmCallTimeline']) assert((await page.locator('#'+id).innerText()).includes('hanako-agent'),'service identity missing from '+id); await page.locator('#callFilterClient').selectOption('<img src=x onerror=alert(1)>'); assert(await page.locator('#callsRecords').locator('img,script').count()===0&&(await page.locator('#callsRecords').innerText()).includes('<script>坏</script>')&&(await page.locator('#callsRecords').innerText()).includes('失败'),'malicious service or calls text was parsed as markup or result was not localized'); await page.locator('#callFilterClient').selectOption(''); await page.locator('#callFilterCaller').fill('direct'); await page.locator('#callFilterApi').selectOption('responses'); await page.locator('#callFilterStatus').selectOption('active'); assert((await page.locator('#callsRecords').innerText()).includes('direct')&&(await page.locator('#callsRecords').innerText()).includes('进行中'),'existing call filters did not localize direct result');
+  await cfg({reset:true}); await page.reload(); await wait(100); assert(await page.locator('#callFilterClient').count()===1,'service filter missing'); assert((await page.locator('#callsRecords').innerText()).includes('hanako-agent'),'service column missing'); assert((await page.locator('#callsCallers').innerText()).includes('hermes-agent'),'service/IP aggregate missing'); await page.locator('#callFilterClient').selectOption('hanako-agent'); assert((await page.locator('#callsRecords').innerText()).includes('hanako-agent')&&!(await page.locator('#callsRecords').innerText()).includes('hermes-agent'),'service filter did not narrow records'); await page.locator('#callFilterClient').selectOption('<img src=x onerror=alert(1)>'); assert(await page.locator('#callsRecords').locator('img,script').count()===0&&(await page.locator('#callsRecords').innerText()).includes('<script>坏</script>')&&(await page.locator('#callsRecords').innerText()).includes('失败'),'malicious service or calls text was parsed as markup or result was not localized'); await page.locator('#callFilterClient').selectOption(''); await page.locator('#callFilterCaller').fill('direct'); await page.locator('#callFilterApi').selectOption('responses'); await page.locator('#callFilterStatus').selectOption('active'); assert((await page.locator('#callsRecords').innerText()).includes('direct')&&(await page.locator('#callsRecords').innerText()).includes('进行中'),'existing call filters did not localize direct result');
   await cfg({reset:true,host_available:false}); await page.reload(); await wait(100); assert((await page.locator('#hostPhysical').innerText())==='不可用','unknown host was not explicit'); await cfg({offline:true}); await wait(1150); assert((await page.locator('#health').innerText())==='数据已过期','offline snapshot was not marked stale');
-  await page.screenshot({path:'output/playwright/dashboard-desktop.png',fullPage:true});
+  await page.screenshot({path:'output/playwright/dashboard-management-desktop.png',fullPage:true});
   return {ok:true,double_apply:'one transaction',apply_save:'one transaction',poll_max_active:1,revision_sequence:s.admin.map(x=>x.mode),confirm_count:confirms.length};
 }
