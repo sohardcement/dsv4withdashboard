@@ -259,6 +259,7 @@ async page => {
   await page.waitForFunction(()=>document.getElementById('dashboard').dataset.mode==='management'&&!document.getElementById('dashboard').classList.contains('stale')&&document.getElementById('health').textContent!=='等待中'&&document.querySelectorAll('#managementRecentCalls tr[data-call-id]').length===3&&!document.getElementById('kvApplyNow').disabled);
   const uniqueControlIds=['callFilterCaller','callFilterClient','callFilterApi','callFilterStatus','kvApplyNow','kvSaveRestart','contextSaveRestart'];
   assert(await page.evaluate(ids=>ids.every(id=>document.querySelectorAll('#'+id).length===1),uniqueControlIds),'filter or administration control IDs are duplicated');
+  const contextSummaryBox=await page.locator('#managementContext').boundingBox(); assert(contextSummaryBox&&contextSummaryBox.height<50,'context summary value split into an unreadable multi-line fragment');
   await page.screenshot({path:'output/playwright/dashboard-management-desktop.png',fullPage:true});
   await page.locator('[data-mode-choice="monitor"]').click();
   await page.locator('[data-request-id="98"] .request-select').click();
