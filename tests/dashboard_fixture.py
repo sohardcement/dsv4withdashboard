@@ -51,15 +51,24 @@ def response_runtime(runtime, mode):
 
 class Handler(BaseHTTPRequestHandler):
     def json(self, value, code=200):
-        body=json.dumps(value).encode(); self.send_response(code); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
+        body=json.dumps(value).encode()
+        try:
+            self.send_response(code); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
     def do_GET(self):
         if self.path == "/ds4/status":
             with lock:
                 state["status_active"] += 1; state["status_max"] = max(state["status_max"], state["status_active"]); delay=state["status_delay_ms"]
-            time.sleep(delay/1000)
-            if state["offline"]: self.send_error(503); return
-            self.json(status())
-            with lock: state["status_active"] -= 1
+            try:
+                time.sleep(delay/1000)
+                if state["offline"]:
+                    try: self.send_error(503)
+                    except (BrokenPipeError, ConnectionResetError): pass
+                    return
+                self.json(status())
+            finally:
+                with lock: state["status_active"] = max(0, state["status_active"] - 1)
         elif self.path == "/fixture/state": self.json(state)
         else:
             self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(page))); self.end_headers(); self.wfile.write(page)
