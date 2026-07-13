@@ -3,11 +3,14 @@ async page => {
   const cfg=body=>page.evaluate(body=>fetch('/fixture/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()),body);
   const fixture=()=>page.evaluate(()=>fetch('/fixture/state').then(r=>r.json()));
   const wait=ms=>page.waitForTimeout(ms);
-  await cfg({reset:true,admin_delay_ms:180}); await page.reload(); await wait(100);
+  const waitKvState=state=>page.waitForFunction(state=>document.getElementById('dashboard').dataset.kvState===state,state);
+  const waitAdmin=modes=>page.waitForFunction(async modes=>(await fetch('/fixture/state').then(r=>r.json())).admin.map(x=>x.mode).join(',')===modes,modes);
+  const reloadReady=async()=>{await page.reload();await page.waitForFunction(()=>document.getElementById('dashboard').dataset.kvState==='idle'&&!document.getElementById('kvApplyNow').disabled)};
+  await cfg({reset:true,admin_delay_ms:180}); await reloadReady();
   await page.locator('#kvBudgetInput').fill('80');
   await page.evaluate(()=>{kvApplyNow.click();kvApplyNow.click()});
   assert(await page.locator('#kvBudgetInput').isDisabled()&&await page.locator('#kvBudgetUnit').isDisabled()&&await page.locator('#kvApplyNow').isDisabled()&&await page.locator('#kvSaveRestart').isDisabled(),'checking did not disable all controls');
-  await wait(300);
+  await waitAdmin('dry-run'); await waitKvState('review');
   let s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run','review performed more than one dry-run or applied immediately');
   assert(s.admin.every(x=>x.header==='1'),'admin header missing');
   const review=page.locator('#kvReview'); assert(await review.count()===1&&await review.isVisible(),'KV impact review did not open exactly once');
@@ -20,47 +23,60 @@ async page => {
   assert(!(await review.isVisible())&&(await page.locator('#kvBudgetInput').inputValue())==='80','cancel did not hide review or retain target');
   assert(await page.evaluate(()=>document.activeElement===kvApplyNow),'cancel did not restore focus to apply trigger');
   s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run','cancel contacted the server');
-  await page.locator('#kvApplyNow').click(); await wait(250); await page.locator('#kvConfirmApply').click();
+  await page.locator('#kvApplyNow').click(); await waitKvState('review'); await page.locator('#kvConfirmApply').click();
   assert(await page.locator('#kvBudgetInput').isDisabled()&&await page.locator('#kvBudgetUnit').isDisabled()&&await page.locator('#kvApplyNow').isDisabled()&&await page.locator('#kvSaveRestart').isDisabled(),'applying did not keep all KV controls locked');
-  await wait(250); s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run,dry-run,apply','explicit confirmation did not apply the reviewed revision');
+  await waitAdmin('dry-run,dry-run,apply'); await waitKvState('success'); s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run,dry-run,apply','explicit confirmation did not apply the reviewed revision');
   assert((await page.locator('#adminNotice').innerText()).startsWith('运行时：'),'runtime success notice was overwritten');
   assert(!(await page.locator('#kvApplyNow').isDisabled()),'successful apply did not restore controls');
 
-  await cfg({reset:true,admin_delay_ms:180}); await page.reload(); await wait(100); await page.locator('#kvBudgetInput').fill('80');
-  await page.evaluate(()=>{kvApplyNow.click();kvSaveRestart.click()}); await wait(300);
+  await cfg({reset:true,admin_delay_ms:180}); await reloadReady(); await page.locator('#kvBudgetInput').fill('80');
+  await page.evaluate(()=>{kvApplyNow.click();kvSaveRestart.click()}); await waitAdmin('dry-run'); await waitKvState('review');
   s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run','apply+save was not serialized');
   assert(!(await page.locator('#adminNotice').innerText()).includes('下次启动'),'blocked save overwrote apply notice');
-  await cfg({reset:true,admin_delay_ms:180}); await page.reload(); await wait(100); await page.locator('#kvBudgetInput').fill('80');
+  await cfg({reset:true,admin_delay_ms:180}); await reloadReady(); await page.locator('#kvBudgetInput').fill('80');
   await page.evaluate(()=>{kvSaveRestart.click();kvSaveRestart.click();kvApplyNow.click()});
   assert(await page.locator('#dashboard').getAttribute('data-kv-state')==='saving'&&await page.locator('#kvBudgetInput').isDisabled()&&await page.locator('#kvBudgetUnit').isDisabled()&&await page.locator('#kvApplyNow').isDisabled()&&await page.locator('#kvSaveRestart').isDisabled(),'saving did not lock all KV controls');
-  await wait(300); s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='persist','save double-click or apply interleaved with persistence'); assert(await page.evaluate(()=>document.activeElement===kvSaveRestart),'save success did not restore focus to its trigger');
+  await waitAdmin('persist'); await waitKvState('success'); s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='persist','save double-click or apply interleaved with persistence'); assert(await page.evaluate(()=>document.activeElement===kvSaveRestart),'save success did not restore focus to its trigger');
 
   await cfg({reset:true,status_delay_ms:1200}); await page.reload(); await wait(3500);
   s=await fixture(); assert(s.status_max===1,'status polling overlapped');
 
-  await cfg({reset:true}); await page.reload(); await wait(100); await page.locator('#kvBudgetUnit').selectOption('MB'); await page.locator('#kvBudgetInput').fill('255'); await page.locator('#kvApplyNow').click(); await wait(50);
+  await cfg({reset:true}); await reloadReady(); await page.locator('#kvBudgetUnit').selectOption('MB'); await page.locator('#kvBudgetInput').fill('255'); await page.locator('#kvApplyNow').click(); await waitKvState('error');
   assert((await page.locator('#adminNotice').innerText()).includes('最小 256 MB'),'small MB validation missing'); s=await fixture(); assert(s.admin.length===0,'invalid MB reached server');
-  await page.locator('#kvBudgetInput').fill('256.5'); await page.locator('#kvApplyNow').click(); await wait(50); s=await fixture(); assert(s.admin.length===0,'fractional MB reached server');
+  await page.locator('#kvBudgetInput').fill('256.5'); await page.locator('#kvApplyNow').click(); s=await fixture(); assert(s.admin.length===0,'fractional MB reached server');
 
-  await cfg({reset:true,malformed:true}); await page.reload(); await wait(100); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvApplyNow').click(); await wait(100); assert((await page.locator('#adminNotice').innerText()).includes('操作失败'),'malformed response not reported');
-  await cfg({reset:true,forbidden:true}); await page.reload(); await wait(100); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvSaveRestart').click(); await wait(100); assert(await page.locator('#kvApplyNow').isDisabled(),'403 did not disable controls');
-  await cfg({reset:true}); await page.reload(); await wait(100); await page.route('**/ds4/admin/kv-cache',route=>route.fulfill({status:403,contentType:'text/plain',body:'forbidden'})); await page.locator('#kvSaveRestart').click(); await wait(50); assert(await page.locator('#kvApplyNow').isDisabled()&&!await page.locator('#contextSaveRestart').isDisabled()&&(await page.locator('#adminNotice').innerText()).includes('仅可从本机管理'),'non-JSON 403 did not isolate only KV controls'); await page.unroute('**/ds4/admin/kv-cache');
+  await cfg({reset:true,malformed:true}); await reloadReady(); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvApplyNow').click(); await waitKvState('error'); assert((await page.locator('#adminNotice').innerText()).includes('操作失败'),'malformed response not reported');
+  await cfg({reset:true,forbidden:true}); await reloadReady(); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvSaveRestart').click(); await waitKvState('error'); assert(await page.locator('#kvApplyNow').isDisabled(),'403 did not disable controls');
+  await cfg({reset:true}); await reloadReady(); await page.route('**/ds4/admin/kv-cache',route=>route.fulfill({status:403,contentType:'text/plain',body:'forbidden'})); await page.locator('#kvSaveRestart').click(); await waitKvState('error'); assert(await page.locator('#kvApplyNow').isDisabled()&&!await page.locator('#contextSaveRestart').isDisabled()&&(await page.locator('#adminNotice').innerText()).includes('仅可从本机管理'),'non-JSON 403 did not isolate only KV controls'); await page.unroute('**/ds4/admin/kv-cache');
 
-  await cfg({reset:true,admin_delay_ms:100,mismatch_once:true,mismatch_makes_eviction:true}); await page.reload(); await wait(100); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvApplyNow').click(); await wait(150); await page.locator('#kvConfirmApply').click(); await wait(250);
+  const rejectRuntime=async(patch,label)=>{await cfg({reset:true,runtime_patch:patch});await reloadReady();await page.locator('#kvBudgetInput').fill('80');await page.locator('#kvApplyNow').click();await waitKvState('error');assert((await page.locator('#adminNotice').innerText()).includes('运行时结果无法读取')&&!(await review.isVisible()),label+' runtime contract was accepted')};
+  await rejectRuntime({after_bytes:null},'missing field');
+  await rejectRuntime({before_entries:'116'},'wrong numeric type');
+  await rejectRuntime({after_bytes:50465865729},'inconsistent after value');
+
+  await cfg({reset:true}); await reloadReady(); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvApplyNow').click(); await waitKvState('review'); await cfg({offline:true}); await page.waitForFunction(()=>document.getElementById('kvConfirmApply').disabled&&!document.getElementById('kvCancelApply').disabled);
+  s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run','offline review changed transaction before confirmation'); await page.evaluate(()=>document.getElementById('kvConfirmApply').click()); s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run','stale offline review applied'); await page.locator('#kvCancelApply').click(); assert(!(await review.isVisible())&&await page.evaluate(()=>document.activeElement===document.getElementById('kvCapacity')),'offline review cancel did not close and move focus to a safe fallback');
+  await cfg({reset:true}); await reloadReady(); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvApplyNow').click(); await waitKvState('review'); await cfg({kv:{enabled:false,budget_bytes:68719476736,used_bytes:49392123904,entries:116,revision:'1'}}); await page.waitForFunction(()=>document.getElementById('kvConfirmApply').disabled&&!document.getElementById('kvCancelApply').disabled);
+  await page.evaluate(()=>document.getElementById('kvConfirmApply').click()); s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run','disabled-cache review applied'); await page.locator('#kvCancelApply').click(); assert(!(await review.isVisible())&&await page.evaluate(()=>document.activeElement===document.getElementById('kvCapacity')),'disabled-cache review cancel did not close and move focus to a safe fallback');
+
+  await cfg({reset:true,mismatch_once:true,mismatch_runtime_patch:{eviction_required:true}}); await reloadReady(); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvApplyNow').click(); await waitKvState('review'); await page.locator('#kvConfirmApply').click(); await waitAdmin('dry-run,apply,dry-run'); await waitKvState('review');
+  s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run,apply,dry-run'&&(await review.innerText()).includes('需要清理\n是'),'changed eviction flag was auto-applied instead of reviewed');
+
+  await cfg({reset:true,admin_delay_ms:100,mismatch_once:true,mismatch_makes_eviction:true}); await reloadReady(); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvApplyNow').click(); await waitKvState('review'); await page.locator('#kvConfirmApply').click(); await waitAdmin('dry-run,apply,dry-run'); await waitKvState('review');
   s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run,apply,dry-run','changed impact was silently applied');
   assert(s.admin[1].revision==='1','first apply did not echo reviewed revision');
   assert(await review.isVisible()&&(await review.innerText()).includes('90.0 GB')&&(await review.innerText()).includes('需要清理\n是')&&(await review.innerText()).includes('预计清理'),'changed eviction impact was not returned for review');
   assert(await page.evaluate(()=>document.activeElement===document.getElementById('kvReview')),'changed impact review did not receive focus');
-  await page.locator('#kvConfirmApply').click(); await wait(150); s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run,apply,dry-run,apply'&&s.admin[3].revision==='2','second confirmation did not apply revised impact');
-  await cfg({reset:true,mismatch_remaining:2}); await page.reload(); await wait(100); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvApplyNow').click(); await wait(50); await page.locator('#kvConfirmApply').click(); await wait(300);
+  await page.locator('#kvConfirmApply').click(); await waitAdmin('dry-run,apply,dry-run,apply'); await waitKvState('success'); s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run,apply,dry-run,apply'&&s.admin[3].revision==='2','second confirmation did not apply revised impact');
+  await cfg({reset:true,mismatch_remaining:2}); await reloadReady(); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvApplyNow').click(); await waitKvState('review'); await page.locator('#kvConfirmApply').click(); await waitAdmin('dry-run,apply,dry-run,apply'); await waitKvState('error');
   assert(/KV 状态持续变化|操作失败/.test(await page.locator('#adminNotice').innerText()),'revision retry cap was not actionable');
   assert(!(await page.locator('#kvApplyNow').isDisabled())&&await page.evaluate(()=>document.activeElement===kvApplyNow),'revision retry cap did not restore controls and focus');
   s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run,apply,dry-run,apply'&&s.admin[1].revision==='1'&&s.admin[3].revision==='2','identical impact did not retry exactly once with the refreshed revision');
-  await cfg({reset:true,eviction_fail:true}); await page.reload(); await wait(100); await page.locator('#kvBudgetInput').fill('32'); await page.locator('#kvApplyNow').click(); await wait(50); await page.locator('#kvConfirmApply').click(); await wait(250);
+  await cfg({reset:true,eviction_fail:true}); await reloadReady(); await page.locator('#kvBudgetInput').fill('32'); await page.locator('#kvApplyNow').click(); await waitKvState('review'); await page.locator('#kvConfirmApply').click(); await waitAdmin('dry-run,apply'); await waitKvState('error');
   assert((await page.locator('#adminNotice').innerText()).includes('操作失败'),'eviction failure notice was not actionable');
   assert(!(await page.locator('#kvBudgetInput').isDisabled())&&!(await page.locator('#kvBudgetUnit').isDisabled())&&!(await page.locator('#kvApplyNow').isDisabled())&&!(await page.locator('#kvSaveRestart').isDisabled()),'500 eviction failure disabled controls');
   s=await fixture(); assert(s.kv.entries===100&&s.kv.used_bytes===(40*2**30)&&s.kv.revision==='2','eviction failure fixture did not publish truthful partial state');
-  await wait(1100); assert((await page.locator('#kvUsed').innerText())==='40.0 GB'&&(await page.locator('#kvEntries').innerText())==='100','next status poll did not paint partial-eviction stats');
+  await page.waitForFunction(()=>document.getElementById('kvUsed').textContent==='40.0 GB'&&document.getElementById('kvEntries').textContent==='100'); assert((await page.locator('#kvUsed').innerText())==='40.0 GB'&&(await page.locator('#kvEntries').innerText())==='100','next status poll did not paint partial-eviction stats');
   await cfg({reset:true}); await page.evaluate(()=>localStorage.setItem('ds4-dashboard-mode','not-a-mode')); await page.reload(); await wait(150);
   assert(await page.locator('#dashboard').getAttribute('data-mode')==='management','management must be the default mode');
   assert(await page.locator('#managementLayout').isVisible(),'management layout must be visible by default');
