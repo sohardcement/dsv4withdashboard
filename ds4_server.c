@@ -8261,7 +8261,7 @@ static const char dashboard_html[] =
 "function reviewFingerprint(r){return JSON.stringify([r.old_budget_bytes,r.new_budget_bytes,r.before_bytes,r.before_entries,r.after_bytes,r.after_entries,r.eviction_required])}"
 "function reviewFact(label,value){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value;$('kvReviewFacts').append(dt,dd)}"
 "function showKvReview(runtime,mb){const facts=$('kvReviewFacts');facts.replaceChildren();reviewFact('容量',bytes(runtime.old_budget_bytes)+' → '+bytes(runtime.new_budget_bytes));reviewFact('修改前使用量',bytes(runtime.before_bytes)+' / '+num(runtime.before_entries).toLocaleString()+' 条');reviewFact('需要清理',runtime.eviction_required?'是':'否');reviewFact('预计清理',Math.max(0,num(runtime.before_entries)-num(runtime.after_entries)).toLocaleString()+' 条');reviewFact('预计释放',bytes(Math.max(0,num(runtime.before_bytes)-num(runtime.after_bytes))));kvReview={runtime,mb,fingerprint:reviewFingerprint(runtime)};setKvState('review');setKvMessage(runtime.eviction_required?'请确认清理影响后再立即应用。':'请确认运行时影响后再立即应用。',runtime.eviction_required);$('kvReview').focus()}"
-"function normalizeRuntime(body,expectedTargetBytes,requireApplied){const r=body&&body.runtime,invalid=()=>{throw kvLocalError('操作失败：服务器返回的运行时结果无法读取。','unreadable_runtime')};if(!Number.isSafeInteger(expectedTargetBytes)||expectedTargetBytes<0||!r||typeof r!=='object'||Array.isArray(r)||r.attempted!==true||r.ok!==true||r.applied!==requireApplied||typeof r.eviction_required!=='boolean'||typeof r.revision!=='string'||!/^(0|[1-9][0-9]*)$/.test(r.revision))invalid();const normalized={ok:true,applied:r.applied,revision:r.revision,eviction_required:r.eviction_required};for(const field of ['old_budget_bytes','new_budget_bytes','before_bytes','after_bytes','before_entries','after_entries']){if(typeof r[field]!=='number'||!Number.isSafeInteger(r[field])||r[field]<0)invalid();normalized[field]=r[field]}const eviction=normalized.before_bytes>expectedTargetBytes;if(normalized.new_budget_bytes!==expectedTargetBytes||normalized.after_bytes>expectedTargetBytes||normalized.eviction_required!==eviction||normalized.after_bytes>normalized.before_bytes||normalized.after_entries>normalized.before_entries)invalid();if(!eviction&&(normalized.after_bytes!==normalized.before_bytes||normalized.after_entries!==normalized.before_entries))invalid();return normalized}"
+"function normalizeRuntime(body,expectedTargetBytes,requireApplied){const r=body&&body.runtime,invalid=()=>{throw kvLocalError('操作失败：服务器返回的运行时结果无法读取。','unreadable_runtime')};if(!Number.isSafeInteger(expectedTargetBytes)||expectedTargetBytes<0||!r||typeof r!=='object'||Array.isArray(r)||r.attempted!==true||r.ok!==true||r.applied!==requireApplied||typeof r.eviction_required!=='boolean'||typeof r.revision!=='string'||!/^(0|[1-9][0-9]*)$/.test(r.revision))invalid();const normalized={ok:true,applied:r.applied,revision:r.revision,eviction_required:r.eviction_required};for(const field of ['old_budget_bytes','new_budget_bytes','before_bytes','after_bytes','before_entries','after_entries']){if(typeof r[field]!=='number'||!Number.isSafeInteger(r[field])||r[field]<0)invalid();normalized[field]=r[field]}const eviction=normalized.before_bytes>expectedTargetBytes;if(normalized.new_budget_bytes!==expectedTargetBytes||normalized.after_bytes>expectedTargetBytes||normalized.eviction_required!==eviction||normalized.after_bytes>normalized.before_bytes||normalized.after_entries>normalized.before_entries)invalid();if(eviction&&(normalized.after_bytes>=normalized.before_bytes||normalized.after_entries>=normalized.before_entries))invalid();if(!eviction&&(normalized.after_bytes!==normalized.before_bytes||normalized.after_entries!==normalized.before_entries))invalid();return normalized}"
 "async function checkKvImpact(){if(!online||!adminLocal||!kvEnabled||['checking','review','applying','saving'].includes(kvState)){setKvState(kvState);return}kvTrigger=$('kvApplyNow');let mb;try{mb=budgetMB();setKvInvalid(false)}catch(e){setKvInvalid(true);finishKvError(e);return}setKvState('checking');setKvMessage('正在检查清理压力…',false);try{showKvReview(normalizeRuntime(await admin('dry-run',mb),mb*1048576,false),mb)}catch(e){finishKvError(e)}}"
 "async function confirmKvApply(){if(kvState!=='review'||!kvReview||!online||!adminLocal||!kvEnabled){setKvState(kvState);return}const reviewed=kvReview,targetBytes=reviewed.mb*1048576;setKvState('applying');setKvMessage('正在应用已审阅的运行时上限…',false);try{let applied;try{applied=normalizeRuntime(await admin('apply',reviewed.mb,String(reviewed.runtime.revision)),targetBytes,true)}catch(e){if(e.code!=='kv_state_changed')throw e;setKvMessage('KV 状态已变化，正在重新检查影响…',false);const refreshed=normalizeRuntime(await admin('dry-run',reviewed.mb),targetBytes,false),fingerprint=reviewFingerprint(refreshed);if(fingerprint!==reviewed.fingerprint){showKvReview(refreshed,reviewed.mb);return}try{applied=normalizeRuntime(await admin('apply',reviewed.mb,String(refreshed.revision)),targetBytes,true)}catch(retry){if(retry.code==='kv_state_changed')throw kvLocalError('KV 状态持续变化，请等待活动缓存操作结束后重试。','kv_state_changed');throw retry}}finishKvSuccess(runtimeMessage(applied))}catch(e){finishKvError(e)}}"
 "function cancelKvApply(){if(kvState!=='review')return;kvReview=null;setKvState('idle');setKvMessage('已取消应用；运行时容量未改变。',false);focusKvTrigger()}"
@@ -14186,15 +14186,21 @@ static void test_server_kv_wrappers_serialize_stats_and_budget(void) {
 	pthread_t thread;
 	TEST_ASSERT(pthread_create(&thread, NULL, test_server_kv_stats_thread, &arg) == 0);
 	for (int i = 0; i < arg.iterations; i++) {
+		uint64_t target = (i & 1) ? 500 : 2000;
 		ds4_kvstore_budget_result result =
-			server_kv_set_budget(&s, (i & 1) ? 500 : 2000, false);
+			server_kv_set_budget(&s, target, false);
 		TEST_ASSERT(result.ok);
 		TEST_ASSERT(!result.applied);
 		TEST_ASSERT(result.old_budget_bytes == 1000);
 		TEST_ASSERT(result.before_bytes == 600);
-		TEST_ASSERT(result.after_bytes == 600);
 		TEST_ASSERT(result.before_entries == 2);
-		TEST_ASSERT(result.after_entries == 2);
+		if (target < result.before_bytes) {
+			TEST_ASSERT(result.after_bytes <= target);
+			TEST_ASSERT(result.after_entries < result.before_entries);
+		} else {
+			TEST_ASSERT(result.after_bytes == result.before_bytes);
+			TEST_ASSERT(result.after_entries == result.before_entries);
+		}
 	}
 	TEST_ASSERT(pthread_join(thread, NULL) == 0);
 
@@ -18646,11 +18652,13 @@ static void test_kv_cache_budget_changes(void) {
 	TEST_ASSERT(dry.old_budget_bytes == 1000);
 	TEST_ASSERT(dry.new_budget_bytes == 500);
 	TEST_ASSERT(dry.before_bytes == 600);
-	TEST_ASSERT(dry.after_bytes == 600);
+	TEST_ASSERT(dry.after_bytes <= 500);
 	TEST_ASSERT(dry.before_entries == 2);
-	TEST_ASSERT(dry.after_entries == 2);
+	TEST_ASSERT(dry.after_entries < dry.before_entries);
 	TEST_ASSERT(kc.budget_bytes == 1000);
 	TEST_ASSERT(kc.len == 2);
+	TEST_ASSERT(access(first_path, F_OK) == 0);
+	TEST_ASSERT(access(second_path, F_OK) == 0);
 
 	ds4_kvstore_budget_result shrink = ds4_kvstore_set_budget(&kc, 500, true);
 	TEST_ASSERT(shrink.ok);
@@ -18659,13 +18667,23 @@ static void test_kv_cache_budget_changes(void) {
 	TEST_ASSERT(shrink.old_budget_bytes == 1000);
 	TEST_ASSERT(shrink.new_budget_bytes == 500);
 	TEST_ASSERT(shrink.before_bytes == 600);
-	TEST_ASSERT(shrink.after_bytes <= 500);
+	TEST_ASSERT(shrink.after_bytes == dry.after_bytes);
 	TEST_ASSERT(shrink.before_entries == 2);
-	TEST_ASSERT(shrink.after_entries < shrink.before_entries);
+	TEST_ASSERT(shrink.after_entries == dry.after_entries);
 	TEST_ASSERT(kc.budget_bytes == 500);
 	TEST_ASSERT((uint64_t)kc.len == shrink.after_entries);
 
 	uint64_t entries_after_shrink = shrink.after_entries;
+	ds4_kvstore_budget_result growth_dry =
+		ds4_kvstore_set_budget(&kc, 2000, false);
+	TEST_ASSERT(growth_dry.ok);
+	TEST_ASSERT(!growth_dry.applied);
+	TEST_ASSERT(!growth_dry.eviction_required);
+	TEST_ASSERT(growth_dry.after_bytes == growth_dry.before_bytes);
+	TEST_ASSERT(growth_dry.after_entries == growth_dry.before_entries);
+	TEST_ASSERT(kc.budget_bytes == 500);
+	TEST_ASSERT((uint64_t)kc.len == entries_after_shrink);
+
 	ds4_kvstore_budget_result growth = ds4_kvstore_set_budget(&kc, 2000, true);
 	TEST_ASSERT(growth.ok);
 	TEST_ASSERT(growth.applied);
@@ -18721,31 +18739,34 @@ static void test_kv_cache_budget_refreshes_external_files(void) {
 
 	/* Simulate another process adding a valid cache entry after our index. */
 	test_kv_stub_file(dir, second_sha, KV_REASON_UNKNOWN, 1024, 0, now, 248);
-	ds4_kvstore_budget_result dry = ds4_kvstore_set_budget(&kc, 500, false);
-	TEST_ASSERT(dry.ok);
-	TEST_ASSERT(!dry.applied);
-	TEST_ASSERT(dry.eviction_required);
-	TEST_ASSERT(dry.before_bytes == 600);
-	TEST_ASSERT(dry.after_bytes == 600);
-	TEST_ASSERT(dry.before_entries == 2);
-	TEST_ASSERT(dry.after_entries == 2);
-	TEST_ASSERT(kc.budget_bytes == 1000);
-
-	ds4_kvstore_budget_result apply = ds4_kvstore_set_budget(&kc, 500, true);
-	TEST_ASSERT(apply.ok);
-	TEST_ASSERT(apply.applied);
-	TEST_ASSERT(apply.before_bytes == 600);
-	TEST_ASSERT(apply.after_bytes <= 500);
-	TEST_ASSERT(apply.before_entries == 2);
-	TEST_ASSERT(apply.after_entries < apply.before_entries);
-	TEST_ASSERT(kc.budget_bytes == 500);
-
-	ds4_kvstore_close(&kc);
 	char first_name[44], second_name[44];
 	snprintf(first_name, sizeof(first_name), "%.40s.kv", first_sha);
 	snprintf(second_name, sizeof(second_name), "%.40s.kv", second_sha);
 	char *first_path = path_join(dir, first_name);
 	char *second_path = path_join(dir, second_name);
+	ds4_kvstore_budget_result dry = ds4_kvstore_set_budget(&kc, 500, false);
+	TEST_ASSERT(dry.ok);
+	TEST_ASSERT(!dry.applied);
+	TEST_ASSERT(dry.eviction_required);
+	TEST_ASSERT(dry.before_bytes == 600);
+	TEST_ASSERT(dry.after_bytes <= 500);
+	TEST_ASSERT(dry.before_entries == 2);
+	TEST_ASSERT(dry.after_entries < dry.before_entries);
+	TEST_ASSERT(kc.budget_bytes == 1000);
+	TEST_ASSERT(kc.len == 2);
+	TEST_ASSERT(access(first_path, F_OK) == 0);
+	TEST_ASSERT(access(second_path, F_OK) == 0);
+
+	ds4_kvstore_budget_result apply = ds4_kvstore_set_budget(&kc, 500, true);
+	TEST_ASSERT(apply.ok);
+	TEST_ASSERT(apply.applied);
+	TEST_ASSERT(apply.before_bytes == 600);
+	TEST_ASSERT(apply.after_bytes == dry.after_bytes);
+	TEST_ASSERT(apply.before_entries == 2);
+	TEST_ASSERT(apply.after_entries == dry.after_entries);
+	TEST_ASSERT(kc.budget_bytes == 500);
+
+	ds4_kvstore_close(&kc);
 	unlink(first_path);
 	unlink(second_path);
 	free(first_path);
@@ -18768,6 +18789,79 @@ static int test_kv_cache_second_unlink_fails(const char *path) {
 		return -1;
 	}
 	return unlink(path);
+}
+
+static void test_kv_admin_dry_run_projects_evictions(void) {
+	char tmpl[] = "/tmp/ds4-kv-admin-dry-run.XXXXXX";
+	char *dir = mkdtemp(tmpl);
+	TEST_ASSERT(dir != NULL);
+	if (!dir) return;
+
+	uint64_t now = (uint64_t)time(NULL);
+	const uint64_t payload_bytes = 200ull * 1024 * 1024;
+	const uint64_t file_bytes = KV_CACHE_FIXED_HEADER + 4 + payload_bytes;
+	for (int i = 1; i <= 2; i++) {
+		char sha[41], name[44];
+		snprintf(sha, sizeof(sha), "%040d", i);
+		test_kv_stub_file(dir, sha, KV_REASON_UNKNOWN, 512, 0,
+		                  now - (uint64_t)(2 - i), 1);
+		snprintf(name, sizeof(name), "%.40s.kv", sha);
+		char *path = path_join(dir, name);
+		FILE *fp = fopen(path, "r+b");
+		TEST_ASSERT(fp != NULL);
+		if (fp) {
+			uint8_t h[KV_CACHE_FIXED_HEADER];
+			kv_fill_header(h, 2, KV_REASON_UNKNOWN, 0, 512, 0, 32768,
+			               100, now - (uint64_t)(2 - i), payload_bytes);
+			TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+			TEST_ASSERT(ftruncate(fileno(fp), (off_t)file_bytes) == 0);
+			TEST_ASSERT(fclose(fp) == 0);
+		}
+		free(path);
+	}
+
+	server s = {0};
+	server_kv_init(&s);
+	s.kv.enabled = true;
+	s.kv.dir = xstrdup(dir);
+	s.kv.opt = kv_cache_default_options();
+	s.kv.budget_bytes = 1024ull * 1024 * 1024;
+
+	char *out = test_kv_admin_core(&s,
+		"{\"budget_mb\":256,\"mode\":\"dry-run\"}", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+	TEST_ASSERT(strstr(out,
+		"\"runtime\":{\"attempted\":true,\"ok\":true,\"applied\":false") != NULL);
+	char expected[256];
+	snprintf(expected, sizeof(expected),
+	         "\"before_bytes\":%llu,\"after_bytes\":%llu,\"before_entries\":2,\"after_entries\":1,\"eviction_required\":true",
+	         (unsigned long long)(2 * file_bytes),
+	         (unsigned long long)file_bytes);
+	TEST_ASSERT(strstr(out, expected) != NULL);
+	TEST_ASSERT(s.kv.budget_bytes == 1024ull * 1024 * 1024);
+	TEST_ASSERT(s.kv.len == 2);
+	free(out);
+
+	out = test_kv_admin_core(&s,
+		"{\"budget_mb\":256,\"mode\":\"apply\",\"revision\":\"0\"}", NULL);
+	TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+	TEST_ASSERT(strstr(out,
+		"\"runtime\":{\"attempted\":true,\"ok\":true,\"applied\":true") != NULL);
+	TEST_ASSERT(strstr(out, expected) != NULL);
+	TEST_ASSERT(s.kv.budget_bytes == 256ull * 1024 * 1024);
+	TEST_ASSERT(s.kv.len == 1);
+	free(out);
+
+	server_kv_close(&s);
+	server_kv_destroy(&s);
+	for (int i = 1; i <= 2; i++) {
+		char name[44];
+		snprintf(name, sizeof(name), "%040d.kv", i);
+		char *path = path_join(dir, name);
+		unlink(path);
+		free(path);
+	}
+	rmdir(dir);
 }
 
 static void test_kv_admin_partial_eviction_failure_advances_revision(void) {
@@ -19691,6 +19785,7 @@ static void ds4_server_unit_tests_run(void) {
 	test_kv_cache_budget_changes();
 	test_kv_cache_budget_refreshes_external_files();
 	test_kv_cache_budget_reports_unlink_failure();
+	test_kv_admin_dry_run_projects_evictions();
 	test_kv_admin_partial_eviction_failure_advances_revision();
 	test_kv_cache_store_rejects_failed_eviction();
 	test_kv_cache_open_rejects_failed_initial_eviction();

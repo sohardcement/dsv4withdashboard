@@ -40,6 +40,8 @@ def status():
     return result
 
 def response_runtime(runtime, mode):
+    # Response corruption exercises the client contract without rewriting the
+    # fixture's source-of-truth state.
     result = dict(runtime)
     patches = [state["mismatch_runtime_patch"] if state["mismatch_patch_active"] else state["runtime_patch"]]
     patches.append(state["apply_runtime_patch"] if mode == "apply" else state["dry_runtime_patch"])
@@ -48,6 +50,12 @@ def response_runtime(runtime, mode):
             if value is None: result.pop(key, None)
             else: result[key] = value
     return result
+
+def project_kv(kv, new):
+    """Deterministic aggregate stand-in for production victim projection."""
+    if new >= kv["used_bytes"]:
+        return kv["used_bytes"], kv["entries"]
+    return new, max(0, kv["entries"] - 28)
 
 class Handler(BaseHTTPRequestHandler):
     def json(self, value, code=200):
@@ -99,7 +107,8 @@ class Handler(BaseHTTPRequestHandler):
         if state["malformed"]:
             raw=b"{"; self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length","1"); self.end_headers(); self.wfile.write(raw); return
         mb=body["budget_mb"]; new=mb<<20; kv=state["kv"]
-        runtime={"attempted":True,"ok":True,"applied":body["mode"]=="apply","old_budget_bytes":kv["budget_bytes"],"new_budget_bytes":new,"before_bytes":kv["used_bytes"],"after_bytes":min(kv["used_bytes"],new),"before_entries":kv["entries"],"after_entries":88 if new<kv["used_bytes"] else kv["entries"],"eviction_required":new<kv["used_bytes"],"revision":kv["revision"]}
+        after_bytes,after_entries=project_kv(kv,new)
+        runtime={"attempted":True,"ok":True,"applied":body["mode"]=="apply","old_budget_bytes":kv["budget_bytes"],"new_budget_bytes":new,"before_bytes":kv["used_bytes"],"after_bytes":after_bytes,"before_entries":kv["entries"],"after_entries":after_entries,"eviction_required":new<kv["used_bytes"],"revision":kv["revision"]}
         if body["mode"]=="apply" and (state["mismatch_once"] or state["mismatch_remaining"]>0):
             state["mismatch_once"]=False; state["mismatch_remaining"]=max(0,state["mismatch_remaining"]-1); kv["revision"]=str(int(kv["revision"])+1)
             if state["mismatch_makes_eviction"]: kv["used_bytes"]=90<<30; kv["entries"]=150

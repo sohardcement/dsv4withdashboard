@@ -407,6 +407,10 @@ ds4_kvstore_stats ds4_kvstore_get_stats(const ds4_kvstore *kc) {
 }
 
 static void kv_cache_refresh(ds4_kvstore *kc);
+static void kv_cache_project_evictions(const ds4_kvstore *kc,
+									   uint64_t target,
+									   uint64_t *after_bytes,
+									   uint64_t *after_entries);
 
 ds4_kvstore_budget_result ds4_kvstore_set_budget(ds4_kvstore *kc,
 												 uint64_t budget_bytes,
@@ -425,7 +429,12 @@ ds4_kvstore_budget_result ds4_kvstore_set_budget(ds4_kvstore *kc,
 
 	result.ok = true;
 	result.eviction_required = before.used_bytes > budget_bytes;
-	if (!apply) return result;
+	if (!apply) {
+		if (result.eviction_required)
+			kv_cache_project_evictions(kc, budget_bytes, &result.after_bytes,
+			                           &result.after_entries);
+		return result;
+	}
 
 	kc->budget_bytes = budget_bytes;
 	bool enforced = ds4_kvstore_evict(kc, NULL, 0, NULL);
@@ -620,6 +629,60 @@ double ds4_kvstore_entry_eviction_score(
     return score;
 }
 
+static int kv_cache_select_victim(
+        const ds4_kvstore_entry *entry,
+        int len,
+        const ds4_tokens *live,
+        uint64_t now,
+        const ds4_kvstore_eviction_context *incoming) {
+    if (!entry || len <= 0) return -1;
+    int victim = 0;
+    double victim_score =
+        ds4_kvstore_entry_eviction_score(&entry[0], live, now, incoming);
+    for (int i = 1; i < len; i++) {
+        double score =
+            ds4_kvstore_entry_eviction_score(&entry[i], live, now, incoming);
+        if (score < victim_score ||
+            (score == victim_score &&
+             entry[i].last_used < entry[victim].last_used))
+        {
+            victim = i;
+            victim_score = score;
+        }
+    }
+    return victim;
+}
+
+static void kv_cache_project_evictions(const ds4_kvstore *kc,
+                                       uint64_t target,
+                                       uint64_t *after_bytes,
+                                       uint64_t *after_entries) {
+    if (!kc || !after_bytes || !after_entries) return;
+    uint64_t total = 0;
+    for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
+    int len = kc->len;
+    *after_bytes = total;
+    *after_entries = len > 0 ? (uint64_t)len : 0;
+    if (total <= target || len <= 0) return;
+
+    ds4_kvstore_entry *entry =
+        kv_xmalloc((size_t)len * sizeof(entry[0]));
+    memcpy(entry, kc->entry, (size_t)len * sizeof(entry[0]));
+    const uint64_t now = (uint64_t)time(NULL);
+    while (total > target && len > 0) {
+        int victim = kv_cache_select_victim(entry, len, NULL, now, NULL);
+        uint64_t file_size = entry[victim].file_size;
+        if (total >= file_size) total -= file_size;
+        else total = 0;
+        memmove(entry + victim, entry + victim + 1,
+                (size_t)(len - victim - 1) * sizeof(entry[0]));
+        len--;
+    }
+    free(entry);
+    *after_bytes = total;
+    *after_entries = (uint64_t)len;
+}
+
 bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming) {
@@ -631,22 +694,8 @@ bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     const uint64_t target = kc->budget_bytes - extra_bytes;
     while (total > target && kc->len > 0) {
-        int victim = 0;
-        double victim_score =
-            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
-                                             incoming);
-        for (int i = 1; i < kc->len; i++) {
-            double score =
-                ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
-                                                 incoming);
-            if (score < victim_score ||
-                (score == victim_score &&
-                 kc->entry[i].last_used < kc->entry[victim].last_used))
-            {
-                victim = i;
-                victim_score = score;
-            }
-        }
+        int victim = kv_cache_select_victim(kc->entry, kc->len, live, now,
+                                            incoming);
         ds4_kvstore_entry e = kc->entry[victim];
         int unlink_result = kc->unlink_file ? kc->unlink_file(e.path) : unlink(e.path);
         if (unlink_result == 0) {

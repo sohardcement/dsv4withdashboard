@@ -38,6 +38,11 @@ async page => {
   assert((await page.locator('#adminNotice').innerText()).startsWith('运行时：'),'runtime success notice was overwritten');
   assert(!(await page.locator('#kvApplyNow').isDisabled()),'successful apply did not restore controls');
 
+  await cfg({reset:true}); await reloadReady(); await page.locator('#kvBudgetInput').fill('32'); await page.locator('#kvApplyNow').click(); await waitAdmin('dry-run'); await waitKvState('review');
+  assert((await review.innerText()).includes('需要清理\n是')&&(await review.innerText()).includes('预计清理\n28 条')&&(await review.innerText()).includes('预计释放\n14.0 GB'),'real shrink review did not show projected positive cleanup and released bytes');
+  await page.locator('#kvConfirmApply').click(); await waitAdmin('dry-run,apply'); await waitKvState('success'); s=await fixture();
+  assert(s.kv.budget_bytes===32*2**30&&s.kv.used_bytes===32*2**30&&s.kv.entries===88,'confirmed real shrink did not apply the reviewed projection');
+
   await cfg({reset:true,admin_delay_ms:180}); await reloadReady(); await page.locator('#kvBudgetInput').fill('80');
   await page.evaluate(()=>{kvApplyNow.click();kvSaveRestart.click()}); await waitAdmin('dry-run'); await waitKvState('review');
   s=await fixture(); assert(s.admin.map(x=>x.mode).join(',')==='dry-run','apply+save was not serialized');
@@ -97,6 +102,8 @@ async page => {
   await rejectRuntime({eviction_required:true},'inconsistent eviction decision');
   await rejectRuntime({after_bytes:48318382080},'release without eviction');
   await cfg({reset:true,runtime_patch:{after_bytes:42949672960}}); await reloadReady(); await page.locator('#kvBudgetInput').fill('32'); await page.locator('#kvApplyNow').click(); await waitKvState('error'); assert(!(await review.isVisible()),'runtime bytes above the requested target reached review');
+  await cfg({reset:true,runtime_patch:{after_entries:116}}); await reloadReady(); await page.locator('#kvBudgetInput').fill('32'); await page.locator('#kvApplyNow').click(); await waitKvState('error'); s=await fixture(); assert(!(await review.isVisible())&&s.kv.entries===116&&s.kv.used_bytes===46*2**30,'dry-run bytes release without entry removal was accepted or mutated fixture state');
+  await cfg({reset:true,apply_runtime_patch:{after_entries:116}}); await reloadReady(); await page.locator('#kvBudgetInput').fill('32'); await page.locator('#kvApplyNow').click(); await waitKvState('review'); await page.locator('#kvConfirmApply').click(); await waitAdmin('dry-run,apply'); await waitKvState('error'); s=await fixture(); assert(s.kv.entries===88&&s.kv.used_bytes===32*2**30,'apply response patch mutated source state instead of only corrupting the response');
   await cfg({reset:true,apply_runtime_patch:{after_entries:'116'}}); await reloadReady(); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvApplyNow').click(); await waitKvState('review'); await page.locator('#kvConfirmApply').click(); await waitAdmin('dry-run,apply'); await waitKvState('error'); assert((await page.locator('#adminNotice').innerText()).includes('运行时结果无法读取'),'malformed successful apply runtime was accepted');
   await cfg({reset:true,apply_runtime_patch:{new_budget_bytes:79*2**30}}); await reloadReady(); await page.locator('#kvBudgetInput').fill('80'); await page.locator('#kvApplyNow').click(); await waitKvState('review'); await page.locator('#kvConfirmApply').click(); await waitAdmin('dry-run,apply'); await waitKvState('error'); assert((await page.locator('#adminNotice').innerText()).includes('运行时结果无法读取'),'mismatched successful apply target was accepted');
 
