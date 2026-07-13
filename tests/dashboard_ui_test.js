@@ -1,10 +1,14 @@
 async page => {
   const assert=(ok,msg)=>{if(!ok)throw new Error(msg)};
+  const dashboardUrl=page.url(),dashboardBase=dashboardUrl.replace(/\/$/,''),fixtureUrl=dashboardBase+'/fixture/state',configUrl=dashboardBase+'/fixture/config';
   const cfg=body=>page.evaluate(body=>fetch('/fixture/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()),body);
+  const cfgApi=body=>page.request.post(configUrl,{data:body}).then(r=>r.json());
   const fixture=()=>page.evaluate(()=>fetch('/fixture/state').then(r=>r.json()));
+  const fixtureApi=()=>page.request.get(fixtureUrl).then(r=>r.json());
   const wait=ms=>page.waitForTimeout(ms);
   const waitKvState=state=>page.waitForFunction(state=>document.getElementById('dashboard').dataset.kvState===state,state);
   const waitAdmin=modes=>page.waitForFunction(async modes=>(await fetch('/fixture/state').then(r=>r.json())).admin.map(x=>x.mode).join(',')===modes,modes);
+  const waitStatusIdle=async()=>{const deadline=Date.now()+8000;while(Date.now()<deadline){if((await fixtureApi()).status_active===0)return;await wait(100)}throw new Error('timed out waiting for delayed status handlers to drain')};
   const reloadReady=async()=>{await page.reload();await page.waitForFunction(()=>document.getElementById('dashboard').dataset.kvState==='idle'&&!document.getElementById('kvApplyNow').disabled)};
   await cfg({reset:true,admin_delay_ms:180}); await reloadReady();
   await page.locator('#kvBudgetInput').fill('80');
@@ -45,7 +49,8 @@ async page => {
   await page.waitForFunction(()=>document.getElementById('dashboard').classList.contains('stale')&&document.getElementById('health').textContent==='数据已过期',null,{timeout:4500});
   const delayedAge=await page.locator('#updatedAt').innerText(); await page.waitForFunction(previous=>document.getElementById('updatedAt').textContent!==previous,delayedAge,{timeout:2500});
   assert((await page.locator('#updatedAt').innerText()).includes('秒前更新')&&(await page.locator('#kvUsed').innerText())===delayedKv&&await page.locator('#kvApplyNow').isDisabled()&&await page.locator('#contextSaveRestart').isDisabled(),'timed-out status did not age independently, retain data, or disable administration');
-  await cfg({reset:true}); await reloadReady(); const malformedKv=await page.locator('#kvUsed').innerText(),malformedUpdatedAt=await page.evaluate(()=>lastUpdatedAt); await cfg({status_patch:{calls:{records:null}}});
+  await page.goto('about:blank'); await cfgApi({status_delay_ms:0}); await waitStatusIdle(); s=await fixtureApi(); assert(s.status_active===0,'delayed status handlers did not drain before fixture reset');
+  await cfgApi({reset:true}); await page.goto(dashboardUrl); await page.waitForFunction(()=>document.getElementById('dashboard').dataset.kvState==='idle'&&!document.getElementById('kvApplyNow').disabled); const malformedKv=await page.locator('#kvUsed').innerText(),malformedUpdatedAt=await page.evaluate(()=>lastUpdatedAt); await cfg({status_patch:{calls:{records:null}}});
   await page.waitForFunction(()=>document.getElementById('dashboard').classList.contains('stale'),null,{timeout:3500});
   assert((await page.locator('#kvUsed').innerText())===malformedKv&&(await page.locator('#managementRecentCalls').innerText()).includes('hanako-agent')&&await page.evaluate(previous=>lastUpdatedAt===previous,malformedUpdatedAt),'malformed structural snapshot replaced the last good snapshot or reset freshness');
   await cfg({reset:true}); await page.waitForFunction(()=>!document.getElementById('dashboard').classList.contains('stale')&&!document.getElementById('kvApplyNow').disabled,null,{timeout:3500});
