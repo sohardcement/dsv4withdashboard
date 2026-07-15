@@ -1,5 +1,7 @@
 # DwarfStar
 
+> 原始仓库：[antirez/ds4](https://github.com/antirez/ds4)。
+
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**, with support for **DeepSeek V4 PRO** on very high-memory
 machines. It is
@@ -751,8 +753,11 @@ also include:
 The dashboard has two task modes under one visual system. **管理** is the default
 for runtime state, disk-KV and context settings, their effects, and operation
 results. **监控** focuses on live metrics, filterable recent calls, the request
-inspector, and host resources. The selected mode is saved only in that browser's
-`localStorage`; it does not change server configuration or data.
+inspector, and host resources; the header presents them in that order. The same
+header also offers three color themes—暖纸面, 深色终端, and 冷静蓝绿. The selected
+mode and theme are saved only in that browser's `localStorage` under
+`ds4-dashboard-mode` and `ds4-dashboard-theme`; they do not change server
+configuration or data.
 
 Disk-KV runtime changes first use an inline dry-run review that shows the old and
 new limits and any required eviction before explicit confirmation. Persisting a
