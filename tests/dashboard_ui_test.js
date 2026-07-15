@@ -74,6 +74,9 @@ async page => {
   await page.waitForFunction(()=>document.getElementById('dashboard').classList.contains('stale'),null,{timeout:3500});
   assert((await page.locator('#kvUsed').innerText())===malformedKv&&(await page.locator('#managementRecentCalls').innerText()).includes('hanako-agent')&&await page.evaluate(previous=>lastUpdatedAt===previous,malformedUpdatedAt),'malformed structural snapshot replaced the last good snapshot or reset freshness');
   await cfg({reset:true}); await page.waitForFunction(()=>!document.getElementById('dashboard').classList.contains('stale')&&!document.getElementById('kvApplyNow').disabled,null,{timeout:3500});
+  await cfg({status_patch:{prefill:{avg_tps:1900.4}}}); await page.waitForFunction(()=>document.getElementById('monitorPrefill').dataset.motionDirection==='increase'); await wait(500);
+  await cfg({status_patch:{calls:{records:null}}}); await page.waitForFunction(()=>document.getElementById('dashboard').classList.contains('stale'),null,{timeout:3500});
+  await cfg({reset:true}); await page.waitForFunction(()=>!document.getElementById('dashboard').classList.contains('stale')&&document.getElementById('monitorPrefill').dataset.motionDirection==='none',null,{timeout:3500}); assert(await page.locator('#monitorPrefill .metric-value-layer-in-increase').count()===0&&await page.locator('#monitorPrefill .metric-value-layer').count()===1,'stale recovery reused the pre-outage metric baseline');
   for(const [patch,label] of [[{queue_depth:null},'queue depth'],[{context:{remaining:null}},'context remaining'],[{kv_cache:{used_bytes:'bad'}},'KV used bytes']]){
     const before=await page.evaluate(()=>({updated:lastUpdatedAt,queue:managementQueue.textContent,context:managementContext.textContent,kv:kvUsed.textContent}));
     await cfg({status_patch:patch}); await page.waitForFunction(()=>document.getElementById('dashboard').classList.contains('stale'),null,{timeout:3500});
