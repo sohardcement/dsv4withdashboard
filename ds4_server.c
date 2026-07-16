@@ -7990,7 +7990,11 @@ static void server_finalize_call_history(server *s, const job *j,
 								 int output_tokens, const char *cache_source,
 								 const char **final_finish, char *err,
 								 size_t errlen, bool response_ok) {
-	if (!response_ok) {
+	if (!response_ok && server_job_client_disconnected(j)) {
+		if (final_finish) *final_finish = "cancelled";
+		if (err && errlen && !err[0])
+			snprintf(err, errlen, "client disconnected during final response");
+	} else if (!response_ok) {
 		if (final_finish) *final_finish = "error";
 		if (err && errlen && !err[0])
 			snprintf(err, errlen, "client stream write failed");
@@ -15996,6 +16000,7 @@ static void test_call_history_marks_final_stream_write_failure(void) {
 	char err[160] = {0};
 	int sv[2];
 	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	j.fd = sv[0];
 	request r;
 	request_init(&r, REQ_CHAT, 16);
 	r.model = xstrdup("test");
@@ -16003,20 +16008,20 @@ static void test_call_history_marks_final_stream_write_failure(void) {
 	void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
 	bool response_ok = sse_chunk(sv[0], &r, "test", NULL, "stop");
 	signal(SIGPIPE, old_sigpipe);
-	close(sv[0]);
 	request_free(&r);
 	TEST_ASSERT(!response_ok);
 	server_finalize_call_history(&s, &j, 3, "memory-token", &final_finish,
 							 err, sizeof(err), response_ok);
-	TEST_ASSERT(!strcmp(final_finish, "error"));
+	TEST_ASSERT(!strcmp(final_finish, "cancelled"));
 	TEST_ASSERT(err[0] != '\0');
 	TEST_ASSERT(s.call_history.len == 1);
-	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_FAILED);
-	TEST_ASSERT(!strcmp(s.call_history.records[0].finish, "error"));
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_CANCELLED);
+	TEST_ASSERT(!strcmp(s.call_history.records[0].finish, "cancelled"));
 	TEST_ASSERT(s.call_history.records[0].error[0] != '\0');
 	ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(&s.call_history, 2.0);
-	TEST_ASSERT(snap.callers_len == 1 && snap.callers[0].failures == 1);
+	TEST_ASSERT(snap.callers_len == 1 && snap.callers[0].failures == 0);
 	ds4_call_history_snapshot_free(&snap);
+	close(sv[0]);
 	ds4_call_history_free(&s.call_history);
 	pthread_mutex_destroy(&s.call_history_mu);
 }

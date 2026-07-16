@@ -4481,6 +4481,14 @@ static int dist_session_ensure_route(ds4_dist_session *d, char *err, size_t errl
     return 0;
 }
 
+static void dist_session_drop_route(ds4_dist_session *d) {
+    if (!d) return;
+    dist_coordinator_forget_route_workers(&d->state, &d->plan);
+    dist_route_plan_free(&d->plan);
+    d->plan_ready = false;
+    d->plan_generation = 0;
+}
+
 /* =========================================================================
  * Distributed KV Snapshot Transport
  * ========================================================================= */
@@ -5677,7 +5685,10 @@ int ds4_dist_session_sync(
                                                                        err,
                                                                        errlen);
             if (prefill_rc != 0) {
-                if (prefill_rc == DS4_DIST_RECV_INTERRUPTED) return DS4_SESSION_SYNC_INTERRUPTED;
+                if (prefill_rc == DS4_DIST_RECV_INTERRUPTED) {
+                    dist_session_drop_route(d);
+                    return DS4_SESSION_SYNC_INTERRUPTED;
+                }
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5715,7 +5726,10 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
             if (eval_rc != 0) {
-                if (eval_rc == DS4_DIST_RECV_INTERRUPTED) return DS4_SESSION_SYNC_INTERRUPTED;
+                if (eval_rc == DS4_DIST_RECV_INTERRUPTED) {
+                    dist_session_drop_route(d);
+                    return DS4_SESSION_SYNC_INTERRUPTED;
+                }
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5750,7 +5764,10 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
     if (prefill_rc != 0) {
-        if (prefill_rc == DS4_DIST_RECV_INTERRUPTED) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (prefill_rc == DS4_DIST_RECV_INTERRUPTED) {
+            dist_session_drop_route(d);
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
         if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -5803,6 +5820,7 @@ int ds4_dist_session_eval(
                                         errlen);
     if (rc != 0) {
         if (rc == DS4_DIST_RECV_INTERRUPTED) {
+            dist_session_drop_route(d);
             ds4_tokens_free(&transcript);
             return DS4_SESSION_SYNC_INTERRUPTED;
         }

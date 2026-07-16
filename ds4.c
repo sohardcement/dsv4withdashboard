@@ -9912,7 +9912,7 @@ static void forward_token_raw_swa_cpu(
 
 /* CPU prefill in layer-major order.  All prompt tokens pass through layer 0,
  * then layer 1, etc., which exposes batch matmul opportunities. */
-static void prefill_layer_major_cpu(
+static bool prefill_layer_major_cpu(
         float             * logits,
         const ds4_model   * model,
         const ds4_weights * weights,
@@ -9920,7 +9920,9 @@ static void prefill_layer_major_cpu(
         const token_vec   * prompt,
         const float       * steering_dirs,
         float               steering_attn_scale,
-        float               steering_ffn_scale) {
+        float               steering_ffn_scale,
+        bool              (*cancel)(void *),
+        void                *cancel_ud) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t n_tok = (uint64_t)prompt->len;
     float *cur = xmalloc((size_t)n_tok * hc_dim * sizeof(cur[0]));
@@ -9935,19 +9937,23 @@ static void prefill_layer_major_cpu(
     const char *batch_env = getenv("DS4_PREFILL_BATCH");
     ds4_cpu_decode_scratch decode_scratch;
     bool decode_scratch_ready = false;
+    bool complete = false;
     if (batch_env && batch_env[0]) {
         long v = strtol(batch_env, NULL, 10);
         if (v > 0 && v < 4096) ffn_batch = (uint32_t)v;
     }
 
     for (uint64_t t = 0; t < n_tok; t++) {
+        if (cancel && cancel(cancel_ud)) goto cleanup;
         embed_token_f16(model, weights, prompt->v[t], plain);
         hc_from_plain_embedding(cur + t * hc_dim, plain, DS4_N_EMBD, DS4_N_HC);
     }
 
     free(plain);
+    plain = NULL;
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (cancel && cancel(cancel_ud)) goto cleanup;
         fprintf(stderr, "ds4: prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
         fflush(stderr);
 
@@ -9975,6 +9981,7 @@ static void prefill_layer_major_cpu(
                                     il,
                                     steering_dirs,
                                     steering_ffn_scale);
+                    if (cancel && cancel(cancel_ud)) goto cleanup;
                 }
             } else if (shared_batch_ffn) {
                 layer_ffn_shared_batch(next,
@@ -10007,6 +10014,7 @@ static void prefill_layer_major_cpu(
                                   steering_dirs,
                                   steering_ffn_scale,
                                   false);
+                    if (cancel && cancel(cancel_ud)) goto cleanup;
                 }
             }
         } else if (batched_ffn) {
@@ -10020,6 +10028,7 @@ static void prefill_layer_major_cpu(
                                             (uint32_t)t,
                                             steering_dirs,
                                             steering_attn_scale);
+                if (cancel && cancel(cancel_ud)) goto cleanup;
             }
 
             for (uint64_t t = 0; t < n_tok; t += ffn_batch) {
@@ -10033,6 +10042,7 @@ static void prefill_layer_major_cpu(
                                 il,
                                 steering_dirs,
                                 steering_ffn_scale);
+                if (cancel && cancel(cancel_ud)) goto cleanup;
             }
         } else {
             if (!decode_scratch_ready) {
@@ -10052,24 +10062,32 @@ static void prefill_layer_major_cpu(
                                           steering_attn_scale,
                                           steering_ffn_scale,
                                           &decode_scratch);
+                if (cancel && cancel(cancel_ud)) goto cleanup;
             }
         }
 
         float *tmp = cur;
         cur = next;
         next = tmp;
+        if (cancel && cancel(cancel_ud)) goto cleanup;
     }
 
+    if (cancel && cancel(cancel_ud)) goto cleanup;
     kv_cache_finish_prefill_states(cache, (uint32_t)n_tok);
 
     if (logits) {
         output_logits_one(logits, model, weights, cur + (n_tok - 1) * hc_dim);
     }
 
+    complete = true;
+
+cleanup:
+    free(plain);
     if (decode_scratch_ready) cpu_decode_scratch_free(&decode_scratch);
     free(next);
     free(cur);
     free(attn);
+    return complete;
 }
 
 /* Diagnostic first-token layer without cache history: the token attends only
@@ -22839,7 +22857,9 @@ static int generate_raw_swa_cpu(
     prefill_layer_major_cpu(logits, model, weights, &cache, prompt,
                             directional_steering_dirs,
                             directional_steering_attn,
-                            directional_steering_ffn);
+                            directional_steering_ffn,
+                            NULL,
+                            NULL);
 
     const double t_prefill1 = now_sec();
     fprintf(stderr, "ds4: prefill %d/%d done\n", prompt->len, prompt->len);
@@ -26750,14 +26770,21 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         }
 
         session_cpu_reset_cache(s);
-        prefill_layer_major_cpu(s->logits,
-                                &e->model,
-                                &e->weights,
-                                &s->cpu_cache,
-                                prompt,
-                                e->directional_steering_dirs,
-                                e->directional_steering_attn_scale,
-                                e->directional_steering_ffn_scale);
+        if (!prefill_layer_major_cpu(s->logits,
+                                     &e->model,
+                                     &e->weights,
+                                     &s->cpu_cache,
+                                     prompt,
+                                     e->directional_steering_dirs,
+                                     e->directional_steering_attn_scale,
+                                     e->directional_steering_ffn_scale,
+                                     ds4_session_cancelled_cb,
+                                     s)) {
+            snprintf(err, errlen, "interrupted");
+            s->checkpoint_valid = false;
+            s->mtp_draft_valid = false;
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
