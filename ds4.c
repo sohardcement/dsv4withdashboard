@@ -9912,7 +9912,7 @@ static void forward_token_raw_swa_cpu(
 
 /* CPU prefill in layer-major order.  All prompt tokens pass through layer 0,
  * then layer 1, etc., which exposes batch matmul opportunities. */
-static void prefill_layer_major_cpu(
+static bool prefill_layer_major_cpu(
         float             * logits,
         const ds4_model   * model,
         const ds4_weights * weights,
@@ -9920,7 +9920,9 @@ static void prefill_layer_major_cpu(
         const token_vec   * prompt,
         const float       * steering_dirs,
         float               steering_attn_scale,
-        float               steering_ffn_scale) {
+        float               steering_ffn_scale,
+        bool              (*cancel)(void *),
+        void                *cancel_ud) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t n_tok = (uint64_t)prompt->len;
     float *cur = xmalloc((size_t)n_tok * hc_dim * sizeof(cur[0]));
@@ -9935,19 +9937,23 @@ static void prefill_layer_major_cpu(
     const char *batch_env = getenv("DS4_PREFILL_BATCH");
     ds4_cpu_decode_scratch decode_scratch;
     bool decode_scratch_ready = false;
+    bool complete = false;
     if (batch_env && batch_env[0]) {
         long v = strtol(batch_env, NULL, 10);
         if (v > 0 && v < 4096) ffn_batch = (uint32_t)v;
     }
 
     for (uint64_t t = 0; t < n_tok; t++) {
+        if (cancel && cancel(cancel_ud)) goto cleanup;
         embed_token_f16(model, weights, prompt->v[t], plain);
         hc_from_plain_embedding(cur + t * hc_dim, plain, DS4_N_EMBD, DS4_N_HC);
     }
 
     free(plain);
+    plain = NULL;
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (cancel && cancel(cancel_ud)) goto cleanup;
         fprintf(stderr, "ds4: prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
         fflush(stderr);
 
@@ -9975,6 +9981,7 @@ static void prefill_layer_major_cpu(
                                     il,
                                     steering_dirs,
                                     steering_ffn_scale);
+                    if (cancel && cancel(cancel_ud)) goto cleanup;
                 }
             } else if (shared_batch_ffn) {
                 layer_ffn_shared_batch(next,
@@ -10007,6 +10014,7 @@ static void prefill_layer_major_cpu(
                                   steering_dirs,
                                   steering_ffn_scale,
                                   false);
+                    if (cancel && cancel(cancel_ud)) goto cleanup;
                 }
             }
         } else if (batched_ffn) {
@@ -10020,6 +10028,7 @@ static void prefill_layer_major_cpu(
                                             (uint32_t)t,
                                             steering_dirs,
                                             steering_attn_scale);
+                if (cancel && cancel(cancel_ud)) goto cleanup;
             }
 
             for (uint64_t t = 0; t < n_tok; t += ffn_batch) {
@@ -10033,6 +10042,7 @@ static void prefill_layer_major_cpu(
                                 il,
                                 steering_dirs,
                                 steering_ffn_scale);
+                if (cancel && cancel(cancel_ud)) goto cleanup;
             }
         } else {
             if (!decode_scratch_ready) {
@@ -10052,24 +10062,32 @@ static void prefill_layer_major_cpu(
                                           steering_attn_scale,
                                           steering_ffn_scale,
                                           &decode_scratch);
+                if (cancel && cancel(cancel_ud)) goto cleanup;
             }
         }
 
         float *tmp = cur;
         cur = next;
         next = tmp;
+        if (cancel && cancel(cancel_ud)) goto cleanup;
     }
 
+    if (cancel && cancel(cancel_ud)) goto cleanup;
     kv_cache_finish_prefill_states(cache, (uint32_t)n_tok);
 
     if (logits) {
         output_logits_one(logits, model, weights, cur + (n_tok - 1) * hc_dim);
     }
 
+    complete = true;
+
+cleanup:
+    free(plain);
     if (decode_scratch_ready) cpu_decode_scratch_free(&decode_scratch);
     free(next);
     free(cur);
     free(attn);
+    return complete;
 }
 
 /* Diagnostic first-token layer without cache history: the token attends only
@@ -20889,6 +20907,24 @@ static bool metal_graph_prefill_layer_major(
     return ok;
 }
 
+static bool metal_graph_prefill_chunked_range(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               start,
+        uint32_t               n_tokens,
+        float                 *logits,
+        bool                   show_progress,
+        ds4_session_progress_fn progress,
+        void                  *progress_ud,
+        ds4_session_progress_fn display_progress,
+        void                  *display_progress_ud,
+        ds4_imatrix_collector *imatrix,
+        ds4_session_cancel_fn  cancel,
+        void                  *cancel_ud,
+        bool                  *cancelled);
+
 static bool metal_graph_prefill_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -20921,6 +20957,24 @@ static bool metal_graph_prefill_raw_swa(
                                                           cancel,
                                                           cancel_ud,
                                                           cancelled);
+    }
+    if (cancel) {
+        return metal_graph_prefill_chunked_range(g,
+                                                 model,
+                                                 weights,
+                                                 prompt,
+                                                 0,
+                                                 (uint32_t)n_tokens,
+                                                 logits,
+                                                 show_progress,
+                                                 NULL,
+                                                 NULL,
+                                                 display_progress,
+                                                 display_progress_ud,
+                                                 NULL,
+                                                 cancel,
+                                                 cancel_ud,
+                                                 cancelled);
     }
     /* The layer-major fallback below may submit the whole short prefill as one
      * Metal command buffer.  Once that command is in flight there is no useful
@@ -20995,6 +21049,10 @@ static bool metal_graph_prefill_chunked_range(
     }
 
     uint32_t chunk_cap = g->prefill_cap;
+    if (cancel && chunk_cap > 1) {
+        const uint32_t cancel_cap = g->raw_cap != 0 ? g->raw_cap : 256u;
+        if (chunk_cap > cancel_cap) chunk_cap = cancel_cap;
+    }
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
 
@@ -22839,7 +22897,9 @@ static int generate_raw_swa_cpu(
     prefill_layer_major_cpu(logits, model, weights, &cache, prompt,
                             directional_steering_dirs,
                             directional_steering_attn,
-                            directional_steering_ffn);
+                            directional_steering_ffn,
+                            NULL,
+                            NULL);
 
     const double t_prefill1 = now_sec();
     fprintf(stderr, "ds4: prefill %d/%d done\n", prompt->len, prompt->len);
@@ -26181,8 +26241,12 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
     s->cancel_ud = ud;
 }
 
-static bool ds4_session_cancelled(ds4_session *s) {
+bool ds4_session_cancel_requested(ds4_session *s) {
     return s && s->cancel && s->cancel(s->cancel_ud);
+}
+
+static bool ds4_session_cancelled(ds4_session *s) {
+    return ds4_session_cancel_requested(s);
 }
 
 static bool ds4_session_cancelled_cb(void *ud) {
@@ -26746,14 +26810,21 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         }
 
         session_cpu_reset_cache(s);
-        prefill_layer_major_cpu(s->logits,
-                                &e->model,
-                                &e->weights,
-                                &s->cpu_cache,
-                                prompt,
-                                e->directional_steering_dirs,
-                                e->directional_steering_attn_scale,
-                                e->directional_steering_ffn_scale);
+        if (!prefill_layer_major_cpu(s->logits,
+                                     &e->model,
+                                     &e->weights,
+                                     &s->cpu_cache,
+                                     prompt,
+                                     e->directional_steering_dirs,
+                                     e->directional_steering_attn_scale,
+                                     e->directional_steering_ffn_scale,
+                                     ds4_session_cancelled_cb,
+                                     s)) {
+            snprintf(err, errlen, "interrupted");
+            s->checkpoint_valid = false;
+            s->mtp_draft_valid = false;
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;

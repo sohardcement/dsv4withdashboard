@@ -7734,6 +7734,7 @@ typedef struct {
     uint64_t total_requests;
     uint64_t completed_requests;
     uint64_t failed_requests;
+	uint64_t cancelled_requests;
     uint64_t total_prompt_tokens;
     uint64_t total_cached_tokens;
     uint64_t prompt_requests;
@@ -7917,6 +7918,44 @@ struct job {
     job *next;
 };
 
+static void server_finish_cancelled_active(server *s, const job *j,
+	int output_tokens, const char *cache_source, const char *reason);
+
+static bool server_client_disconnected(int fd) {
+	if (fd < 0) return true;
+	struct pollfd pfd = { .fd = fd, .events = POLLIN
+#ifdef POLLRDHUP
+			| POLLRDHUP
+#endif
+	};
+	int rc;
+	do {
+		rc = poll(&pfd, 1, 0);
+	} while (rc < 0 && errno == EINTR);
+	if (rc == 0) return false;
+	if (rc < 0 || (pfd.revents & (POLLERR | POLLNVAL))) return true;
+#ifdef POLLRDHUP
+	if (pfd.revents & POLLRDHUP) return true;
+#endif
+	if (pfd.revents & POLLHUP) return true;
+	if (pfd.revents & POLLIN) {
+		char byte;
+		ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+		if (n == 0) return true;
+		if (n > 0) return false;
+		return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+	}
+	return false;
+}
+
+static bool server_job_client_disconnected(const job *j) {
+	return j && !j->req.stream && server_client_disconnected(j->fd);
+}
+
+static bool server_job_cancel_cb(void *ud) {
+	return server_job_client_disconnected((const job *)ud);
+}
+
 static void server_call_history_update_prompt(server *s, const job *j,
 									int prompt_tokens, int cached_tokens,
 									const char *cache_source) {
@@ -7938,21 +7977,36 @@ static void server_call_history_finish(server *s, const job *j,
 	pthread_mutex_unlock(&s->call_history_mu);
 }
 
+static bool server_drop_disconnected_queued_job(server *s, const job *j) {
+	if (!server_job_client_disconnected(j)) return false;
+	server_log(DS4_LOG_GENERATION,
+		"ds4-server: dropping queued request after client disconnected");
+	server_call_history_finish(s, j, DS4_CALL_CANCELLED, 0, "none",
+		"cancelled", "client disconnected while queued");
+	return true;
+}
+
 static void server_finalize_call_history(server *s, const job *j,
 								 int output_tokens, const char *cache_source,
 								 const char **final_finish, char *err,
 								 size_t errlen, bool response_ok) {
-	if (!response_ok) {
+	if (!response_ok && server_job_client_disconnected(j)) {
+		if (final_finish) *final_finish = "cancelled";
+		if (err && errlen && !err[0])
+			snprintf(err, errlen, "client disconnected during final response");
+	} else if (!response_ok) {
 		if (final_finish) *final_finish = "error";
 		if (err && errlen && !err[0])
 			snprintf(err, errlen, "client stream write failed");
 	}
 	const char *finish = final_finish && *final_finish ? *final_finish : "error";
+	ds4_call_status status = !strcmp(finish, "error") ? DS4_CALL_FAILED :
+		!strcmp(finish, "cancelled") ? DS4_CALL_CANCELLED : DS4_CALL_COMPLETED;
 	server_call_history_finish(s, j,
-			(!strcmp(finish, "error") || !strcmp(finish, "cancelled")) ?
-				DS4_CALL_FAILED : DS4_CALL_COMPLETED,
+			status,
 			output_tokens, cache_source, finish,
-			!strcmp(finish, "error") && err && err[0] ? err : "");
+			(status == DS4_CALL_FAILED || status == DS4_CALL_CANCELLED) &&
+				err && err[0] ? err : "");
 }
 
 static const char *request_api_name(api_style api) {
@@ -8174,6 +8228,9 @@ static void server_status_finish_request(server *s, const char *finish,
     pthread_mutex_lock(&s->status_mu);
     if (finish && !strcmp(finish, "error")) {
         s->status.failed_requests = status_sat_inc(s->status.failed_requests);
+	} else if (finish && !strcmp(finish, "cancelled")) {
+		s->status.cancelled_requests = status_sat_inc(
+			s->status.cancelled_requests);
     } else {
         s->status.completed_requests = status_sat_inc(
             s->status.completed_requests);
@@ -8225,7 +8282,7 @@ static const char dashboard_html[] =
 "<section id=\"contextCapacity\" class=\"setting-block\"><div class=\"setting-head\"><h2>上下文窗口</h2><span id=\"contextEffect\" class=\"effect\">重启后生效</span></div><div class=\"capacity-stats\"><div><span class=\"eyebrow\">当前 / 上限</span><strong id=\"contextCurrent\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">剩余</span><strong id=\"contextRemaining\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">利用率</span><strong id=\"contextUtilization\" class=\"mono\">—</strong></div></div><form class=\"editor\" id=\"contextForm\"><label class=\"eyebrow\" for=\"contextNextInput\">下次启动窗口（token）</label><div class=\"controls\"><input id=\"contextNextInput\" type=\"number\" inputmode=\"numeric\" min=\"4096\" step=\"1\" aria-describedby=\"contextEffect contextNotice\" aria-invalid=\"false\" disabled><button id=\"contextSaveRestart\" class=\"primary\" type=\"button\" disabled>保存下次启动设置</button></div><div id=\"contextNotice\" class=\"notice\" role=\"status\" aria-live=\"polite\"></div></form></section></div>"
 "<section id=\"managementRecent\" class=\"management-section\"><div class=\"section-head\"><h2>最近调用</h2><p id=\"managementCallsActive\" class=\"caption\">当前活动请求：—</p></div><table class=\"recent-calls\"><thead><tr><th>请求</th><th>服务</th><th>API</th><th>结果</th><th>时长</th></tr></thead><tbody id=\"managementRecentCalls\"></tbody></table></section>"
 "<section id=\"managementHost\" class=\"management-section\"><div class=\"section-head\"><h2>主机资源</h2><p class=\"caption\">系统采样不可用时明确标注。</p></div><div class=\"host-ruler\"><div><span class=\"eyebrow\">内存压力 / Swap</span><strong id=\"managementHostPressure\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">物理内存 已用 / 总量 / 可用</span><strong id=\"managementHostPhysical\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">DS4 RSS</span><strong id=\"managementHostRss\" class=\"mono\">不可用</strong></div></div></section></div></div></div>"
-"<section id=\"monitorLayout\" class=\"mode-layout monitor-layout\" hidden aria-hidden=\"true\" aria-labelledby=\"monitorTitle\"><h1 id=\"monitorTitle\" class=\"monitor-title\">实时运行</h1><p class=\"model\">实时吞吐与最近调用检查器</p><div id=\"monitorMetrics\" class=\"monitor-metrics\"><div><span class=\"eyebrow\">阶段 / 活动 / 服务</span><strong id=\"monitorPhase\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">预填充</span><strong id=\"monitorPrefill\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">解码 / 进度</span><strong id=\"monitorDecode\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">请求 KV 命中</span><strong id=\"monitorCacheHit\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">上下文利用率</span><strong id=\"monitorContext\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">队列 / 客户端</span><strong id=\"monitorQueue\" class=\"mono\">—</strong></div></div><div class=\"monitor-grid\"><section class=\"monitor-panel\" aria-labelledby=\"monitorCallsTitle\"><div class=\"section-head\"><h2 id=\"monitorCallsTitle\">最近调用</h2><p id=\"monitorCallsActive\" class=\"caption\">当前活动请求：—</p></div><div class=\"call-filters\"><input id=\"callFilterCaller\" data-call-filter=\"caller\" aria-label=\"按调用方筛选\" placeholder=\"调用方\"><select id=\"callFilterClient\" data-call-filter=\"client\" aria-label=\"按服务筛选\"><option value=\"\">全部服务</option></select><select id=\"callFilterApi\" data-call-filter=\"api\" aria-label=\"按 API 筛选\"><option value=\"\">全部 API</option></select><select id=\"callFilterStatus\" data-call-filter=\"result\" aria-label=\"按结果筛选\"><option value=\"\">全部结果</option><option value=\"active\">进行中</option><option value=\"completed\">完成</option><option value=\"failed\">失败</option></select></div><div class=\"monitor-table-wrap call-table-wrap\"><table class=\"monitor-table\"><thead><tr><th>请求</th><th>服务</th><th>调用方</th><th>API</th><th>结果</th><th>时长</th><th>错误</th></tr></thead><tbody id=\"monitorCalls\"></tbody></table></div></section><aside id=\"requestInspector\" class=\"monitor-panel inspector\" tabindex=\"-1\" aria-labelledby=\"requestInspectorTitle\"><h2 id=\"requestInspectorTitle\">请求检查器</h2><p class=\"caption\">请选择一条调用记录</p></aside><section id=\"monitorHost\" class=\"monitor-host\" aria-labelledby=\"monitorHostTitle\"><div class=\"section-head\"><h2 id=\"monitorHostTitle\">主机资源</h2><p class=\"caption\">系统采样不可用时明确标注。</p></div><div class=\"host-ruler\"><div><span class=\"eyebrow\">内存压力 / Swap</span><strong id=\"monitorHostPressure\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">物理内存 已用 / 总量 / 可用</span><strong id=\"monitorHostPhysical\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">DS4 RSS</span><strong id=\"monitorHostRss\" class=\"mono\">不可用</strong></div></div></section></div></section>"
+"<section id=\"monitorLayout\" class=\"mode-layout monitor-layout\" hidden aria-hidden=\"true\" aria-labelledby=\"monitorTitle\"><h1 id=\"monitorTitle\" class=\"monitor-title\">实时运行</h1><p class=\"model\">实时吞吐与最近调用检查器</p><div id=\"monitorMetrics\" class=\"monitor-metrics\"><div><span class=\"eyebrow\">阶段 / 活动 / 服务</span><strong id=\"monitorPhase\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">预填充</span><strong id=\"monitorPrefill\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">解码 / 进度</span><strong id=\"monitorDecode\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">请求 KV 命中</span><strong id=\"monitorCacheHit\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">上下文利用率</span><strong id=\"monitorContext\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">队列 / 客户端</span><strong id=\"monitorQueue\" class=\"mono\">—</strong></div></div><div class=\"monitor-grid\"><section class=\"monitor-panel\" aria-labelledby=\"monitorCallsTitle\"><div class=\"section-head\"><h2 id=\"monitorCallsTitle\">最近调用</h2><p id=\"monitorCallsActive\" class=\"caption\">当前活动请求：—</p></div><div class=\"call-filters\"><input id=\"callFilterCaller\" data-call-filter=\"caller\" aria-label=\"按调用方筛选\" placeholder=\"调用方\"><select id=\"callFilterClient\" data-call-filter=\"client\" aria-label=\"按服务筛选\"><option value=\"\">全部服务</option></select><select id=\"callFilterApi\" data-call-filter=\"api\" aria-label=\"按 API 筛选\"><option value=\"\">全部 API</option></select><select id=\"callFilterStatus\" data-call-filter=\"result\" aria-label=\"按结果筛选\"><option value=\"\">全部结果</option><option value=\"active\">进行中</option><option value=\"completed\">完成</option><option value=\"failed\">失败</option><option value=\"cancelled\">已取消</option></select></div><div class=\"monitor-table-wrap call-table-wrap\"><table class=\"monitor-table\"><thead><tr><th>请求</th><th>服务</th><th>调用方</th><th>API</th><th>结果</th><th>时长</th><th>错误</th></tr></thead><tbody id=\"monitorCalls\"></tbody></table></div></section><aside id=\"requestInspector\" class=\"monitor-panel inspector\" tabindex=\"-1\" aria-labelledby=\"requestInspectorTitle\"><h2 id=\"requestInspectorTitle\">请求检查器</h2><p class=\"caption\">请选择一条调用记录</p></aside><section id=\"monitorHost\" class=\"monitor-host\" aria-labelledby=\"monitorHostTitle\"><div class=\"section-head\"><h2 id=\"monitorHostTitle\">主机资源</h2><p class=\"caption\">系统采样不可用时明确标注。</p></div><div class=\"host-ruler\"><div><span class=\"eyebrow\">内存压力 / Swap</span><strong id=\"monitorHostPressure\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">物理内存 已用 / 总量 / 可用</span><strong id=\"monitorHostPhysical\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">DS4 RSS</span><strong id=\"monitorHostRss\" class=\"mono\">不可用</strong></div></div></section></div></section>"
 "</main><script>"
 "const $=id=>document.getElementById(id),dash=$('dashboard');window.__ds4InitialMode=(()=>{try{return localStorage.getItem('ds4-dashboard-mode')}catch(e){return null}})();let lastSnapshot=null,lastUpdatedAt=0,online=false,adminLocal=true,kvEnabled=false,currentKvBudgetBytes=null,kvState='idle',kvReview=null,kvTrigger=null,pollGeneration=0,contextLocal=true,contextBusy=false,kvTargetTouched=false,contextTargetTouched=false,selectedRequestId=null;"
 "const themeValues=['paper','terminal','calm'];function setTheme(value){const theme=themeValues.includes(value)?value:'paper';document.documentElement.dataset.theme=theme;dash.dataset.theme=theme;try{localStorage.setItem('ds4-dashboard-theme',theme)}catch(e){}document.querySelectorAll('[data-theme-choice]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.themeChoice===theme)))}"
@@ -8237,7 +8294,7 @@ static const char dashboard_html[] =
 "function setKvState(state){kvState=state;dash.dataset.kvState=state;const reviewing=state==='review';$('kvReview').hidden=!reviewing;const available=online&&adminLocal&&kvEnabled,locked=['checking','review','applying','saving'].includes(state)||!available;for(const id of ['kvBudgetInput','kvBudgetUnit','kvApplyNow','kvSaveRestart'])$(id).disabled=locked;$('kvConfirmApply').disabled=!reviewing||!available;$('kvCancelApply').disabled=!reviewing}"
 "function contextControls(){const disabled=contextBusy||!online||!contextLocal;$('contextNextInput').disabled=disabled;$('contextSaveRestart').disabled=disabled}"
 "function setKvInvalid(value){for(const id of ['kvBudgetInput','kvBudgetUnit'])$(id).setAttribute('aria-invalid',String(value))}"
-"function callStatus(value){return ({active:'进行中',completed:'完成',failed:'失败'})[value]||'未知'}"
+"function callStatus(value){return ({active:'进行中',completed:'完成',failed:'失败',cancelled:'已取消'})[value]||'未知'}"
 "function replaceOptions(id,values,label){const select=$(id),next=[''].concat(values),options=[...select.options],same=options.length===next.length&&options.every((option,i)=>option.value===next[i]&&option.textContent===(next[i]||label));if(same)return;const old=select.value;select.replaceChildren();for(const value of next){const option=document.createElement('option');option.value=value;option.textContent=value||label;select.append(option)}select.value=values.includes(old)?old:''}"
 "function inspectorFact(root,label,value){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value==null||value===''?'—':String(value);root.append(dt,dd)}"
 "function requestDuration(record,request,currentId,snapshotActive){const started=nonnegative(record.started_at)?Number(record.started_at):null,finished=nonnegative(record.finished_at)?Number(record.finished_at):null;if(record.status!=='active')return started!==null&&finished!==null&&finished>=started?(finished-started).toFixed(1)+'s':'—';if(snapshotActive&&currentId&&String(record.request_id)===currentId){if(nonnegative(request&&request.elapsed_sec))return Number(request.elapsed_sec).toFixed(1)+'s';const now=Date.now()/1000;if(started!==null&&started<=now)return (now-started).toFixed(1)+'s'}return '—'}"
@@ -8292,7 +8349,8 @@ static bool send_dashboard_page(int fd, bool enable_cors) {
 
 static const char *call_status_name(ds4_call_status status) {
 	return status == DS4_CALL_ACTIVE ? "active" :
-		status == DS4_CALL_COMPLETED ? "completed" : "failed";
+		status == DS4_CALL_COMPLETED ? "completed" :
+		status == DS4_CALL_CANCELLED ? "cancelled" : "failed";
 }
 
 static void append_status_calls_json(buf *b, const ds4_call_history_snapshot *calls,
@@ -8393,11 +8451,13 @@ static void append_status_json(buf *b, const server_status *st,
                st->decode_chunk_tps,
                st->decode_elapsed_s);
     buf_printf(b, ",\"totals\":{\"requests\":%llu,\"completed\":%llu,\"failed\":%llu,"
+				  "\"cancelled\":%llu,"
                   "\"cache\":{\"prompt_tokens\":%llu,\"cached_tokens\":%llu,"
                   "\"prompt_requests\":%llu,\"hit_requests\":%llu}}",
                (unsigned long long)st->total_requests,
                (unsigned long long)st->completed_requests,
                (unsigned long long)st->failed_requests,
+			   (unsigned long long)st->cancelled_requests,
                (unsigned long long)st->total_prompt_tokens,
                (unsigned long long)st->total_cached_tokens,
                (unsigned long long)st->prompt_requests,
@@ -9662,6 +9722,23 @@ static void server_kv_reset_continued_store(server *s) {
 	pthread_mutex_lock(&s->kv_mu);
 	s->kv.continued_last_store_tokens = 0;
 	pthread_mutex_unlock(&s->kv_mu);
+}
+
+static void server_discard_cancelled_live_state(server *s) {
+	if (!s) return;
+	if (s->session) ds4_session_invalidate(s->session);
+	server_kv_reset_continued_store(s);
+	responses_live_clear(s);
+	anthropic_live_clear(s);
+	thinking_live_clear(s);
+}
+
+static void server_finish_cancelled_active(server *s, const job *j,
+	int output_tokens, const char *cache_source, const char *reason) {
+	server_discard_cancelled_live_state(s);
+	server_call_history_finish(s, j, DS4_CALL_CANCELLED, output_tokens,
+		cache_source, "cancelled", reason);
+	server_status_finish_request(s, "cancelled", reason);
 }
 
 static int server_kv_cold_store_len(server *s, const ds4_tokens *prompt,
@@ -11137,13 +11214,34 @@ static void generate_job(server *s, job *j) {
 			server_kv_suppress_continued_store(s, cold_store_len);
     }
 
-	if (kv_policy.enabled &&
+    if (kv_policy.enabled &&
 		cold_store_len >= kv_policy.min_tokens &&
         cold_store_len < prompt_for_sync->len)
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (ds4_session_sync(s->session, &prefix, err, sizeof(err)) != 0) {
+		int sync_rc = ds4_session_sync(s->session, &prefix, err, sizeof(err));
+		if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED ||
+		    (sync_rc == 0 && server_job_client_disconnected(j)))
+		{
+			ds4_tokens_free(&prefix);
+			ds4_tokens_free(&effective_prompt);
+			ds4_session_set_progress(s->session, NULL, NULL);
+			ds4_session_set_display_progress(s->session, NULL, NULL);
+			server_kv_restore_suppressed_continued(s,
+				suppressed_continued_last, cold_store_len);
+			free(disk_cache_path);
+			trace_event(s, trace_id,
+				"prefill cancelled: client disconnected during prefill");
+			server_log(DS4_LOG_GENERATION,
+				"ds4-server: %s ctx=%s%s%s cancelled: client disconnected during prefill",
+				j->req.kind == REQ_CHAT ? "chat" : "completion",
+				ctx_span, req_flags[0] ? " " : "", req_flags);
+			server_finish_cancelled_active(s, j, 0, cache_source,
+				"client disconnected during prefill");
+			return;
+		}
+        if (sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
@@ -11169,7 +11267,27 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
+	int sync_rc = ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err));
+	if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED ||
+	    (sync_rc == 0 && server_job_client_disconnected(j)))
+	{
+		ds4_tokens_free(&effective_prompt);
+		ds4_session_set_progress(s->session, NULL, NULL);
+		ds4_session_set_display_progress(s->session, NULL, NULL);
+		server_kv_restore_suppressed_continued(s,
+			suppressed_continued_last, cold_store_len);
+		free(disk_cache_path);
+		trace_event(s, trace_id,
+			"prefill cancelled: client disconnected during prefill");
+		server_log(DS4_LOG_GENERATION,
+			"ds4-server: %s ctx=%s%s%s cancelled: client disconnected during prefill",
+			j->req.kind == REQ_CHAT ? "chat" : "completion",
+			ctx_span, req_flags[0] ? " " : "", req_flags);
+		server_finish_cancelled_active(s, j, 0, cache_source,
+			"client disconnected during prefill");
+		return;
+	}
+    if (sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
         ds4_session_set_display_progress(s->session, NULL, NULL);
@@ -11327,6 +11445,12 @@ decode_again:
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
+		if (server_job_client_disconnected(j)) {
+			finish = "cancelled";
+			snprintf(err, sizeof(err),
+				"client disconnected during decode");
+			break;
+		}
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
@@ -11367,20 +11491,45 @@ decode_again:
                                                        err,
                                                        sizeof(err));
             if (ntok < 0) {
-                finish = "error";
+				if (server_job_client_disconnected(j)) {
+					finish = "cancelled";
+					snprintf(err, sizeof(err),
+						"client disconnected during decode");
+				} else {
+					finish = "error";
+				}
                 break;
             }
         } else {
             if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
-                finish = "error";
+				if (server_job_client_disconnected(j)) {
+					finish = "cancelled";
+					snprintf(err, sizeof(err),
+						"client disconnected during decode");
+				} else {
+					finish = "error";
+				}
                 break;
             }
             toks[0] = token;
             ntok = 1;
         }
+		if (server_job_client_disconnected(j)) {
+			finish = "cancelled";
+			snprintf(err, sizeof(err),
+				"client disconnected during decode");
+			break;
+		}
 
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
+			if (server_job_client_disconnected(j)) {
+				finish = "cancelled";
+				snprintf(err, sizeof(err),
+					"client disconnected during decode");
+				stop_decode = true;
+				break;
+			}
             token = toks[ti];
             if (token == ds4_token_eos(s->engine)) {
                 finish = "stop";
@@ -11569,14 +11718,20 @@ decode_again:
         }
         if (stop_decode) break;
     }
+	if (server_job_client_disconnected(j)) {
+		finish = "cancelled";
+		snprintf(err, sizeof(err), "client disconnected during decode");
+	}
 
-    if (g_stop_requested && strcmp(finish, "error") != 0) {
+    if (g_stop_requested && strcmp(finish, "error") != 0 &&
+		strcmp(finish, "cancelled") != 0) {
         finish = "error";
         snprintf(err, sizeof(err), "shutdown requested");
     }
 
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
-        saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
+		saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0 &&
+		strcmp(finish, "cancelled") != 0)
     {
         /* Deterministically complete a simple truncation.  Anything more than
          * missing closing tags stays model-owned: for non-streaming requests,
@@ -11626,23 +11781,32 @@ decode_again:
                                                 recovery_err,
                                                 sizeof(recovery_err)))
                 {
-                    dsml_recovery_attempted = true;
-                    server_log(DS4_LOG_GENERATION,
-                               "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
-                               ctx_span,
-                               req_flags[0] ? " " : "",
-                               req_flags,
-                               recovery_tokens);
-                    trace_event(s, trace_id,
-                                "tool-error continuation appended %d tokens",
-                                recovery_tokens);
-                    buf_free(&repaired);
-                    buf_free(&text);
-                    goto decode_again;
+					if (server_job_client_disconnected(j)) {
+						finish = "cancelled";
+						snprintf(err, sizeof(err),
+							"client disconnected during decode");
+					} else {
+						dsml_recovery_attempted = true;
+						server_log(DS4_LOG_GENERATION,
+								   "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
+								   ctx_span,
+								   req_flags[0] ? " " : "",
+								   req_flags,
+								   recovery_tokens);
+						trace_event(s, trace_id,
+									"tool-error continuation appended %d tokens",
+									recovery_tokens);
+						buf_free(&repaired);
+						buf_free(&text);
+						goto decode_again;
+					}
                 }
-                finish = "error";
-                snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
-                         recovery_err[0] ? recovery_err : "unknown error");
+				if (strcmp(finish, "cancelled")) {
+					finish = "error";
+					snprintf(err, sizeof(err),
+						"invalid tool call recovery failed: %s",
+						recovery_err[0] ? recovery_err : "unknown error");
+				}
             } else {
                 finish = "error";
                 snprintf(err, sizeof(err), "unterminated tool call");
@@ -11650,6 +11814,11 @@ decode_again:
         }
         buf_free(&repaired);
     }
+
+	if (server_job_client_disconnected(j)) {
+		finish = "cancelled";
+		snprintf(err, sizeof(err), "client disconnected during decode");
+	}
 
     if (completion > last_decode_log_completion) {
         log_decode_progress(j->req.kind, prompt_tokens, completion,
@@ -11674,7 +11843,7 @@ decode_again:
     char *parsed_reasoning = NULL;
     const char *final_finish = finish;
     bool recovered_tool_parse_failure = false;
-    if (j->req.kind == REQ_CHAT) {
+	if (j->req.kind == REQ_CHAT && strcmp(final_finish, "cancelled")) {
         bool parsed_ok = parse_generated_message_for_response(
             text.ptr ? text.ptr : "",
             j->req.has_tools,
@@ -11709,27 +11878,36 @@ decode_again:
                                                 recovery_err,
                                                 sizeof(recovery_err)))
                 {
-                    dsml_recovery_attempted = true;
-                    server_log(DS4_LOG_GENERATION,
-                               "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
-                               ctx_span,
-                               req_flags[0] ? " " : "",
-                               req_flags,
-                               recovery_tokens);
-                    trace_event(s, trace_id,
-                                "tool-error continuation appended %d tokens",
-                                recovery_tokens);
-                    free(parsed_content);
-                    free(parsed_reasoning);
-                    tool_calls_free(&parsed_calls);
-                    buf_free(&text);
-                    goto decode_again;
+					if (server_job_client_disconnected(j)) {
+						final_finish = "cancelled";
+						snprintf(err, sizeof(err),
+							"client disconnected during decode");
+					} else {
+						dsml_recovery_attempted = true;
+						server_log(DS4_LOG_GENERATION,
+								   "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
+								   ctx_span,
+								   req_flags[0] ? " " : "",
+								   req_flags,
+								   recovery_tokens);
+						trace_event(s, trace_id,
+									"tool-error continuation appended %d tokens",
+									recovery_tokens);
+						free(parsed_content);
+						free(parsed_reasoning);
+						tool_calls_free(&parsed_calls);
+						buf_free(&text);
+						goto decode_again;
+					}
                 }
-                final_finish = "error";
-                snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
-                         recovery_err[0] ? recovery_err : "unknown error");
+				if (strcmp(final_finish, "cancelled")) {
+					final_finish = "error";
+					snprintf(err, sizeof(err),
+						"invalid tool call recovery failed: %s",
+						recovery_err[0] ? recovery_err : "unknown error");
+				}
             }
-            if (!parsed_ok) {
+			if (!parsed_ok && strcmp(final_finish, "cancelled")) {
                 /* Print raw DSML snippet for debugging */
                 size_t dsml_snippet_len = 0;
                 const char *dsml_start = NULL;
@@ -11771,26 +11949,44 @@ decode_again:
                             final_finish);
             }
         }
-        if (parsed_calls.len) {
+		if (server_job_client_disconnected(j)) {
+			final_finish = "cancelled";
+			snprintf(err, sizeof(err),
+				"client disconnected during decode");
+		}
+		if (strcmp(final_finish, "cancelled") && parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
             if (j->req.api == API_ANTHROPIC && j->req.stream)
                 apply_anthropic_stream_tool_ids(&parsed_calls, &anthropic_live);
             assign_tool_call_ids(s, &parsed_calls, j->req.api);
-            tool_memory_remember(s, &parsed_calls);
+			tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
-        } else if (j->req.api == API_RESPONSES) {
+		} else if (strcmp(final_finish, "cancelled") &&
+		           j->req.api == API_RESPONSES) {
             responses_live_clear(s);
         }
     }
-    log_tool_calls_summary(ctx_span, &parsed_calls,
-                           responses_protocol);
+	if (server_job_client_disconnected(j)) {
+		final_finish = "cancelled";
+		snprintf(err, sizeof(err), "client disconnected during decode");
+	}
+	if (strcmp(final_finish, "cancelled")) {
+		log_tool_calls_summary(ctx_span, &parsed_calls,
+			responses_protocol);
+		trace_finish(s, trace_id, &j->req, final_finish, completion,
+			saw_tool_start, saw_tool_end,
+			parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+			parsed_reasoning, &parsed_calls, now_sec() - t0);
+	} else {
+		tool_calls cancelled_calls = {0};
+		trace_event(s, trace_id,
+			"request cancelled: client disconnected during decode");
+		trace_finish(s, trace_id, &j->req, final_finish, completion,
+			false, false, "", NULL, &cancelled_calls, now_sec() - t0);
+	}
 
-    trace_finish(s, trace_id, &j->req, final_finish, completion,
-                 saw_tool_start, saw_tool_end,
-                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                 parsed_reasoning, &parsed_calls, now_sec() - t0);
-
-    if (j->req.api == API_RESPONSES) {
+	if (strcmp(final_finish, "cancelled") &&
+		j->req.api == API_RESPONSES) {
         if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
             /* Store the post-turn visible transcript plus the live token
              * frontier.  The next Responses request may replay only this
@@ -11812,7 +12008,8 @@ decode_again:
             responses_live_clear(s);
         }
     }
-    if (j->req.api == API_ANTHROPIC) {
+	if (strcmp(final_finish, "cancelled") &&
+		j->req.api == API_ANTHROPIC) {
         if (parsed_calls.len && strcmp(final_finish, "error") &&
             strcmp(final_finish, "length"))
         {
@@ -11822,32 +12019,44 @@ decode_again:
         }
     }
 
-    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
-        j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls))
-    {
+	if (strcmp(final_finish, "cancelled")) {
+		if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+			j->req.api != API_RESPONSES &&
+			should_canonicalize_tool_checkpoint(s, &parsed_calls))
+		{
         /* Chat/completions has no protocol object that binds the next request
          * to this live KV state.  Canonicalize only the fallback tool-call
          * path where we lack exact sampled DSML replay; when raw DSML is known,
          * replaying those bytes keeps future prompts aligned without rebuilding
          * hidden reasoning.  Responses deliberately skips this path because its
          * previous_response_id contract binds the next turn to live state. */
-        canonicalize_tool_checkpoint(s, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "",
-                                     parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s);
-    } else if (parsed_calls.len) {
-        thinking_live_clear(s);
-    } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
-        remember_thinking_checkpoint(s, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "");
-    } else if (!parsed_calls.len) {
-        thinking_live_clear(s);
-    }
+			canonicalize_tool_checkpoint(s, j, ctx_span, trace_id,
+				parsed_content ? parsed_content : "",
+				parsed_reasoning, &parsed_calls);
+			thinking_live_clear(s);
+		} else if (parsed_calls.len) {
+			thinking_live_clear(s);
+		} else if (!parsed_calls.len &&
+			should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
+			remember_thinking_checkpoint(s, j, ctx_span, trace_id,
+				parsed_content ? parsed_content : "");
+		} else if (!parsed_calls.len) {
+			thinking_live_clear(s);
+		}
+	}
 
+	if (server_job_client_disconnected(j)) {
+		if (strcmp(final_finish, "cancelled")) {
+			trace_event(s, trace_id,
+				"request cancelled before final response: client disconnected during decode");
+		}
+		final_finish = "cancelled";
+		snprintf(err, sizeof(err), "client disconnected during decode");
+	}
     bool response_ok = true;
-    if (j->req.stream) {
+	if (!strcmp(final_finish, "cancelled")) {
+		server_discard_cancelled_live_state(s);
+	} else if (j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
@@ -11889,26 +12098,27 @@ decode_again:
                        req_flags);
         }
     } else if (j->req.api == API_ANTHROPIC) {
-        anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
+		response_ok = anthropic_final_response(j->fd, s->enable_cors,
+			&j->req, id,
+			parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+			parsed_reasoning, &parsed_calls, final_finish,
+			prompt_tokens, completion);
     } else if (j->req.api == API_RESPONSES) {
-        responses_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
+		response_ok = responses_final_response(j->fd, s->enable_cors,
+			&j->req, id,
+			parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+			parsed_reasoning, &parsed_calls, final_finish,
+			prompt_tokens, completion);
     } else {
-        final_response(j->fd, s->enable_cors, &j->req, id,
-                       parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                       parsed_reasoning,
-                       &parsed_calls, final_finish,
-                       prompt_tokens, completion);
+		response_ok = final_response(j->fd, s->enable_cors, &j->req, id,
+			parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+			parsed_reasoning, &parsed_calls, final_finish,
+			prompt_tokens, completion);
     }
 	server_finalize_call_history(s, j, completion, cache_source, &final_finish,
-							 err, sizeof(err), response_ok);
+								 err, sizeof(err), response_ok);
+	if (!response_ok && !j->req.stream && !strcmp(final_finish, "cancelled"))
+		server_discard_cancelled_live_state(s);
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),
@@ -11917,7 +12127,8 @@ decode_again:
                   thinking.inside,
                   saw_tool_start,
                   saw_tool_end);
-        if (!strcmp(final_finish, "error") && err[0]) {
+		if ((!strcmp(final_finish, "error") ||
+		     !strcmp(final_finish, "cancelled")) && err[0]) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
                        ctx_span,
@@ -11945,7 +12156,8 @@ decode_again:
                   thinking.inside,
                   false,
                   false);
-        if (!strcmp(final_finish, "error") && err[0]) {
+		if ((!strcmp(final_finish, "error") ||
+		     !strcmp(final_finish, "cancelled")) && err[0]) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -11969,7 +12181,8 @@ decode_again:
         }
     }
     server_status_finish_request(s, final_finish,
-                                 !strcmp(final_finish, "error") && err[0] ? err : "");
+		(!strcmp(final_finish, "error") ||
+		 !strcmp(final_finish, "cancelled")) && err[0] ? err : "");
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -12015,9 +12228,14 @@ static void *worker_main(void *arg) {
 	for (;;) {
 		job *j = dequeue(s);
 		if (!j) break;
-		server_worker_active_call_set(s, j->call_request_id);
-		generate_job(s, j);
-		server_worker_active_call_clear(s, j->call_request_id);
+		if (!server_drop_disconnected_queued_job(s, j)) {
+			server_worker_active_call_set(s, j->call_request_id);
+			if (!j->req.stream)
+				ds4_session_set_cancel(s->session, server_job_cancel_cb, j);
+			generate_job(s, j);
+			ds4_session_set_cancel(s->session, NULL, NULL);
+			server_worker_active_call_clear(s, j->call_request_id);
+		}
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -14063,6 +14281,8 @@ static void test_dashboard_page_is_served_as_html(void) {
     TEST_ASSERT(strstr(out, "data-call-filter=\"caller\"") != NULL);
     TEST_ASSERT(strstr(out, "id=\"callFilterClient\"") != NULL);
     TEST_ASSERT(strstr(out, "data-call-filter=\"client\"") != NULL);
+	TEST_ASSERT(strstr(out, "<option value=\"cancelled\">已取消</option>") != NULL);
+	TEST_ASSERT(strstr(out, "cancelled:'已取消'") != NULL);
     TEST_ASSERT(strstr(out, "selectedRequestId") != NULL);
     TEST_ASSERT(strstr(out, "/ds4/admin/context") != NULL);
     TEST_ASSERT(strstr(out, "/ds4/admin/kv-cache") != NULL);
@@ -15358,6 +15578,8 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
     s.status.session_pos = 40;
     buf b = {0};
     append_status_json(&b, &s.status, &kv, &host, &calls, history.capacity, 0);
+	TEST_ASSERT(strstr(b.ptr, "\"totals\":{\"requests\":3,\"completed\":0,"
+		"\"failed\":0,\"cancelled\":0,") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"cache\":{\"prompt_tokens\":150,"
                               "\"cached_tokens\":75,\"prompt_requests\":2,"
                               "\"hit_requests\":1}") != NULL);
@@ -15426,9 +15648,95 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
     s.status.failed_requests = UINT64_MAX;
     server_status_finish_request(&s, "error", "test error");
     TEST_ASSERT(s.status.failed_requests == UINT64_MAX);
+	s.status.cancelled_requests = UINT64_MAX;
+	server_status_finish_request(&s, "cancelled", "client disconnected");
+	TEST_ASSERT(s.status.cancelled_requests == UINT64_MAX);
 
     request_free(&r);
     pthread_mutex_destroy(&s.status_mu);
+}
+
+static void test_cancelled_request_counts_separately(void) {
+	server s = {0};
+	pthread_mutex_init(&s.status_mu, NULL);
+	request r;
+	request_init(&r, REQ_CHAT, 16);
+
+	server_status_begin_request(&s, &r, 0, 0, "none");
+	server_status_finish_request(&s, "cancelled",
+		"client disconnected during decode");
+
+	TEST_ASSERT(!s.status.active);
+	TEST_ASSERT(!strcmp(s.status.finish, "cancelled"));
+	TEST_ASSERT(s.status.cancelled_requests == 1);
+	TEST_ASSERT(s.status.completed_requests == 0);
+	TEST_ASSERT(s.status.failed_requests == 0);
+
+	request_free(&r);
+	pthread_mutex_destroy(&s.status_mu);
+}
+
+static void test_cancelled_active_request_discards_live_state(void) {
+	server s = {0};
+	job j = {0};
+	pthread_mutex_init(&s.kv_mu, NULL);
+	pthread_mutex_init(&s.tool_mu, NULL);
+	pthread_mutex_init(&s.status_mu, NULL);
+	pthread_mutex_init(&s.call_history_mu, NULL);
+	ds4_call_history_init(&s.call_history);
+	request_init(&j.req, REQ_CHAT, 16);
+
+	s.kv.continued_last_store_tokens = 123;
+	s.responses_live.valid = true;
+	s.responses_live.live_tokens = 101;
+	s.responses_live.visible_text = xstrdup("responses live");
+	s.responses_live.visible_len = strlen(s.responses_live.visible_text);
+	s.anthropic_live.valid = true;
+	s.anthropic_live.live_tokens = 102;
+	s.anthropic_live.visible_text = xstrdup("anthropic live");
+	s.anthropic_live.visible_len = strlen(s.anthropic_live.visible_text);
+	s.thinking_live.valid = true;
+	s.thinking_live.live_tokens = 103;
+	s.thinking_live.visible_text = xstrdup("thinking live");
+	s.thinking_live.visible_len = strlen(s.thinking_live.visible_text);
+	j.call_request_id = ds4_call_history_begin(&s.call_history, "caller", NULL,
+		"openai", "chat", false, false, 1.0);
+	server_status_begin_request(&s, &j.req, 0, 12, "none");
+
+	server_finish_cancelled_active(&s, &j, 0, "disk",
+		"client disconnected during prefill");
+
+	TEST_ASSERT(s.kv.continued_last_store_tokens == 0);
+	TEST_ASSERT(!s.responses_live.valid);
+	TEST_ASSERT(s.responses_live.visible_text == NULL);
+	TEST_ASSERT(!s.anthropic_live.valid);
+	TEST_ASSERT(s.anthropic_live.visible_text == NULL);
+	TEST_ASSERT(!s.thinking_live.valid);
+	TEST_ASSERT(s.thinking_live.visible_text == NULL);
+	TEST_ASSERT(s.call_history.len == 1);
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_CANCELLED);
+	TEST_ASSERT(s.call_history.records[0].output_tokens == 0);
+	TEST_ASSERT(!strcmp(s.call_history.records[0].cache_source, "disk"));
+	TEST_ASSERT(!strcmp(s.call_history.records[0].finish, "cancelled"));
+	TEST_ASSERT(!strcmp(s.call_history.records[0].error,
+		"client disconnected during prefill"));
+	TEST_ASSERT(!s.status.active);
+	TEST_ASSERT(!strcmp(s.status.finish, "cancelled"));
+	TEST_ASSERT(!strcmp(s.status.last_error,
+		"client disconnected during prefill"));
+	TEST_ASSERT(s.status.cancelled_requests == 1);
+	TEST_ASSERT(s.status.completed_requests == 0);
+	TEST_ASSERT(s.status.failed_requests == 0);
+
+	request_free(&j.req);
+	live_tool_state_free(&s.responses_live);
+	live_tool_state_free(&s.anthropic_live);
+	visible_live_free(&s.thinking_live);
+	ds4_call_history_free(&s.call_history);
+	pthread_mutex_destroy(&s.call_history_mu);
+	pthread_mutex_destroy(&s.status_mu);
+	pthread_mutex_destroy(&s.tool_mu);
+	pthread_mutex_destroy(&s.kv_mu);
 }
 
 static void test_call_history_capacity_keeps_active_calls(void) {
@@ -15530,6 +15838,35 @@ static void test_call_history_clamps_tokens_and_aggregates_failures(void) {
     TEST_ASSERT(snap.callers[0].recent_activity == 14.0);
     ds4_call_history_snapshot_free(&snap);
     ds4_call_history_free(&h);
+}
+
+static void test_call_history_tracks_cancelled_without_failure(void) {
+	server s = {0};
+	job j = {0};
+	pthread_mutex_init(&s.call_history_mu, NULL);
+	ds4_call_history_init(&s.call_history);
+	j.call_request_id = ds4_call_history_begin(&s.call_history, "client", NULL, "openai",
+		"chat", false, false, 10.0);
+	const char *final_finish = "cancelled";
+	char err[160] = "client disconnected during decode";
+	server_finalize_call_history(&s, &j, 0, "none", &final_finish,
+		err, sizeof(err), true);
+
+	TEST_ASSERT(s.call_history.len == 1);
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_CANCELLED);
+	TEST_ASSERT(!strcmp(call_status_name(s.call_history.records[0].status),
+		"cancelled"));
+	ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(
+		&s.call_history, 20.0);
+	TEST_ASSERT(snap.callers_len == 1);
+	TEST_ASSERT(snap.callers[0].failures == 0);
+	TEST_ASSERT(!strcmp(snap.records[0].finish, "cancelled"));
+	TEST_ASSERT(!strcmp(snap.records[0].error,
+		"client disconnected during decode"));
+
+	ds4_call_history_snapshot_free(&snap);
+	ds4_call_history_free(&s.call_history);
+	pthread_mutex_destroy(&s.call_history_mu);
 }
 
 static void test_call_history_keeps_clients_separate_per_caller(void) {
@@ -15665,6 +16002,7 @@ static void test_call_history_marks_final_stream_write_failure(void) {
 	char err[160] = {0};
 	int sv[2];
 	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	j.fd = sv[0];
 	request r;
 	request_init(&r, REQ_CHAT, 16);
 	r.model = xstrdup("test");
@@ -15672,20 +16010,101 @@ static void test_call_history_marks_final_stream_write_failure(void) {
 	void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
 	bool response_ok = sse_chunk(sv[0], &r, "test", NULL, "stop");
 	signal(SIGPIPE, old_sigpipe);
-	close(sv[0]);
 	request_free(&r);
 	TEST_ASSERT(!response_ok);
 	server_finalize_call_history(&s, &j, 3, "memory-token", &final_finish,
 							 err, sizeof(err), response_ok);
-	TEST_ASSERT(!strcmp(final_finish, "error"));
+	TEST_ASSERT(!strcmp(final_finish, "cancelled"));
 	TEST_ASSERT(err[0] != '\0');
 	TEST_ASSERT(s.call_history.len == 1);
-	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_FAILED);
-	TEST_ASSERT(!strcmp(s.call_history.records[0].finish, "error"));
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_CANCELLED);
+	TEST_ASSERT(!strcmp(s.call_history.records[0].finish, "cancelled"));
 	TEST_ASSERT(s.call_history.records[0].error[0] != '\0');
 	ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(&s.call_history, 2.0);
-	TEST_ASSERT(snap.callers_len == 1 && snap.callers[0].failures == 1);
+	TEST_ASSERT(snap.callers_len == 1 && snap.callers[0].failures == 0);
 	ds4_call_history_snapshot_free(&snap);
+	close(sv[0]);
+	ds4_call_history_free(&s.call_history);
+	pthread_mutex_destroy(&s.call_history_mu);
+}
+
+extern int ds4_dist_test_cancelled_result_wait(void);
+
+static void test_distributed_result_wait_observes_cancellation(void) {
+	TEST_ASSERT(ds4_dist_test_cancelled_result_wait() == 0);
+}
+
+static void test_nonstream_client_disconnect_probe_contract(void) {
+	int sv[2] = {-1, -1};
+	int rc = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+	TEST_ASSERT(rc == 0);
+	if (rc != 0) return;
+	int flags = fcntl(sv[0], F_GETFL, 0);
+	TEST_ASSERT(flags >= 0);
+	TEST_ASSERT(flags >= 0 && fcntl(sv[0], F_SETFL, flags | O_NONBLOCK) == 0);
+
+	TEST_ASSERT(!server_client_disconnected(sv[0]));
+	const char sentinel = 'x';
+	TEST_ASSERT(send(sv[1], &sentinel, 1, 0) == 1);
+	TEST_ASSERT(!server_client_disconnected(sv[0]));
+	char received = '\0';
+	TEST_ASSERT(recv(sv[0], &received, 1, 0) == 1);
+	TEST_ASSERT(received == sentinel);
+
+	/* DS4 handles exactly one request per connection, so after its request body
+	 * is consumed, peer EOF (including SHUT_WR) means that request was abandoned. */
+	TEST_ASSERT(shutdown(sv[1], SHUT_WR) == 0);
+	TEST_ASSERT(server_client_disconnected(sv[0]));
+
+	close(sv[0]);
+	close(sv[1]);
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	TEST_ASSERT(send(sv[1], &sentinel, 1, 0) == 1);
+	TEST_ASSERT(shutdown(sv[1], SHUT_WR) == 0);
+	TEST_ASSERT(server_client_disconnected(sv[0]));
+	TEST_ASSERT(recv(sv[0], &received, 1, 0) == 1);
+	TEST_ASSERT(received == sentinel);
+
+	close(sv[0]);
+	close(sv[1]);
+}
+
+static void test_worker_drops_disconnected_nonstream_job(void) {
+	server s = {0};
+	job j = {0};
+	int sv[2] = {-1, -1};
+	pthread_mutex_init(&s.call_history_mu, NULL);
+	ds4_call_history_init(&s.call_history);
+	request_init(&j.req, REQ_CHAT, 16);
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	if (sv[0] < 0 || sv[1] < 0) goto cleanup;
+	j.fd = sv[0];
+	j.call_request_id = ds4_call_history_begin(&s.call_history, "caller", NULL,
+		"openai", "chat", false, false, 1.0);
+
+	TEST_ASSERT(!server_drop_disconnected_queued_job(&s, &j));
+	TEST_ASSERT(s.call_history.len == 1);
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_ACTIVE);
+	TEST_ASSERT(shutdown(sv[1], SHUT_WR) == 0);
+	j.req.stream = true;
+	TEST_ASSERT(!server_job_cancel_cb(&j));
+	TEST_ASSERT(!server_drop_disconnected_queued_job(&s, &j));
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_ACTIVE);
+	j.req.stream = false;
+	TEST_ASSERT(server_job_cancel_cb(&j));
+	TEST_ASSERT(server_drop_disconnected_queued_job(&s, &j));
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_CANCELLED);
+	TEST_ASSERT(s.call_history.records[0].output_tokens == 0);
+	TEST_ASSERT(!strcmp(s.call_history.records[0].cache_source, "none"));
+	TEST_ASSERT(!strcmp(s.call_history.records[0].finish, "cancelled"));
+	TEST_ASSERT(!strcmp(s.call_history.records[0].error,
+		"client disconnected while queued"));
+	TEST_ASSERT(s.status.total_requests == 0);
+
+cleanup:
+	if (sv[0] >= 0) close(sv[0]);
+	if (sv[1] >= 0) close(sv[1]);
+	request_free(&j.req);
 	ds4_call_history_free(&s.call_history);
 	pthread_mutex_destroy(&s.call_history_mu);
 }
@@ -19761,16 +20180,22 @@ static void ds4_server_unit_tests_run(void) {
     test_dashboard_page_is_served_as_html();
     test_status_json_reports_idle_metrics_shape();
     test_status_json_reports_cache_totals_and_capacity();
+	test_cancelled_request_counts_separately();
+	test_cancelled_active_request_discards_live_state();
     test_call_history_capacity_keeps_active_calls();
 	test_call_history_never_exceeds_full_active_window();
     test_call_history_clamps_tokens_and_aggregates_failures();
+	test_call_history_tracks_cancelled_without_failure();
     test_call_history_keeps_clients_separate_per_caller();
     test_call_history_snapshot_owns_copies();
 	test_status_worker_active_call_is_not_newest_queued_call();
 	test_status_host_snapshot_does_not_wait_for_sampler();
 	test_status_host_cache_ttl_uses_monotonic_age();
 	test_status_external_timestamps_are_wall_clock();
-    test_call_history_marks_final_stream_write_failure();
+	test_call_history_marks_final_stream_write_failure();
+	test_distributed_result_wait_observes_cancellation();
+	test_nonstream_client_disconnect_probe_contract();
+	test_worker_drops_disconnected_nonstream_job();
     test_peer_caller_formats_direct_addresses();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
