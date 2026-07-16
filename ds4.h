@@ -226,9 +226,10 @@ void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
  * callers must not treat it as a durable KV checkpoint boundary. */
 void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
-/* Optional cooperative cancellation.  ds4_session_sync() checks it only at
- * safe boundaries where the live checkpoint is either unchanged or represents a
- * valid token prefix, and returns DS4_SESSION_SYNC_INTERRUPTED when it stops. */
+/* Optional cooperative cancellation.  ds4_session_sync() returns
+ * DS4_SESSION_SYNC_INTERRUPTED when it stops.  Single-machine paths either
+ * retain a valid prefix or invalidate it; interrupted distributed work always
+ * invalidates partial state so the next sync cannot expose stale logits or KV. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
 bool ds4_session_cancel_requested(ds4_session *s);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);

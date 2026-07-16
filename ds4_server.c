@@ -16029,9 +16029,31 @@ static void test_call_history_marks_final_stream_write_failure(void) {
 }
 
 extern int ds4_dist_test_cancelled_result_wait(void);
+extern int ds4_dist_test_control_fd_ownership(void);
+extern int ds4_dist_test_route_forget_ignores_replacement(void);
+extern int ds4_dist_test_stale_worker_wakes_owner(void);
+extern int ds4_dist_test_registration_ids_reach_route_plan(void);
+extern int ds4_dist_test_pipeline_interrupt_precedence(void);
+extern int ds4_dist_test_local_interrupt_mapping(void);
+extern int ds4_test_distributed_interrupt_invalidates_checkpoint(void);
+extern int ds4_test_distributed_failure_invalidates_checkpoint(void);
+extern int ds4_test_distributed_success_preserves_checkpoint(void);
+extern int ds4_test_layer_slice_observes_precancel(void);
+extern int ds4_test_layer_slice_cancel_policy(void);
 
 static void test_distributed_result_wait_observes_cancellation(void) {
 	TEST_ASSERT(ds4_dist_test_cancelled_result_wait() == 0);
+	TEST_ASSERT(ds4_dist_test_control_fd_ownership() == 0);
+	TEST_ASSERT(ds4_dist_test_route_forget_ignores_replacement() == 0);
+	TEST_ASSERT(ds4_dist_test_stale_worker_wakes_owner() == 0);
+	TEST_ASSERT(ds4_dist_test_registration_ids_reach_route_plan() == 0);
+	TEST_ASSERT(ds4_dist_test_pipeline_interrupt_precedence() == 0);
+	TEST_ASSERT(ds4_dist_test_local_interrupt_mapping() == 0);
+	TEST_ASSERT(ds4_test_distributed_interrupt_invalidates_checkpoint() == 0);
+	TEST_ASSERT(ds4_test_distributed_failure_invalidates_checkpoint() == 0);
+	TEST_ASSERT(ds4_test_distributed_success_preserves_checkpoint() == 0);
+	TEST_ASSERT(ds4_test_layer_slice_observes_precancel() == 0);
+	TEST_ASSERT(ds4_test_layer_slice_cancel_policy() == 0);
 }
 
 static void test_nonstream_client_disconnect_probe_contract(void) {

@@ -456,9 +456,10 @@ rebuild worker KV state by replaying the prefix when the route is available
 again. Workers also validate a rolling 64-bit token-prefix hash on every work
 item, so a restarted worker at position 0 cannot silently accept work for
 position N; it reports the mismatch and the coordinator replays the current
-transcript. Ctrl+C in the CLI and agent is cooperative: DwarfStar waits for the
-current distributed token or prefill chunk to drain before returning control,
-which avoids coordinator-caused KV splits. Saved agent/server sessions use the
+transcript. Ctrl+C in the CLI and agent is cooperative: distributed prefill
+checks between local layer groups and while waiting for remote results. If it
+stops mid-chunk, DwarfStar discards that partial route and rebuilds it on the
+next sync instead of exposing split KV state. Saved agent/server sessions use the
 same KV file format as single-machine sessions: during save the coordinator
 fetches worker-owned layer tensors and serializes one normal payload; during
 load it splits that payload over the currently registered route.
