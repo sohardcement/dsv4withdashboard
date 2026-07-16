@@ -14974,9 +14974,74 @@ static void test_start_server_context_precedence(void) {
 	TEST_ASSERT(strstr(out, "--ctx 262144") != NULL); free(out);
 	TEST_ASSERT(unlink(file) == 0);
 	out = test_start_server_dry_run();
-	TEST_ASSERT(strstr(out, "--ctx 204800") != NULL); free(out);
+	TEST_ASSERT(strstr(out, "--ctx 51200") != NULL); free(out);
 	rmdir(ds4dir); rmdir(root);
 cleanup:
+	test_env_restore(&dry_run);
+	test_env_restore(&model);
+	test_env_restore(&ctx);
+	test_env_restore(&ctx_file);
+	test_env_restore(&home);
+}
+
+static void test_start_server_performance_profiles(void) {
+	test_env_value home = {0}, ctx_file = {0}, ctx = {0}, model = {0};
+	test_env_value dry_run = {0}, profile = {0}, prefill_chunk = {0}, mtp_path = {0};
+	test_env_snapshot(&home, "HOME");
+	test_env_snapshot(&ctx_file, "DS4_CTX_FILE");
+	test_env_snapshot(&ctx, "DS4_CTX");
+	test_env_snapshot(&model, "DS4_MODEL");
+	test_env_snapshot(&dry_run, "DS4_DRY_RUN");
+	test_env_snapshot(&profile, "DS4_PROFILE");
+	test_env_snapshot(&prefill_chunk, "DS4_PREFILL_CHUNK");
+	test_env_snapshot(&mtp_path, "DS4_MTP_PATH");
+	char tmpl[] = "/tmp/ds4-performance-launcher.XXXXXX";
+	char *root = mkdtemp(tmpl);
+	TEST_ASSERT(root != NULL);
+	if (!root) goto cleanup;
+	TEST_ASSERT(setenv("HOME", root, 1) == 0);
+	TEST_ASSERT(unsetenv("DS4_CTX_FILE") == 0);
+	TEST_ASSERT(unsetenv("DS4_CTX") == 0);
+	TEST_ASSERT(setenv("DS4_MODEL", "", 1) == 0);
+	TEST_ASSERT(setenv("DS4_DRY_RUN", "1", 1) == 0);
+	TEST_ASSERT(unsetenv("DS4_PROFILE") == 0);
+	TEST_ASSERT(unsetenv("DS4_PREFILL_CHUNK") == 0);
+	TEST_ASSERT(unsetenv("DS4_MTP_PATH") == 0);
+
+	char *out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--ctx 51200") != NULL);
+	TEST_ASSERT(strstr(out, "--prefill-chunk 5120") != NULL);
+	TEST_ASSERT(strstr(out, "--mtp") == NULL);
+	free(out);
+
+	TEST_ASSERT(setenv("DS4_PROFILE", "greedy", 1) == 0);
+	out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--ctx 51200") != NULL);
+	TEST_ASSERT(strstr(out, "--prefill-chunk 5120") != NULL);
+	const char *default_mtp = "gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf";
+	if (access(default_mtp, F_OK) == 0) {
+		TEST_ASSERT(strstr(out, "--mtp gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf") != NULL);
+		TEST_ASSERT(strstr(out, "--mtp-draft 2") != NULL);
+	} else {
+		TEST_ASSERT(strstr(out, "--mtp") == NULL);
+	}
+	free(out);
+
+	TEST_ASSERT(setenv("DS4_MTP_PATH", "Makefile", 1) == 0);
+	out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--mtp Makefile") != NULL);
+	TEST_ASSERT(strstr(out, "--mtp-draft 2") != NULL);
+	free(out);
+
+	TEST_ASSERT(setenv("DS4_MTP_PATH", "", 1) == 0);
+	out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--mtp") == NULL);
+	free(out);
+	TEST_ASSERT(rmdir(root) == 0);
+cleanup:
+	test_env_restore(&mtp_path);
+	test_env_restore(&prefill_chunk);
+	test_env_restore(&profile);
 	test_env_restore(&dry_run);
 	test_env_restore(&model);
 	test_env_restore(&ctx);
@@ -19788,6 +19853,7 @@ static void ds4_server_unit_tests_run(void) {
 	test_kv_admin_actual_route_and_peer_auth();
 	test_context_admin_route_auth_and_active_context();
 	test_start_server_context_precedence();
+	test_start_server_performance_profiles();
 	test_context_admin_tests_preserve_environment();
 	test_kv_admin_rejects_headers_before_body();
 	test_http_content_length_framing_is_strict();
