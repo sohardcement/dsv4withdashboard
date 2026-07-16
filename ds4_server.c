@@ -12116,7 +12116,9 @@ decode_again:
 			prompt_tokens, completion);
     }
 	server_finalize_call_history(s, j, completion, cache_source, &final_finish,
-							 err, sizeof(err), response_ok);
+								 err, sizeof(err), response_ok);
+	if (!response_ok && !j->req.stream && !strcmp(final_finish, "cancelled"))
+		server_discard_cancelled_live_state(s);
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),

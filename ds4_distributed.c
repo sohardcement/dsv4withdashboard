@@ -3105,18 +3105,15 @@ static int dist_coordinator_rebuild_from_transcript(
         if (!dist_coordinator_ensure_route(state, plan, &generation, err, errlen)) return 1;
         if (plan_generation) *plan_generation = generation;
     }
-    if (dist_coordinator_prefill_prompt(state,
-                                        session,
-                                        plan,
-                                        transcript,
-                                        session_id,
-                                        request_id,
-                                        logits,
-                                        err,
-                                        errlen) != 0) {
-        return 1;
-    }
-    return 0;
+    return dist_coordinator_prefill_prompt(state,
+                                           session,
+                                           plan,
+                                           transcript,
+                                           session_id,
+                                           request_id,
+                                           logits,
+                                           err,
+                                           errlen);
 }
 
 static int dist_write_logprobs_dump(
@@ -5689,19 +5686,24 @@ int ds4_dist_session_sync(
                     dist_session_drop_route(d);
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
-                if (dist_coordinator_rebuild_from_transcript(&d->state,
-                                                             owner,
-                                                             &d->plan,
-                                                             prompt,
-                                                             d->session_id,
-                                                             &d->request_id,
-                                                             logits,
-                                                             &d->plan_generation,
-                                                             prefill_rc != DS4_DIST_RECV_REMOTE_ERROR,
-                                                             err,
-                                                             errlen) != 0) {
+                int rebuild_rc = dist_coordinator_rebuild_from_transcript(&d->state,
+                                                                          owner,
+                                                                          &d->plan,
+                                                                          prompt,
+                                                                          d->session_id,
+                                                                          &d->request_id,
+                                                                          logits,
+                                                                          &d->plan_generation,
+                                                                          prefill_rc != DS4_DIST_RECV_REMOTE_ERROR,
+                                                                          err,
+                                                                          errlen);
+                if (rebuild_rc != 0) {
                     d->plan_ready = false;
                     d->plan_generation = 0;
+                    if (rebuild_rc == DS4_DIST_RECV_INTERRUPTED) {
+                        dist_session_drop_route(d);
+                        return DS4_SESSION_SYNC_INTERRUPTED;
+                    }
                     return 1;
                 }
                 d->plan_ready = true;
@@ -5730,19 +5732,24 @@ int ds4_dist_session_sync(
                     dist_session_drop_route(d);
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
-                if (dist_coordinator_rebuild_from_transcript(&d->state,
-                                                             owner,
-                                                             &d->plan,
-                                                             prompt,
-                                                             d->session_id,
-                                                             &d->request_id,
-                                                             logits,
-                                                             &d->plan_generation,
-                                                             eval_rc != DS4_DIST_RECV_REMOTE_ERROR,
-                                                             err,
-                                                             errlen) != 0) {
+                int rebuild_rc = dist_coordinator_rebuild_from_transcript(&d->state,
+                                                                          owner,
+                                                                          &d->plan,
+                                                                          prompt,
+                                                                          d->session_id,
+                                                                          &d->request_id,
+                                                                          logits,
+                                                                          &d->plan_generation,
+                                                                          eval_rc != DS4_DIST_RECV_REMOTE_ERROR,
+                                                                          err,
+                                                                          errlen);
+                if (rebuild_rc != 0) {
                     d->plan_ready = false;
                     d->plan_generation = 0;
+                    if (rebuild_rc == DS4_DIST_RECV_INTERRUPTED) {
+                        dist_session_drop_route(d);
+                        return DS4_SESSION_SYNC_INTERRUPTED;
+                    }
                     return 1;
                 }
                 d->plan_ready = true;
@@ -5768,19 +5775,24 @@ int ds4_dist_session_sync(
             dist_session_drop_route(d);
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
-        if (dist_coordinator_rebuild_from_transcript(&d->state,
-                                                     owner,
-                                                     &d->plan,
-                                                     prompt,
-                                                     d->session_id,
-                                                     &d->request_id,
-                                                     logits,
-                                                     &d->plan_generation,
-                                                     prefill_rc != DS4_DIST_RECV_REMOTE_ERROR,
-                                                     err,
-                                                     errlen) != 0) {
+        int rebuild_rc = dist_coordinator_rebuild_from_transcript(&d->state,
+                                                                  owner,
+                                                                  &d->plan,
+                                                                  prompt,
+                                                                  d->session_id,
+                                                                  &d->request_id,
+                                                                  logits,
+                                                                  &d->plan_generation,
+                                                                  prefill_rc != DS4_DIST_RECV_REMOTE_ERROR,
+                                                                  err,
+                                                                  errlen);
+        if (rebuild_rc != 0) {
             d->plan_ready = false;
             d->plan_generation = 0;
+            if (rebuild_rc == DS4_DIST_RECV_INTERRUPTED) {
+                dist_session_drop_route(d);
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
             return 1;
         }
         d->plan_ready = true;
@@ -5824,20 +5836,25 @@ int ds4_dist_session_eval(
             ds4_tokens_free(&transcript);
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
-        if (dist_coordinator_rebuild_from_transcript(&d->state,
-                                                     owner,
-                                                     &d->plan,
-                                                     &transcript,
-                                                     d->session_id,
-                                                     &d->request_id,
-                                                     logits,
-                                                     &d->plan_generation,
-                                                     rc != DS4_DIST_RECV_REMOTE_ERROR,
-                                                     err,
-                                                     errlen) != 0) {
+        int rebuild_rc = dist_coordinator_rebuild_from_transcript(&d->state,
+                                                                  owner,
+                                                                  &d->plan,
+                                                                  &transcript,
+                                                                  d->session_id,
+                                                                  &d->request_id,
+                                                                  logits,
+                                                                  &d->plan_generation,
+                                                                  rc != DS4_DIST_RECV_REMOTE_ERROR,
+                                                                  err,
+                                                                  errlen);
+        if (rebuild_rc != 0) {
             d->plan_ready = false;
             d->plan_generation = 0;
             ds4_tokens_free(&transcript);
+            if (rebuild_rc == DS4_DIST_RECV_INTERRUPTED) {
+                dist_session_drop_route(d);
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
             return 1;
         }
         d->plan_ready = true;

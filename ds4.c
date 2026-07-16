@@ -20907,6 +20907,24 @@ static bool metal_graph_prefill_layer_major(
     return ok;
 }
 
+static bool metal_graph_prefill_chunked_range(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               start,
+        uint32_t               n_tokens,
+        float                 *logits,
+        bool                   show_progress,
+        ds4_session_progress_fn progress,
+        void                  *progress_ud,
+        ds4_session_progress_fn display_progress,
+        void                  *display_progress_ud,
+        ds4_imatrix_collector *imatrix,
+        ds4_session_cancel_fn  cancel,
+        void                  *cancel_ud,
+        bool                  *cancelled);
+
 static bool metal_graph_prefill_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -20939,6 +20957,24 @@ static bool metal_graph_prefill_raw_swa(
                                                           cancel,
                                                           cancel_ud,
                                                           cancelled);
+    }
+    if (cancel) {
+        return metal_graph_prefill_chunked_range(g,
+                                                 model,
+                                                 weights,
+                                                 prompt,
+                                                 0,
+                                                 (uint32_t)n_tokens,
+                                                 logits,
+                                                 show_progress,
+                                                 NULL,
+                                                 NULL,
+                                                 display_progress,
+                                                 display_progress_ud,
+                                                 NULL,
+                                                 cancel,
+                                                 cancel_ud,
+                                                 cancelled);
     }
     /* The layer-major fallback below may submit the whole short prefill as one
      * Metal command buffer.  Once that command is in flight there is no useful
@@ -21013,6 +21049,10 @@ static bool metal_graph_prefill_chunked_range(
     }
 
     uint32_t chunk_cap = g->prefill_cap;
+    if (cancel && chunk_cap > 1) {
+        const uint32_t cancel_cap = g->raw_cap != 0 ? g->raw_cap : 256u;
+        if (chunk_cap > cancel_cap) chunk_cap = cancel_cap;
+    }
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
 
