@@ -7923,14 +7923,22 @@ static void server_finish_cancelled_active(server *s, const job *j,
 
 static bool server_client_disconnected(int fd) {
 	if (fd < 0) return true;
-	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	struct pollfd pfd = { .fd = fd, .events = POLLIN
+#ifdef POLLRDHUP
+			| POLLRDHUP
+#endif
+	};
 	int rc;
 	do {
 		rc = poll(&pfd, 1, 0);
 	} while (rc < 0 && errno == EINTR);
 	if (rc == 0) return false;
 	if (rc < 0 || (pfd.revents & (POLLERR | POLLNVAL))) return true;
-	if (pfd.revents & (POLLIN | POLLHUP)) {
+#ifdef POLLRDHUP
+	if (pfd.revents & POLLRDHUP) return true;
+#endif
+	if (pfd.revents & POLLHUP) return true;
+	if (pfd.revents & POLLIN) {
 		char byte;
 		ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
 		if (n == 0) return true;
@@ -16013,6 +16021,12 @@ static void test_call_history_marks_final_stream_write_failure(void) {
 	pthread_mutex_destroy(&s.call_history_mu);
 }
 
+extern int ds4_dist_test_cancelled_result_wait(void);
+
+static void test_distributed_result_wait_observes_cancellation(void) {
+	TEST_ASSERT(ds4_dist_test_cancelled_result_wait() == 0);
+}
+
 static void test_nonstream_client_disconnect_probe_contract(void) {
 	int sv[2] = {-1, -1};
 	int rc = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
@@ -16034,6 +16048,15 @@ static void test_nonstream_client_disconnect_probe_contract(void) {
 	 * is consumed, peer EOF (including SHUT_WR) means that request was abandoned. */
 	TEST_ASSERT(shutdown(sv[1], SHUT_WR) == 0);
 	TEST_ASSERT(server_client_disconnected(sv[0]));
+
+	close(sv[0]);
+	close(sv[1]);
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	TEST_ASSERT(send(sv[1], &sentinel, 1, 0) == 1);
+	TEST_ASSERT(shutdown(sv[1], SHUT_WR) == 0);
+	TEST_ASSERT(server_client_disconnected(sv[0]));
+	TEST_ASSERT(recv(sv[0], &received, 1, 0) == 1);
+	TEST_ASSERT(received == sentinel);
 
 	close(sv[0]);
 	close(sv[1]);
@@ -20163,6 +20186,7 @@ static void ds4_server_unit_tests_run(void) {
 	test_status_host_cache_ttl_uses_monotonic_age();
 	test_status_external_timestamps_are_wall_clock();
 	test_call_history_marks_final_stream_write_failure();
+	test_distributed_result_wait_observes_cancellation();
 	test_nonstream_client_disconnect_probe_contract();
 	test_worker_drops_disconnected_nonstream_job();
     test_peer_caller_formats_direct_addresses();

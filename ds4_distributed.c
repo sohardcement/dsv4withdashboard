@@ -67,6 +67,7 @@
 #define DS4_DIST_ROUTE_RETURN_UPSTREAM 1u
 #define DS4_DIST_RECV_TRANSPORT_ERROR 1
 #define DS4_DIST_RECV_REMOTE_ERROR 2
+#define DS4_DIST_RECV_INTERRUPTED 3
 #define DS4_DIST_SNAPSHOT_CHUNK_BYTES (8u * 1024u * 1024u)
 
 typedef struct {
@@ -1135,6 +1136,97 @@ static int dist_write_frame_header(int fd, uint32_t type, uint32_t bytes) {
     };
     return dist_write_full(fd, &h, sizeof(h));
 }
+static bool dist_session_cancel_requested(void *session) {
+    return session && ds4_session_cancel_requested((ds4_session *)session);
+}
+
+static int dist_read_full_cancelled(int fd, void *buf, size_t len, bool (*cancel)(void *), void *cancel_ud) {
+    unsigned char *p = buf;
+    while (len > 0) {
+        if (cancel && cancel(cancel_ud)) return DS4_DIST_RECV_INTERRUPTED;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int prc;
+        do {
+            prc = poll(&pfd, 1, 100);
+        } while (prc < 0 && errno == EINTR);
+        if (prc < 0) return -1;
+        if (prc == 0) continue;
+        if (pfd.revents & (POLLERR | POLLNVAL)) return -1;
+        if (!(pfd.revents & POLLIN)) {
+            if (pfd.revents & POLLHUP) return 0;
+            continue;
+        }
+        ssize_t n = recv(fd, p, len, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return -1;
+        }
+        if (n == 0) return 0;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 1;
+}
+
+static int dist_read_frame_header_cancelled(int fd, uint32_t *type, uint32_t *bytes, bool (*cancel)(void *), void *cancel_ud, char *err, size_t errlen) {
+    ds4_dist_frame_header h;
+    int rc = dist_read_full_cancelled(fd, &h, sizeof(h), cancel, cancel_ud);
+    if (rc == DS4_DIST_RECV_INTERRUPTED) {
+        if (errlen) snprintf(err, errlen, "interrupted");
+        return rc;
+    }
+    if (rc < 0 && errlen) snprintf(err, errlen, "failed to read frame header: %s", strerror(errno));
+    if (rc <= 0) return rc;
+
+    uint32_t magic = ntohl(h.magic);
+    if (magic != DS4_DIST_MAGIC) {
+        if (errlen) snprintf(err, errlen, "bad frame magic 0x%08x", magic);
+        return -1;
+    }
+
+    *type = ntohl(h.type);
+    *bytes = ntohl(h.bytes);
+    return 1;
+}
+
+static int dist_discard_bytes_cancelled(int fd, uint32_t bytes, bool (*cancel)(void *), void *cancel_ud);
+
+static bool dist_test_cancel_after_poll(void *ud) {
+    int *checks = ud;
+    (*checks)++;
+    return *checks > 1;
+}
+
+int ds4_dist_test_cancelled_result_wait(void) {
+    if (DS4_DIST_RECV_INTERRUPTED == DS4_DIST_RECV_REMOTE_ERROR) return 1;
+    int sv[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 1;
+    char buf[sizeof(ds4_dist_frame_header)];
+    int checks = 0;
+    int rc = dist_discard_bytes_cancelled(sv[0], (uint32_t)sizeof(buf), dist_test_cancel_after_poll, &checks);
+    close(sv[0]);
+    close(sv[1]);
+    if (rc != DS4_DIST_RECV_INTERRUPTED || checks < 2) return 1;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 1;
+    memset(buf, 0x5a, sizeof(buf));
+    if (send(sv[1], buf, sizeof(buf), 0) != (ssize_t)sizeof(buf) ||
+        shutdown(sv[1], SHUT_WR) != 0) {
+        close(sv[0]);
+        close(sv[1]);
+        return 1;
+    }
+    memset(buf, 0, sizeof(buf));
+    rc = dist_read_full_cancelled(sv[0], buf, sizeof(buf), NULL, NULL);
+    close(sv[0]);
+    close(sv[1]);
+    if (rc != 1) return 1;
+    for (size_t i = 0; i < sizeof(buf); i++) {
+        if ((unsigned char)buf[i] != 0x5a) return 1;
+    }
+    return 0;
+}
 
 static int dist_read_frame_header(int fd, uint32_t *type, uint32_t *bytes, char *err, size_t errlen) {
     ds4_dist_frame_header h;
@@ -1158,6 +1250,18 @@ static int dist_discard_bytes(int fd, uint32_t bytes) {
     while (bytes > 0) {
         size_t n = bytes < sizeof(buf) ? bytes : sizeof(buf);
         int rc = dist_read_full(fd, buf, n);
+        if (rc <= 0) return rc == 0 ? 0 : -1;
+        bytes -= (uint32_t)n;
+    }
+    return 1;
+}
+
+static int dist_discard_bytes_cancelled(int fd, uint32_t bytes, bool (*cancel)(void *), void *cancel_ud) {
+    unsigned char buf[4096];
+    while (bytes > 0) {
+        size_t n = bytes < sizeof(buf) ? bytes : sizeof(buf);
+        int rc = dist_read_full_cancelled(fd, buf, n, cancel, cancel_ud);
+        if (rc == DS4_DIST_RECV_INTERRUPTED) return rc;
         if (rc <= 0) return rc == 0 ? 0 : -1;
         bytes -= (uint32_t)n;
     }
@@ -2344,6 +2448,7 @@ static uint64_t dist_coordinator_generation(ds4_dist_coordinator_state *state) {
 static int dist_recv_result_alloc(
         int fd,
         const ds4_dist_coordinator_state *state,
+        ds4_session *session,
         uint64_t request_id,
         uint32_t *kind,
         uint64_t *result_hash,
@@ -2357,19 +2462,25 @@ static int dist_recv_result_alloc(
     if (result_hash) *result_hash = 0;
 
     uint32_t type = 0, bytes = 0;
-    int rc = dist_read_frame_header(fd, &type, &bytes, err, errlen);
+    int rc = dist_read_frame_header_cancelled(fd, &type, &bytes, dist_session_cancel_requested, session, err, errlen);
+    if (rc == DS4_DIST_RECV_INTERRUPTED) return rc;
     if (rc <= 0) {
         if (rc == 0 && errlen) snprintf(err, errlen, "distributed worker closed connection");
         return 1;
     }
     if (type != DS4_DIST_MSG_RESULT || bytes < sizeof(ds4_dist_result_fixed)) {
-        dist_discard_bytes(fd, bytes);
+        rc = dist_discard_bytes_cancelled(fd, bytes, dist_session_cancel_requested, session);
+        if (rc == DS4_DIST_RECV_INTERRUPTED) return rc;
         if (errlen) snprintf(err, errlen, "distributed worker returned invalid frame");
         return 1;
     }
 
     ds4_dist_result_fixed result;
-    rc = dist_read_full(fd, &result, sizeof(result));
+    rc = dist_read_full_cancelled(fd, &result, sizeof(result), dist_session_cancel_requested, session);
+    if (rc == DS4_DIST_RECV_INTERRUPTED) {
+        if (errlen) snprintf(err, errlen, "interrupted");
+        return rc;
+    }
     if (rc <= 0) {
         if (errlen) snprintf(err, errlen, "failed to read distributed result");
         return 1;
@@ -2383,12 +2494,14 @@ static int dist_recv_result_alloc(
         result.telemetry_count != result.telemetry_bytes / (uint32_t)sizeof(ds4_dist_telemetry_fixed) ||
         result.telemetry_bytes > body_bytes ||
         result.payload_bytes != body_bytes - result.telemetry_bytes) {
-        dist_discard_bytes(fd, body_bytes);
+        rc = dist_discard_bytes_cancelled(fd, body_bytes, dist_session_cancel_requested, session);
+        if (rc == DS4_DIST_RECV_INTERRUPTED) return rc;
         if (errlen) snprintf(err, errlen, "distributed result telemetry metadata mismatch");
         return 1;
     }
     if (got_request != request_id) {
-        dist_discard_bytes(fd, bytes - (uint32_t)sizeof(result));
+        rc = dist_discard_bytes_cancelled(fd, bytes - (uint32_t)sizeof(result), dist_session_cancel_requested, session);
+        if (rc == DS4_DIST_RECV_INTERRUPTED) return rc;
         if (errlen) snprintf(err, errlen, "distributed result metadata mismatch");
         return 1;
     }
@@ -2397,11 +2510,17 @@ static int dist_recv_result_alloc(
         if (dist_coordinator_debug_enabled(state)) {
             ds4_dist_telemetry_fixed *telemetry = malloc(result.telemetry_bytes);
             if (!telemetry) {
-                dist_discard_bytes(fd, result.telemetry_bytes);
+                rc = dist_discard_bytes_cancelled(fd, result.telemetry_bytes, dist_session_cancel_requested, session);
+                if (rc == DS4_DIST_RECV_INTERRUPTED) return rc;
                 if (errlen) snprintf(err, errlen, "out of memory reading distributed telemetry");
                 return 1;
             }
-            rc = dist_read_full(fd, telemetry, result.telemetry_bytes);
+            rc = dist_read_full_cancelled(fd, telemetry, result.telemetry_bytes, dist_session_cancel_requested, session);
+            if (rc == DS4_DIST_RECV_INTERRUPTED) {
+                free(telemetry);
+                if (errlen) snprintf(err, errlen, "interrupted");
+                return rc;
+            }
             if (rc <= 0) {
                 free(telemetry);
                 if (errlen) snprintf(err, errlen, "failed to read distributed result telemetry");
@@ -2425,9 +2544,16 @@ static int dist_recv_result_alloc(
                                  (double)telemetry[i].output_bytes / (1024.0 * 1024.0));
             }
             free(telemetry);
-        } else if (dist_discard_bytes(fd, result.telemetry_bytes) <= 0) {
-            if (errlen) snprintf(err, errlen, "failed to read distributed result telemetry");
-            return 1;
+        } else {
+            rc = dist_discard_bytes_cancelled(fd, result.telemetry_bytes, dist_session_cancel_requested, session);
+            if (rc == DS4_DIST_RECV_INTERRUPTED) {
+                if (errlen) snprintf(err, errlen, "interrupted");
+                return rc;
+            }
+            if (rc <= 0) {
+                if (errlen) snprintf(err, errlen, "failed to read distributed result telemetry");
+                return 1;
+            }
         }
     }
 
@@ -2435,11 +2561,17 @@ static int dist_recv_result_alloc(
     if (result.payload_bytes != 0) {
         buf = malloc(result.payload_bytes);
         if (!buf) {
-            dist_discard_bytes(fd, result.payload_bytes);
+            rc = dist_discard_bytes_cancelled(fd, result.payload_bytes, dist_session_cancel_requested, session);
+            if (rc == DS4_DIST_RECV_INTERRUPTED) return rc;
             if (errlen) snprintf(err, errlen, "out of memory reading distributed result");
             return 1;
         }
-        rc = dist_read_full(fd, buf, result.payload_bytes);
+        rc = dist_read_full_cancelled(fd, buf, result.payload_bytes, dist_session_cancel_requested, session);
+        if (rc == DS4_DIST_RECV_INTERRUPTED) {
+            free(buf);
+            if (errlen) snprintf(err, errlen, "interrupted");
+            return rc;
+        }
         if (rc <= 0) {
             free(buf);
             if (errlen) snprintf(err, errlen, "failed to read distributed result payload");
@@ -2596,6 +2728,7 @@ static int dist_coordinator_eval_remote_on_fd(
         const double recv_t0 = profile ? dist_now_sec() : 0.0;
         rc = dist_recv_result_alloc(fd,
                                     state,
+                                    session,
                                     request_id,
                                     &kind,
                                     &result_hash,
@@ -3358,6 +3491,7 @@ static void *dist_prefill_result_reader_main(void *arg) {
         void *payload = NULL;
         int recv_rc = dist_recv_result_alloc(reader->fd,
                                              reader->state,
+                                             reader->progress_session,
                                              request_id,
                                              &kind,
                                              &result_hash,
@@ -3749,7 +3883,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
     pthread_mutex_destroy(&reader.progress_mu);
     if (rc != 0) {
         free(reader.final_payload);
-        return 1;
+        return rc == DS4_DIST_RECV_INTERRUPTED ? DS4_DIST_RECV_INTERRUPTED : 1;
     }
     const uint32_t logits_bytes =
         (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
@@ -5543,6 +5677,7 @@ int ds4_dist_session_sync(
                                                                        err,
                                                                        errlen);
             if (prefill_rc != 0) {
+                if (prefill_rc == DS4_DIST_RECV_INTERRUPTED) return DS4_SESSION_SYNC_INTERRUPTED;
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5580,6 +5715,7 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
             if (eval_rc != 0) {
+                if (eval_rc == DS4_DIST_RECV_INTERRUPTED) return DS4_SESSION_SYNC_INTERRUPTED;
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5614,6 +5750,7 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
     if (prefill_rc != 0) {
+        if (prefill_rc == DS4_DIST_RECV_INTERRUPTED) return DS4_SESSION_SYNC_INTERRUPTED;
         if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -5665,6 +5802,10 @@ int ds4_dist_session_eval(
                                         err,
                                         errlen);
     if (rc != 0) {
+        if (rc == DS4_DIST_RECV_INTERRUPTED) {
+            ds4_tokens_free(&transcript);
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
         if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                      owner,
                                                      &d->plan,

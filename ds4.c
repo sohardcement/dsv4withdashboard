@@ -26181,8 +26181,12 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
     s->cancel_ud = ud;
 }
 
-static bool ds4_session_cancelled(ds4_session *s) {
+bool ds4_session_cancel_requested(ds4_session *s) {
     return s && s->cancel && s->cancel(s->cancel_ud);
+}
+
+static bool ds4_session_cancelled(ds4_session *s) {
+    return ds4_session_cancel_requested(s);
 }
 
 static bool ds4_session_cancelled_cb(void *ud) {
