@@ -17,21 +17,30 @@ Use `./start-server.sh` with the default `DS4_PROFILE=agent`:
 Important defaults:
 
 ```text
---model ds4flash.gguf
---ctx 204800
+--model /Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF/Huihui-DeepSeek-V4-Flash-BF16-abliterated-ds4-Q2.gguf
+--ctx 51200
 --kv-disk-dir ~/.ds4/server-kv
---kv-disk-space-mb 81920
+--kv-disk-space-mb 163840
 --kv-cache-cold-max-tokens 98304
---kv-cache-continued-interval-tokens 4096
+--kv-cache-continued-interval-tokens 2048
 --kv-cache-boundary-trim-tokens 64
 --kv-cache-boundary-align-tokens 2048
 --tool-memory-max-ids 200000
---prefill-chunk 4096
---mtp gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
---mtp-draft 4
---mtp-margin 3.0
+--prefill-chunk 5120
 --trace /tmp/ds4-trace.jsonl
 ```
+
+The table shows profile defaults. A valid saved dashboard context or disk-KV
+capacity still overrides the corresponding profile value according to the
+precedence rules below.
+
+The 51200 context default is a capacity and memory-headroom choice, not a claim
+that a smaller allocation makes short prompts compute faster. In a same-process
+M3 Max check with 2048 fixed prefill tokens, 128 fixed decode tokens, and a 5120
+prefill chunk, 51200 and 200000 allocations had no consistent throughput
+difference beyond run-to-run noise. Their context buffers were 1355.75 MiB and
+3975.90 MiB respectively, so the larger allocation reserved about 2.56 GiB more
+before any benefit from the extra capacity was needed.
 
 ## Dashboard Capacity Controls
 
@@ -105,19 +114,19 @@ It is not suitable for remote administration.
 
 ## Model Choice
 
-The default `ds4flash.gguf` symlink should remain explicit in `start-server.sh`
-so tuning results always identify the main model being served. On this machine it
-points at:
+The launcher intentionally defaults to the locally downloaded Huihui
+abliterated Q2 model on this machine:
 
 ```text
-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf
+/Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF/Huihui-DeepSeek-V4-Flash-BF16-abliterated-ds4-Q2.gguf
 ```
 
-That is already the 2-bit/IQ2XXS Flash GGUF from
-[`antirez/deepseek-v4-gguf`](https://huggingface.co/antirez/deepseek-v4-gguf).
-The same repository also publishes the optional
-`DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` speculative-decoding model used by the
-agent profile.
+It uses the DS4-specific mixed Q2 layout derived from the
+[`antirez/deepseek-v4-gguf`](https://huggingface.co/antirez/deepseek-v4-gguf)
+template. The repository model remains available through `ds4flash.gguf` for
+reference benchmarks. The optional
+`DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` support model used by the `greedy`
+profile is stored under `gguf/`.
 
 [`deepseek-ai/DeepSeek-V4-Flash-DSpark`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark)
 is not a drop-in GGUF replacement for `ds4-server`; its files are safetensors
@@ -137,24 +146,29 @@ loads that sidecar automatically so saved metrics retain the startup profile
 even when summarized from a different shell. The snapshot also records
 `started_at`, `cwd`, and the full `command_line` for traceability.
 
-The 4096 continued interval is intentional. Agent traces showed repeated
-`first_mismatch_token` values around 5k-9k tokens. With the old 10000 interval,
-the aligned checkpoint step was 10240, so disk KV checkpoints landed after the
-dynamic skill/system block divergence and could not help. A 4096 interval leaves
-a reusable checkpoint before both 5k and 9k divergence points, while keeping file
-count manageable under the 80 GiB cache budget.
+The 2048 continued interval retains the cache-coverage choice from the local
+agent sweep. The 5120 Metal prefill chunk is a separate raw-throughput choice;
+prefill boundaries can coalesce actual checkpoint writes, so re-evaluate the
+frontier list after representative traffic rather than assuming every interval
+becomes a file.
 
-The MTP options are enabled only when the local MTP GGUF exists. They target
-decode throughput; they do not fix prompt prefill misses. Disable them with:
+The default `agent` profile does not load MTP: server speculation is used only
+for temperature-zero generation, while normal agent traffic is predominantly
+sampled. Use the `greedy` profile for deterministic generation:
 
 ```sh
-DS4_MTP_PATH= ./start-server.sh
+DS4_PROFILE=greedy ./start-server.sh
 ```
+
+This adds `--mtp ... --mtp-draft 2 --mtp-margin 3.0` when the local support GGUF
+exists. `DS4_MTP_PATH` remains authoritative: set it explicitly to enable MTP
+for another profile, or set it empty to disable MTP for `greedy`.
 
 For short measurement runs, enable MTP stderr metrics and capture the server log:
 
 ```sh
-DS4_MTP_METRICS=1 DS4_SERVER_LOG=/tmp/ds4-server.log ./start-server.sh
+DS4_PROFILE=greedy DS4_MTP_METRICS=1 \
+  DS4_SERVER_LOG=/tmp/ds4-server.log ./start-server.sh
 ```
 
 This exports `DS4_MTP_TIMING=1` and `DS4_MTP_CONF_LOG=1` for the server process
@@ -468,8 +482,9 @@ matrix. Keep this narrow; every extra dimension restarts the full model:
 This is useful only after the interval-only run shows that `2048` and `4096` are
 close. The matrix answers whether smaller prefill chunks or tighter boundary
 alignment improve reuse before the common 5k-9k agent-prompt divergence. The
-default remains `prefill_chunk=4096` and `boundary_align=2048` because that keeps
-cache files and scheduler overhead bounded. Candidate filenames include
+current performance profile uses `prefill_chunk=5120` and
+`boundary_align=2048`; retain 4096 as the control in future sweeps. Candidate
+filenames include
 `chunk-*` and `align-*` only when those dimensions have multiple values, so the
 old interval-only result names stay stable.
 
