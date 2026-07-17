@@ -28015,6 +28015,9 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        s->logits[i] = DS4_NEG_INF;
+    }
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
