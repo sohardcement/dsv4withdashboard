@@ -26918,6 +26918,30 @@ int ds4_test_distributed_failure_invalidates_checkpoint(void) {
     return rc == 1 && invalidated ? 0 : 1;
 }
 
+int ds4_test_distributed_failure_invalidates_logits(void) {
+    ds4_session session = {0};
+    const size_t bytes = (size_t)DS4_N_VOCAB * sizeof(float);
+    session.logits = malloc(bytes);
+    float *copied = malloc(bytes);
+    if (!session.logits || !copied) {
+        free(session.logits);
+        free(copied);
+        return 1;
+    }
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) session.logits[i] = (float)i;
+
+    const int rc = ds4_session_finish_distributed_call(&session, 1);
+    const int copied_n = ds4_session_copy_logits(&session, copied, DS4_N_VOCAB);
+    bool invalidated = copied_n == (int)DS4_N_VOCAB;
+    for (uint32_t i = 0; invalidated && i < DS4_N_VOCAB; i++) {
+        invalidated = copied[i] == DS4_NEG_INF;
+    }
+
+    free(session.logits);
+    free(copied);
+    return rc == 1 && invalidated ? 0 : 1;
+}
+
 int ds4_test_distributed_success_preserves_checkpoint(void) {
     ds4_session session = {0};
     token_vec_push(&session.checkpoint, 7);

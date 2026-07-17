@@ -13,4 +13,5 @@
 
 - 修复 coordinator 在路由失败或 worker 重连时错误关闭、移除新控制连接，以及注册日志可能解引用已释放 worker 的并发问题。
 - 修复 pipelined prefill 将取消覆盖成传输错误，以及分布式普通失败后残留 checkpoint 可能暴露旧 logits/KV 的问题。
-- 增加控制连接所有权、重连代际、取消优先级、checkpoint 失效和后端取消策略的回归测试。
+- 修复取消 pipeline 时将健康 worker 的控制连接一并关闭，导致下一次请求短暂缺少完整 route 的问题。
+- 增加控制连接所有权、work/control 连接隔离、重连代际、取消优先级、logits/checkpoint 失效和后端取消策略的回归测试。

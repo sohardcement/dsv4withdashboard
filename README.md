@@ -458,8 +458,10 @@ item, so a restarted worker at position 0 cannot silently accept work for
 position N; it reports the mismatch and the coordinator replays the current
 transcript. Ctrl+C in the CLI and agent is cooperative: distributed prefill
 checks between local layer groups and while waiting for remote results. If it
-stops mid-chunk, DwarfStar discards that partial route and rebuilds it on the
-next sync instead of exposing split KV state. Saved agent/server sessions use the
+stops mid-chunk, DwarfStar discards that session's partial route and isolated
+work connection while retaining healthy worker registrations. The next sync
+opens a fresh work connection and rebuilds KV state instead of exposing split
+state. Saved agent/server sessions use the
 same KV file format as single-machine sessions: during save the coordinator
 fetches worker-owned layer tensors and serializes one normal payload; during
 load it splits that payload over the currently registered route.

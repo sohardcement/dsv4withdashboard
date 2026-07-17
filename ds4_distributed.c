@@ -235,7 +235,7 @@ typedef struct {
     bool local_can_output_head;
     bool replay_check;
     bool debug;
-    bool use_control_for_work;
+    bool use_dedicated_work_connection;
     uint32_t prefill_chunk;
     uint32_t prefill_window;
     uint32_t activation_bits;
@@ -2600,18 +2600,6 @@ static bool dist_coordinator_build_route_plan(
         entry.layer_end = w->layer_end;
         entry.flags = w->has_output ? DS4_DIST_ROUTE_F_OUTPUT_LOGITS : 0u;
         entry.registration_id = w->registration_id;
-        if (state->use_control_for_work && plan->count == 0) {
-            entry.fd = dup(w->fd);
-            if (entry.fd < 0) {
-                pthread_mutex_unlock(&state->mu);
-                free(workers);
-                free(path);
-                dist_route_plan_free(plan);
-                if (errlen) snprintf(err, errlen, "failed to duplicate first-hop worker connection: %s", strerror(errno));
-                return false;
-            }
-            dist_set_socket_low_latency(entry.fd);
-        }
 
         ds4_dist_route_entry *new_entries = realloc(plan->entry, (size_t)(plan->count + 1u) * sizeof(plan->entry[0]));
         if (!new_entries) {
@@ -2658,7 +2646,36 @@ static bool dist_coordinator_ensure_route(
         uint64_t *generation,
         char *err,
         size_t errlen) {
-    return dist_coordinator_build_route_plan(state, plan, generation, err, errlen);
+    if (!dist_coordinator_build_route_plan(state, plan, generation, err, errlen)) {
+        return false;
+    }
+    if (!state->use_dedicated_work_connection || plan->count == 0) return true;
+
+    /* Keep registration/control ownership independent from cancellable work.
+     * Pipeline cleanup may shutdown this data connection without forcing a
+     * healthy worker to deregister and reconnect. */
+    ds4_dist_route_entry *first = &plan->entry[0];
+    first->fd = dist_connect_endpoint(first->host, (int)first->port, err, errlen);
+    if (first->fd < 0) {
+        dist_route_plan_free(plan);
+        return false;
+    }
+
+    bool still_registered = false;
+    pthread_mutex_lock(&state->mu);
+    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) {
+        if (dist_route_entry_matches_worker(first, it)) {
+            still_registered = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&state->mu);
+    if (still_registered) return true;
+
+    if (errlen) snprintf(err, errlen,
+                         "first-hop worker changed while opening work connection");
+    dist_route_plan_free(plan);
+    return false;
 }
 
 static uint64_t dist_coordinator_generation(ds4_dist_coordinator_state *state) {
@@ -4641,7 +4658,7 @@ static void *dist_coordinator_client_main(void *arg) {
 
     dist_coordinator_add_worker(state, fd, peer_host, peer_port, &hello, model_name);
 
-    if (state->use_control_for_work) {
+    if (state->use_dedicated_work_connection) {
         dist_coordinator_monitor_worker_fd(state, fd, peer_host, peer_port);
     } else {
         for (;;) {
@@ -4737,12 +4754,112 @@ static int dist_session_ensure_route(ds4_dist_session *d, char *err, size_t errl
     return 0;
 }
 
-static void dist_session_drop_route(ds4_dist_session *d) {
+static void dist_session_discard_route(ds4_dist_session *d) {
     if (!d) return;
-    dist_coordinator_forget_route_workers(&d->state, &d->plan);
     dist_route_plan_free(&d->plan);
     d->plan_ready = false;
     d->plan_generation = 0;
+}
+
+int ds4_dist_test_interrupt_route_discard_preserves_workers(void) {
+    ds4_dist_session session = {
+        .state = {
+            .n_layers = 8,
+            .local_start = 0,
+            .local_end = 3,
+            .generation = 11,
+            .use_dedicated_work_connection = true,
+        },
+    };
+    int control[2] = {-1, -1};
+    int listener_fd = -1;
+    int work_peer_fd = -1;
+    int route_fd = -1;
+    int rc = 1;
+    bool route_discarded = false;
+    bool route_fd_closed = false;
+    char err[256];
+    if (pthread_mutex_init(&session.state.mu, NULL) != 0) return 1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, control) != 0) goto cleanup;
+
+    listener_fd = dist_open_listener("127.0.0.1", 0, err, sizeof(err));
+    if (listener_fd < 0) goto cleanup;
+    const int listen_port = dist_listener_port(listener_fd);
+    if (listen_port <= 0) goto cleanup;
+
+    ds4_dist_worker_entry *worker = calloc(1, sizeof(*worker));
+    if (!worker) goto cleanup;
+    worker->fd = control[0];
+    worker->registration_id = 1;
+    worker->listen_port = (uint32_t)listen_port;
+    worker->layer_start = 4;
+    worker->layer_end = 7;
+    worker->has_output = 1;
+    worker->has_hidden = 1;
+    snprintf(worker->peer_host, sizeof(worker->peer_host), "127.0.0.1");
+    session.state.workers = worker;
+
+    uint64_t generation = 0;
+    if (!dist_coordinator_ensure_route(&session.state,
+                                       &session.plan,
+                                       &generation,
+                                       err,
+                                       sizeof(err))) {
+        goto cleanup;
+    }
+    session.plan_ready = true;
+    session.plan_generation = generation;
+    route_fd = session.plan.entry[0].fd;
+
+    struct pollfd pfd = {
+        .fd = listener_fd,
+        .events = POLLIN,
+    };
+    if (poll(&pfd, 1, 1000) <= 0 || !(pfd.revents & POLLIN)) goto cleanup;
+    work_peer_fd = accept(listener_fd, NULL, NULL);
+    if (work_peer_fd < 0 || route_fd < 0) goto cleanup;
+
+    if (shutdown(route_fd, SHUT_RDWR) != 0) goto cleanup;
+
+    dist_session_discard_route(&session);
+    route_discarded = true;
+    int socket_type = 0;
+    socklen_t socket_type_len = sizeof(socket_type);
+    errno = 0;
+    route_fd_closed =
+        getsockopt(route_fd, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_len) < 0 &&
+        errno == EBADF;
+    const bool worker_retained = session.state.workers != NULL &&
+                                 session.state.generation == 11;
+    const bool plan_discarded = session.plan.entry == NULL &&
+                                session.plan.count == 0 &&
+                                !session.plan_ready &&
+                                session.plan_generation == 0;
+    bool control_usable = false;
+    if (worker_retained) {
+        const char sent = 'x';
+        char received = '\0';
+        control_usable = send(control[1], &sent, 1, 0) == 1 &&
+                         recv(control[0], &received, 1, 0) == 1 &&
+                         received == sent;
+    }
+    const bool work_peer_woken = dist_test_peer_observes_shutdown(work_peer_fd);
+    rc = route_fd_closed && worker_retained && plan_discarded &&
+         control_usable && work_peer_woken ? 0 : 1;
+
+cleanup:
+    if (route_discarded) {
+        if (!route_fd_closed && route_fd >= 0) close(route_fd);
+    } else {
+        dist_route_plan_free(&session.plan);
+    }
+    if (session.state.workers) free(session.state.workers);
+    if (work_peer_fd >= 0) close(work_peer_fd);
+    if (listener_fd >= 0) close(listener_fd);
+    if (control[0] >= 0) close(control[0]);
+    if (control[1] >= 0) close(control[1]);
+    pthread_mutex_destroy(&session.state.mu);
+    return rc;
 }
 
 /* =========================================================================
@@ -5825,7 +5942,7 @@ int ds4_dist_session_create(
     d->state.local_can_output_head = ds4_engine_has_output_head(engine);
     d->state.replay_check = opt->replay_check;
     d->state.debug = opt->debug;
-    d->state.use_control_for_work = true;
+    d->state.use_dedicated_work_connection = true;
     d->state.prefill_chunk = opt->prefill_chunk;
     d->state.prefill_window = opt->prefill_window;
     d->state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
@@ -5942,7 +6059,7 @@ int ds4_dist_session_sync(
                                                                        errlen);
             if (prefill_rc != 0) {
                 if (prefill_rc == DS4_DIST_RECV_INTERRUPTED) {
-                    dist_session_drop_route(d);
+                    dist_session_discard_route(d);
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
                 int rebuild_rc = dist_coordinator_rebuild_from_transcript(&d->state,
@@ -5960,7 +6077,7 @@ int ds4_dist_session_sync(
                     d->plan_ready = false;
                     d->plan_generation = 0;
                     if (rebuild_rc == DS4_DIST_RECV_INTERRUPTED) {
-                        dist_session_drop_route(d);
+                        dist_session_discard_route(d);
                         return DS4_SESSION_SYNC_INTERRUPTED;
                     }
                     return 1;
@@ -5988,7 +6105,7 @@ int ds4_dist_session_sync(
                                                      errlen);
             if (eval_rc != 0) {
                 if (eval_rc == DS4_DIST_RECV_INTERRUPTED) {
-                    dist_session_drop_route(d);
+                    dist_session_discard_route(d);
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
                 int rebuild_rc = dist_coordinator_rebuild_from_transcript(&d->state,
@@ -6006,7 +6123,7 @@ int ds4_dist_session_sync(
                     d->plan_ready = false;
                     d->plan_generation = 0;
                     if (rebuild_rc == DS4_DIST_RECV_INTERRUPTED) {
-                        dist_session_drop_route(d);
+                        dist_session_discard_route(d);
                         return DS4_SESSION_SYNC_INTERRUPTED;
                     }
                     return 1;
@@ -6031,7 +6148,7 @@ int ds4_dist_session_sync(
                                                      errlen);
     if (prefill_rc != 0) {
         if (prefill_rc == DS4_DIST_RECV_INTERRUPTED) {
-            dist_session_drop_route(d);
+            dist_session_discard_route(d);
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
         int rebuild_rc = dist_coordinator_rebuild_from_transcript(&d->state,
@@ -6049,7 +6166,7 @@ int ds4_dist_session_sync(
             d->plan_ready = false;
             d->plan_generation = 0;
             if (rebuild_rc == DS4_DIST_RECV_INTERRUPTED) {
-                dist_session_drop_route(d);
+                dist_session_discard_route(d);
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             return 1;
@@ -6091,7 +6208,7 @@ int ds4_dist_session_eval(
                                         errlen);
     if (rc != 0) {
         if (rc == DS4_DIST_RECV_INTERRUPTED) {
-            dist_session_drop_route(d);
+            dist_session_discard_route(d);
             ds4_tokens_free(&transcript);
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
@@ -6111,7 +6228,7 @@ int ds4_dist_session_eval(
             d->plan_generation = 0;
             ds4_tokens_free(&transcript);
             if (rebuild_rc == DS4_DIST_RECV_INTERRUPTED) {
-                dist_session_drop_route(d);
+                dist_session_discard_route(d);
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             return 1;
@@ -6147,7 +6264,7 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
     state.local_can_output_head = ds4_engine_has_output_head(engine);
     state.replay_check = opt->replay_check;
     state.debug = opt->debug;
-    state.use_control_for_work = gen && gen->prompt;
+    state.use_dedicated_work_connection = gen && gen->prompt;
     state.prefill_chunk = opt->prefill_chunk;
     state.prefill_window = opt->prefill_window;
     state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
