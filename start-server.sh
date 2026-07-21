@@ -5,7 +5,8 @@ cd "$(dirname "$0")"
 
 # Profiles:
 #   agent        Default for Claude Code / Codex / Hermes-style clients with
-#                large system prompts, tool schemas, and long agent sessions.
+#                sampled generation, large prompts, tools, and long sessions.
+#   greedy       Agent settings plus MTP for temperature-zero generation.
 #   conservative Smaller cache footprint for occasional API use.
 PROFILE=${DS4_PROFILE:-agent}
 HOST=${DS4_HOST:-127.0.0.1}
@@ -34,23 +35,27 @@ for arg in "$@"; do
 done
 
 case "$PROFILE" in
-    agent)
+    agent|greedy)
         DEFAULT_MODEL="/Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF/Huihui-DeepSeek-V4-Flash-BF16-abliterated-ds4-Q2.gguf"
-        DEFAULT_CTX=204800
+        DEFAULT_CTX=51200
         DEFAULT_THREADS=8
-        DEFAULT_PREFILL_CHUNK=4096
+        # Matched M3 Max runs at a >16K context allocation favored 5120 over
+        # 4096 for long prefill without the short-frontier regression of 6144.
+        DEFAULT_PREFILL_CHUNK=5120
         DEFAULT_KV_DIR="$HOME/.ds4/server-kv"
         DEFAULT_KV_SPACE=163840
         DEFAULT_COLD_MAX=98304
-        # Keep this aligned with DEFAULT_PREFILL_CHUNK. Local 20k-200k context
-        # sweeps showed 2048 improves reusable prefix coverage on this M3 Max,
-        # while the larger disk budget absorbs the extra checkpoint writes.
+        # Keep the measured 2048 disk-KV cadence. Prefill chunk boundaries may
+        # coalesce writes, while the larger disk budget absorbs the checkpoints.
         DEFAULT_CONTINUED_INTERVAL=2048
         DEFAULT_CACHE_MIN=1024
         DEFAULT_BOUNDARY_TRIM=64
         DEFAULT_BOUNDARY_ALIGN=2048
         DEFAULT_TOOL_MEMORY_MAX=200000
-        DEFAULT_MTP_PATH="gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
+        DEFAULT_MTP_PATH=
+        if [ "$PROFILE" = greedy ]; then
+            DEFAULT_MTP_PATH="gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
+        fi
         DEFAULT_MTP_DRAFT=2
         DEFAULT_MTP_MARGIN=3.0
         ;;
@@ -72,7 +77,7 @@ case "$PROFILE" in
         DEFAULT_MTP_MARGIN=3.0
         ;;
     *)
-        echo "unknown DS4_PROFILE: $PROFILE (expected: agent or conservative)" >&2
+        echo "unknown DS4_PROFILE: $PROFILE (expected: agent, greedy, or conservative)" >&2
         exit 2
         ;;
 esac

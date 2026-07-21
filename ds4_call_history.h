@@ -12,6 +12,7 @@ typedef enum {
 	DS4_CALL_ACTIVE = 0,
 	DS4_CALL_COMPLETED,
 	DS4_CALL_FAILED,
+	DS4_CALL_CANCELLED,
 } ds4_call_status;
 
 typedef struct {

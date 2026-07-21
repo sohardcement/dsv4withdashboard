@@ -1,5 +1,7 @@
 # DwarfStar
 
+> 原始仓库：[antirez/ds4](https://github.com/antirez/ds4)。
+
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**, with support for **DeepSeek V4 PRO** on very high-memory
 machines. It is

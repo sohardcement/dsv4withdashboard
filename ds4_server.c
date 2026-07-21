@@ -7734,6 +7734,7 @@ typedef struct {
     uint64_t total_requests;
     uint64_t completed_requests;
     uint64_t failed_requests;
+	uint64_t cancelled_requests;
     uint64_t total_prompt_tokens;
     uint64_t total_cached_tokens;
     uint64_t prompt_requests;
@@ -7917,6 +7918,44 @@ struct job {
     job *next;
 };
 
+static void server_finish_cancelled_active(server *s, const job *j,
+	int output_tokens, const char *cache_source, const char *reason);
+
+static bool server_client_disconnected(int fd) {
+	if (fd < 0) return true;
+	struct pollfd pfd = { .fd = fd, .events = POLLIN
+#ifdef POLLRDHUP
+			| POLLRDHUP
+#endif
+	};
+	int rc;
+	do {
+		rc = poll(&pfd, 1, 0);
+	} while (rc < 0 && errno == EINTR);
+	if (rc == 0) return false;
+	if (rc < 0 || (pfd.revents & (POLLERR | POLLNVAL))) return true;
+#ifdef POLLRDHUP
+	if (pfd.revents & POLLRDHUP) return true;
+#endif
+	if (pfd.revents & POLLHUP) return true;
+	if (pfd.revents & POLLIN) {
+		char byte;
+		ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+		if (n == 0) return true;
+		if (n > 0) return false;
+		return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+	}
+	return false;
+}
+
+static bool server_job_client_disconnected(const job *j) {
+	return j && !j->req.stream && server_client_disconnected(j->fd);
+}
+
+static bool server_job_cancel_cb(void *ud) {
+	return server_job_client_disconnected((const job *)ud);
+}
+
 static void server_call_history_update_prompt(server *s, const job *j,
 									int prompt_tokens, int cached_tokens,
 									const char *cache_source) {
@@ -7938,21 +7977,36 @@ static void server_call_history_finish(server *s, const job *j,
 	pthread_mutex_unlock(&s->call_history_mu);
 }
 
+static bool server_drop_disconnected_queued_job(server *s, const job *j) {
+	if (!server_job_client_disconnected(j)) return false;
+	server_log(DS4_LOG_GENERATION,
+		"ds4-server: dropping queued request after client disconnected");
+	server_call_history_finish(s, j, DS4_CALL_CANCELLED, 0, "none",
+		"cancelled", "client disconnected while queued");
+	return true;
+}
+
 static void server_finalize_call_history(server *s, const job *j,
 								 int output_tokens, const char *cache_source,
 								 const char **final_finish, char *err,
 								 size_t errlen, bool response_ok) {
-	if (!response_ok) {
+	if (!response_ok && server_job_client_disconnected(j)) {
+		if (final_finish) *final_finish = "cancelled";
+		if (err && errlen && !err[0])
+			snprintf(err, errlen, "client disconnected during final response");
+	} else if (!response_ok) {
 		if (final_finish) *final_finish = "error";
 		if (err && errlen && !err[0])
 			snprintf(err, errlen, "client stream write failed");
 	}
 	const char *finish = final_finish && *final_finish ? *final_finish : "error";
+	ds4_call_status status = !strcmp(finish, "error") ? DS4_CALL_FAILED :
+		!strcmp(finish, "cancelled") ? DS4_CALL_CANCELLED : DS4_CALL_COMPLETED;
 	server_call_history_finish(s, j,
-			(!strcmp(finish, "error") || !strcmp(finish, "cancelled")) ?
-				DS4_CALL_FAILED : DS4_CALL_COMPLETED,
+			status,
 			output_tokens, cache_source, finish,
-			!strcmp(finish, "error") && err && err[0] ? err : "");
+			(status == DS4_CALL_FAILED || status == DS4_CALL_CANCELLED) &&
+				err && err[0] ? err : "");
 }
 
 static const char *request_api_name(api_style api) {
@@ -8174,6 +8228,9 @@ static void server_status_finish_request(server *s, const char *finish,
     pthread_mutex_lock(&s->status_mu);
     if (finish && !strcmp(finish, "error")) {
         s->status.failed_requests = status_sat_inc(s->status.failed_requests);
+	} else if (finish && !strcmp(finish, "cancelled")) {
+		s->status.cancelled_requests = status_sat_inc(
+			s->status.cancelled_requests);
     } else {
         s->status.completed_requests = status_sat_inc(
             s->status.completed_requests);
@@ -8209,13 +8266,14 @@ static const char dashboard_html[] =
 ".settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:34px;padding:34px 0;border-bottom:1px solid var(--ink)}.setting-block{min-width:0;border-top:2px solid var(--ink);padding-top:16px}.setting-head{display:flex;justify-content:space-between;align-items:baseline;gap:14px;margin-bottom:20px}.setting-head h2,.management-section h2{font:400 27px/1.1 Georgia,\"Times New Roman\",serif}.effect{color:var(--accent);font-size:12px;font-weight:700}.capacity-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.capacity-stats strong{display:block;margin-top:6px;font-size:16px;overflow-wrap:anywhere}.progress{height:3px;background:var(--line);margin:16px 0 22px;overflow:hidden}.progress span{display:block;height:100%;width:0;background:var(--accent);transition:width .2s linear}.editor{border-top:1px solid var(--line);padding-top:18px}.controls{display:flex;flex-wrap:wrap;gap:9px;margin-top:14px}.target-state{min-height:22px;margin-top:8px}.notice{min-height:24px;margin-top:14px;color:var(--muted)}.notice.bad{color:var(--danger)}.impact-review{margin-top:18px;border-top:2px solid var(--danger);border-bottom:1px solid var(--ink);padding:14px 0 16px}.impact-review h3{font:600 14px/1.3 var(--instrument-font);color:var(--danger)}.impact-review dl{display:grid;grid-template-columns:auto 1fr;margin:12px 0 0}.impact-review dt,.impact-review dd{margin:0;padding:8px 0;border-top:1px solid var(--line)}.impact-review dt{padding-right:18px;color:var(--muted)}.impact-review dd{text-align:right;font-family:var(--instrument-font);overflow-wrap:anywhere}.impact-review[hidden]{display:none!important}"
 ".management-section{padding:30px 0;border-bottom:1px solid var(--ink)}.section-head{display:flex;justify-content:space-between;align-items:baseline;gap:20px;margin-bottom:20px}.recent-calls{table-layout:fixed}.recent-calls th,.recent-calls td{width:20%}.host-ruler{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-top:1px solid var(--line)}.host-ruler>div{padding:16px 16px 0 0}.host-ruler>div+div{padding-left:16px;border-left:1px solid var(--line)}.host-ruler strong{display:block;margin-top:7px;overflow-wrap:anywhere}"
 "table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:10px 12px 10px 0;border-top:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:500;width:16%}td{font-family:var(--instrument-font);overflow-wrap:anywhere}.stale #connectionState{padding:6px 10px;border:1px solid var(--danger)}.stale #health:after{content:' · 只读';font-weight:700}.stale #managementPhase{color:var(--danger)}.stale .status-dot{background:var(--danger)}"
-".monitor-layout{padding-top:28px}.monitor-title{font:400 clamp(38px,5vw,64px)/1 Georgia,\"Times New Roman\",serif;letter-spacing:-.035em}.monitor-metrics{display:grid;grid-template-columns:minmax(220px,1.35fr) repeat(5,minmax(0,1fr));gap:18px;margin:24px 0 30px;padding:16px 0;border-block:1px solid var(--ink)}.monitor-metrics>div{min-width:0}.monitor-metrics strong{display:block;margin-top:7px;font:400 clamp(17px,1.7vw,24px)/1.12 Georgia,serif;overflow-wrap:normal;word-break:keep-all;white-space:normal}.monitor-metrics .metric-primary strong{font-size:clamp(20px,2vw,28px);color:var(--accent)}.metric-bar{height:4px;margin-top:10px;background:var(--line);overflow:hidden}.metric-bar span{display:block;width:0;height:100%;background:var(--accent)}.value-changing{animation:metric-value-change 500ms ease both}.mode-layout.mode-enter{animation:mode-enter var(--motion-smooth) cubic-bezier(.22,.8,.24,1) both}@keyframes metric-value-change{0%{opacity:.45;transform:translateY(4px)}100%{opacity:1;transform:translateY(0)}}@keyframes mode-enter{0%{opacity:0;transform:translateY(8px)}100%{opacity:1;transform:translateY(0)}}.monitor-grid{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(260px,.65fr);gap:32px;align-items:start}.monitor-panel{min-width:0;border-top:2px solid var(--ink);padding-top:15px}.call-filters{display:grid;grid-template-columns:minmax(110px,1fr) repeat(3,minmax(0,.72fr));gap:8px;margin-bottom:14px}.filter-field{min-width:0}.call-filters input,.call-filters select{min-width:0;width:100%}.monitor-table-wrap{max-height:390px;overflow:auto;border-bottom:1px solid var(--ink)}.monitor-table{min-width:780px;table-layout:fixed}.monitor-table th:nth-child(1){width:9%}.monitor-table th:nth-child(2){width:15%}.monitor-table th:nth-child(3){width:15%}.monitor-table th:nth-child(4){width:11%}.monitor-table th:nth-child(5){width:9%}.monitor-table th:nth-child(6){width:11%}.monitor-table th:nth-child(7){width:30%}.monitor-table tr[aria-selected=true]{background:var(--selected)}.request-select{width:100%;min-height:44px;padding:0 8px;text-align:left;border-color:transparent;background:transparent;font-family:var(--instrument-font)}.request-select:hover{border-color:var(--ink)}.inspector{min-height:250px}.inspector dl{display:grid;grid-template-columns:minmax(96px,auto) minmax(0,1fr);column-gap:10px;margin:15px 0 0}.inspector dt,.inspector dd{margin:0;padding:8px 0;border-top:1px solid var(--line)}.inspector dt{color:var(--muted);padding-right:6px}.inspector dd{font-family:var(--instrument-font);overflow-wrap:anywhere}.monitor-host{grid-column:1/-1;margin-top:2px;padding-top:20px;border-top:1px solid var(--ink)}"
+".monitor-layout{padding-top:28px}.monitor-title{font:400 clamp(38px,5vw,64px)/1 Georgia,\"Times New Roman\",serif;letter-spacing:-.035em}.monitor-metrics{display:grid;grid-template-columns:minmax(220px,1.35fr) repeat(5,minmax(0,1fr));gap:18px;margin:24px 0 30px;padding:16px 0;border-block:1px solid var(--ink)}.monitor-metrics>div{min-width:0}.monitor-metrics strong{display:block;margin-top:7px;font:400 clamp(17px,1.7vw,24px)/1.12 Georgia,serif;overflow-wrap:normal;word-break:keep-all;white-space:normal}.monitor-metrics .metric-primary strong{font-size:clamp(20px,2vw,28px);color:var(--accent)}.metric-bar{height:4px;margin-top:10px;background:var(--line);overflow:hidden}.metric-bar span{display:block;width:0;height:100%;background:var(--accent)}.mode-layout.mode-enter{animation:mode-enter var(--motion-smooth) cubic-bezier(.22,.8,.24,1) both}@keyframes mode-enter{0%{opacity:0;transform:translateY(8px)}100%{opacity:1;transform:translateY(0)}}.monitor-grid{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(260px,.65fr);gap:32px;align-items:start}.monitor-panel{min-width:0;border-top:2px solid var(--ink);padding-top:15px}.call-filters{display:grid;grid-template-columns:minmax(110px,1fr) repeat(3,minmax(0,.72fr));gap:8px;margin-bottom:14px}.filter-field{min-width:0}.call-filters input,.call-filters select{min-width:0;width:100%}.monitor-table-wrap{max-height:390px;overflow:auto;border-bottom:1px solid var(--ink)}.monitor-table{min-width:780px;table-layout:fixed}.monitor-table th:nth-child(1){width:9%}.monitor-table th:nth-child(2){width:15%}.monitor-table th:nth-child(3){width:15%}.monitor-table th:nth-child(4){width:11%}.monitor-table th:nth-child(5){width:9%}.monitor-table th:nth-child(6){width:11%}.monitor-table th:nth-child(7){width:30%}.monitor-table tr[aria-selected=true]{background:var(--selected)}.request-select{width:100%;min-height:44px;padding:0 8px;text-align:left;border-color:transparent;background:transparent;font-family:var(--instrument-font)}.request-select:hover{border-color:var(--ink)}.inspector{min-height:250px}.inspector dl{display:grid;grid-template-columns:minmax(54px,auto) minmax(0,1fr) minmax(54px,auto) minmax(0,1fr);column-gap:10px;margin:15px 0 0}.inspector dt,.inspector dd{margin:0;padding:8px 0;border-top:1px solid var(--line)}.inspector dt{color:var(--muted);padding-right:6px}.inspector dd{font-family:var(--instrument-font);overflow-wrap:anywhere}.monitor-host{grid-column:1/-1;margin-top:2px;padding-top:20px;border-top:1px solid var(--ink)}"
 "@media(min-width:981px){.monitor-layout{padding-top:20px}.monitor-title{font-size:54px}.monitor-metrics{margin:18px 0 22px}.monitor-panel{padding-top:10px}.monitor-panel .section-head{margin-bottom:12px}.call-filters{margin-bottom:10px}.filter-field label{margin-bottom:2px}.inspector dt,.inspector dd{padding-block:6px}}"
 "@media(min-width:981px){.monitor-metrics{padding-block:10px;margin-block:14px 16px}.monitor-metrics>div.metric-primary{margin:-2px 0;padding:8px 12px}.metric-subvalue,.metric-phase-meta{margin-top:3px;font-size:10px}.metric-bar{height:3px;margin-top:6px}}"
 "@media(max-width:980px){.monitor-grid{grid-template-columns:1fr}.monitor-host{grid-column:auto}.monitor-table-wrap{max-height:330px}.monitor-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}.inspector dl{grid-template-columns:minmax(92px,auto) minmax(0,1fr);column-gap:0}.inspector dt{padding-right:14px}}@media(max-width:900px){.management-grid{grid-template-columns:1fr;gap:0;margin-top:20px}.management-nav{display:none}}"
 "@media(max-width:760px){.page{padding:16px 16px 44px}.topbar{grid-template-columns:1fr}.mode-switch button{flex:1}.state{justify-content:flex-start;gap:12px}.summary-ruler,.settings-grid,.capacity-stats,.host-ruler{grid-template-columns:1fr}.summary-cell+.summary-cell,.host-ruler>div+div{padding-left:0;border-left:0;border-top:1px solid var(--line)}.summary-cell:nth-child(2) strong{white-space:normal;font-size:clamp(20px,7vw,30px)}.settings-grid{gap:28px}.monitor-metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;padding-block:14px}.call-filters{grid-template-columns:repeat(2,minmax(0,1fr))}.controls>*{flex:1 1 auto}input{font-size:16px;width:min(11rem,60vw)}.section-head,.setting-head{display:block}.section-head .caption,.effect{display:block;margin-top:8px}}"
 "@media(max-width:420px){.page{padding-inline:12px}.monitor-metrics,.call-filters{grid-template-columns:1fr;gap:0}.monitor-metrics>div{padding:13px 0}.monitor-metrics>div+div{padding-top:13px}.monitor-table-wrap{max-width:100%}}"
 ".metric-subvalue{display:block;margin-top:6px;color:var(--muted);font:600 11px/1.35 var(--instrument-font);letter-spacing:.02em}.metric-phase-meta{display:block;margin-top:5px;color:var(--muted);font:600 11px/1.35 var(--instrument-font)}.monitor-metrics>div.metric-primary{margin:-4px 0;padding:12px 14px;background:var(--surface)}.monitor-metrics>div.metric-primary .eyebrow{color:var(--accent)}.metric-bar span{transition:width var(--motion-smooth) cubic-bezier(.22,.8,.24,1),background-color var(--motion-fast) ease}"
+".metric-value-window{display:block;position:relative;height:1.2em;overflow:hidden}.metric-value-layer{position:absolute;inset:0;display:block;white-space:inherit;will-change:transform,opacity}.metric-value-layer-out-increase{animation:metric-value-out-increase 420ms cubic-bezier(.22,.8,.24,1) both}.metric-value-layer-in-increase{animation:metric-value-in-increase 420ms cubic-bezier(.22,.8,.24,1) both}.metric-value-layer-out-decrease{animation:metric-value-out-decrease 420ms cubic-bezier(.22,.8,.24,1) both}.metric-value-layer-in-decrease{animation:metric-value-in-decrease 420ms cubic-bezier(.22,.8,.24,1) both}@keyframes metric-value-out-increase{to{opacity:0;transform:translateY(-100%) scale(.94)}}@keyframes metric-value-in-increase{from{opacity:0;transform:translateY(-100%) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}@keyframes metric-value-out-decrease{to{opacity:0;transform:translateY(100%) scale(1.04)}}@keyframes metric-value-in-decrease{from{opacity:0;transform:translateY(100%) scale(1.04)}to{opacity:1;transform:translateY(0) scale(1)}}"
 "@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important;animation:none!important}}"
 ".mode-layout[hidden]{display:none!important}:root[data-theme=glass]{color-scheme:light;--paper:#f5f5f7;--surface:rgba(255,255,255,.72);--ink:#1d1d1f;--muted:#86868b;--line:rgba(0,0,0,.06);--accent:#0071e3;--success:#248a3d;--danger:#d70015;--selected:rgba(0,113,227,.08);--glass-bg:rgba(255,255,255,.72);--glass-border:rgba(0,0,0,.05);--glass-shadow:0 1px 2px rgba(0,0,0,.04),0 12px 32px rgba(0,0,0,.06)}:root[data-theme=glass] body{background:radial-gradient(120vw 90vw at 50% -20%,rgba(210,224,241,.55),transparent 55%),linear-gradient(180deg,#fafafc,#f1f2f6);background-attachment:fixed;min-height:100vh}:root[data-theme=glass] body::before{content:'';position:fixed;inset:0;z-index:3;pointer-events:none;background:radial-gradient(560px 560px at var(--mx,50%) var(--my,18%),rgba(255,255,255,.4),transparent 70%);mix-blend-mode:soft-light}:root[data-theme=glass] .topbar{background:var(--glass-bg);backdrop-filter:blur(20px) saturate(1.6);-webkit-backdrop-filter:blur(20px) saturate(1.6);border:1px solid var(--glass-border);border-radius:14px;padding:8px 14px;box-shadow:var(--glass-shadow)}:root[data-theme=glass] .management-nav,:root[data-theme=glass] .management-summary,:root[data-theme=glass] .setting-block,:root[data-theme=glass] .management-section,:root[data-theme=glass] .monitor-panel,:root[data-theme=glass] .monitor-host{background:var(--glass-bg);backdrop-filter:blur(20px) saturate(1.6);-webkit-backdrop-filter:blur(20px) saturate(1.6);border:1px solid var(--glass-border);border-radius:14px;box-shadow:var(--glass-shadow);padding:22px 24px}:root[data-theme=glass] .management-grid{gap:28px}:root[data-theme=glass] .summary-ruler{border-top-color:var(--line);border-bottom-color:var(--line)}:root[data-theme=glass] .management-nav a:first-child{border-top-color:var(--line)}:root[data-theme=glass] .settings-grid,:root[data-theme=glass] .monitor-table-wrap{border-bottom-color:var(--line)}:root[data-theme=glass] .management-summary h1,:root[data-theme=glass] .monitor-title{font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-weight:600;letter-spacing:-.02em;font-size:clamp(28px,3.4vw,40px)}:root[data-theme=glass] .setting-head h2,:root[data-theme=glass] .management-section h2{font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-weight:600;font-size:20px}:root[data-theme=glass] .summary-cell strong,:root[data-theme=glass] .monitor-metrics strong{font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-weight:600}:root[data-theme=glass] button,:root[data-theme=glass] input,:root[data-theme=glass] select{border-radius:8px;border-color:rgba(0,0,0,.1);background:rgba(255,255,255,.8);min-height:36px}:root[data-theme=glass] button.primary{background:#0071e3;color:#fff;border-color:transparent;box-shadow:none}:root[data-theme=glass] button.primary:hover:not(:disabled){background:#0077ed;box-shadow:none}:root[data-theme=glass] button:hover:not(:disabled){box-shadow:0 1px 4px rgba(0,0,0,.1)}:root[data-theme=glass] .request-select{background:transparent;border-color:transparent;border-radius:6px}:root[data-theme=glass] .request-select:hover{background:rgba(0,0,0,.04);border-color:transparent;box-shadow:none}:root[data-theme=glass] .mode-switch,:root[data-theme=glass] .theme-switch{background:rgba(120,120,128,.12);border:1px solid transparent;border-radius:9px;padding:2px}:root[data-theme=glass] .mode-switch button,:root[data-theme=glass] .theme-switch button{background:transparent;border-color:transparent;min-height:30px;border-radius:7px;padding-inline:12px;font-size:13px}:root[data-theme=glass] .mode-switch button[aria-pressed=true]{background:#fff;color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.12)}:root[data-theme=glass] .theme-switch button{color:var(--muted)}:root[data-theme=glass] .theme-switch button[aria-pressed=true]{background:#fff;color:var(--ink);border-color:transparent;box-shadow:0 1px 3px rgba(0,0,0,.12)}:root[data-theme=glass] .monitor-metrics>div{background:rgba(255,255,255,.6);border:1px solid var(--glass-border);border-radius:12px;padding:12px 14px;backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);box-shadow:0 1px 2px rgba(0,0,0,.03)}:root[data-theme=glass] .monitor-metrics>div.metric-primary{background:rgba(255,255,255,.85)}:root[data-theme=glass] .progress,:root[data-theme=glass] .metric-bar{height:4px;border-radius:99px;background:rgba(120,120,128,.18)}:root[data-theme=glass] .progress span,:root[data-theme=glass] .metric-bar span{border-radius:99px;background:#0071e3;box-shadow:none}:root[data-theme=glass] .status-dot{box-shadow:none}:root[data-theme=glass] .impact-review{border-radius:10px;padding:14px 16px 16px;background:rgba(255,255,255,.6)}"
 "</style></head><body><main class=\"page\" id=\"dashboard\" data-mode=\"management\" data-theme=\"paper\"><header class=\"topbar\"><div class=\"brand\"><a href=\"#managementSummary\"><span class=\"status-glyph\" aria-hidden=\"true\">◆</span>DS4</a></div><nav class=\"mode-switch\" aria-label=\"Dashboard 模式\"><button type=\"button\" data-mode-choice=\"management\" aria-pressed=\"true\">管理模式</button><button type=\"button\" data-mode-choice=\"monitor\" aria-pressed=\"false\">监控模式</button></nav><div class=\"theme-switch\" role=\"group\" aria-label=\"Dashboard 主题\"><button type=\"button\" data-theme-choice=\"paper\" aria-pressed=\"true\">暖纸面</button><button type=\"button\" data-theme-choice=\"terminal\" aria-pressed=\"false\">深色终端</button><button type=\"button\" data-theme-choice=\"calm\" aria-pressed=\"false\">冷静蓝绿</button><button type=\"button\" data-theme-choice=\"glass\" aria-pressed=\"false\">液态玻璃</button></div><div id=\"connectionState\" class=\"state\"><span class=\"status-dot\" aria-hidden=\"true\"></span><strong id=\"health\" aria-label=\"健康\">等待中</strong><strong id=\"updatedAt\" aria-label=\"更新时间\">尚未更新</strong></div></header><div id=\"managementLayout\" class=\"mode-layout management-layout\" aria-hidden=\"false\"><div class=\"management-grid\"><aside class=\"management-nav\"><nav aria-label=\"管理章节\"><a href=\"#managementSummary\">运行概览</a><a href=\"#kvCapacity\">KV 容量</a><a href=\"#contextCapacity\">上下文窗口</a><a href=\"#managementRecent\">最近调用</a><a href=\"#managementHost\">主机资源</a></nav></aside><div class=\"management-main\">"
@@ -8224,19 +8282,19 @@ static const char dashboard_html[] =
 "<section id=\"contextCapacity\" class=\"setting-block\"><div class=\"setting-head\"><h2>上下文窗口</h2><span id=\"contextEffect\" class=\"effect\">重启后生效</span></div><div class=\"capacity-stats\"><div><span class=\"eyebrow\">当前 / 上限</span><strong id=\"contextCurrent\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">剩余</span><strong id=\"contextRemaining\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">利用率</span><strong id=\"contextUtilization\" class=\"mono\">—</strong></div></div><form class=\"editor\" id=\"contextForm\"><label class=\"eyebrow\" for=\"contextNextInput\">下次启动窗口（token）</label><div class=\"controls\"><input id=\"contextNextInput\" type=\"number\" inputmode=\"numeric\" min=\"4096\" step=\"1\" aria-describedby=\"contextEffect contextNotice\" aria-invalid=\"false\" disabled><button id=\"contextSaveRestart\" class=\"primary\" type=\"button\" disabled>保存下次启动设置</button></div><div id=\"contextNotice\" class=\"notice\" role=\"status\" aria-live=\"polite\"></div></form></section></div>"
 "<section id=\"managementRecent\" class=\"management-section\"><div class=\"section-head\"><h2>最近调用</h2><p id=\"managementCallsActive\" class=\"caption\">当前活动请求：—</p></div><table class=\"recent-calls\"><thead><tr><th>请求</th><th>服务</th><th>API</th><th>结果</th><th>时长</th></tr></thead><tbody id=\"managementRecentCalls\"></tbody></table></section>"
 "<section id=\"managementHost\" class=\"management-section\"><div class=\"section-head\"><h2>主机资源</h2><p class=\"caption\">系统采样不可用时明确标注。</p></div><div class=\"host-ruler\"><div><span class=\"eyebrow\">内存压力 / Swap</span><strong id=\"managementHostPressure\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">物理内存 已用 / 总量 / 可用</span><strong id=\"managementHostPhysical\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">DS4 RSS</span><strong id=\"managementHostRss\" class=\"mono\">不可用</strong></div></div></section></div></div></div>"
-"<section id=\"monitorLayout\" class=\"mode-layout monitor-layout\" hidden aria-hidden=\"true\" aria-labelledby=\"monitorTitle\"><h1 id=\"monitorTitle\" class=\"monitor-title\">实时运行</h1><p class=\"model\">实时吞吐与最近调用检查器</p><div id=\"monitorMetrics\" class=\"monitor-metrics\"><div><span class=\"eyebrow\">阶段 / 活动 / 服务</span><strong id=\"monitorPhase\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">预填充</span><strong id=\"monitorPrefill\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">解码 / 进度</span><strong id=\"monitorDecode\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">请求 KV 命中</span><strong id=\"monitorCacheHit\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">上下文利用率</span><strong id=\"monitorContext\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">队列 / 客户端</span><strong id=\"monitorQueue\" class=\"mono\">—</strong></div></div><div class=\"monitor-grid\"><section class=\"monitor-panel\" aria-labelledby=\"monitorCallsTitle\"><div class=\"section-head\"><h2 id=\"monitorCallsTitle\">最近调用</h2><p id=\"monitorCallsActive\" class=\"caption\">当前活动请求：—</p></div><div class=\"call-filters\"><input id=\"callFilterCaller\" data-call-filter=\"caller\" aria-label=\"按调用方筛选\" placeholder=\"调用方\"><select id=\"callFilterClient\" data-call-filter=\"client\" aria-label=\"按服务筛选\"><option value=\"\">全部服务</option></select><select id=\"callFilterApi\" data-call-filter=\"api\" aria-label=\"按 API 筛选\"><option value=\"\">全部 API</option></select><select id=\"callFilterStatus\" data-call-filter=\"result\" aria-label=\"按结果筛选\"><option value=\"\">全部结果</option><option value=\"active\">进行中</option><option value=\"completed\">完成</option><option value=\"failed\">失败</option></select></div><div class=\"monitor-table-wrap call-table-wrap\"><table class=\"monitor-table\"><thead><tr><th>请求</th><th>服务</th><th>调用方</th><th>API</th><th>结果</th><th>时长</th><th>错误</th></tr></thead><tbody id=\"monitorCalls\"></tbody></table></div></section><aside id=\"requestInspector\" class=\"monitor-panel inspector\" tabindex=\"-1\" aria-labelledby=\"requestInspectorTitle\"><h2 id=\"requestInspectorTitle\">请求检查器</h2><p class=\"caption\">请选择一条调用记录</p></aside><section id=\"monitorHost\" class=\"monitor-host\" aria-labelledby=\"monitorHostTitle\"><div class=\"section-head\"><h2 id=\"monitorHostTitle\">主机资源</h2><p class=\"caption\">系统采样不可用时明确标注。</p></div><div class=\"host-ruler\"><div><span class=\"eyebrow\">内存压力 / Swap</span><strong id=\"monitorHostPressure\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">物理内存 已用 / 总量 / 可用</span><strong id=\"monitorHostPhysical\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">DS4 RSS</span><strong id=\"monitorHostRss\" class=\"mono\">不可用</strong></div></div></section></div></section>"
+"<section id=\"monitorLayout\" class=\"mode-layout monitor-layout\" hidden aria-hidden=\"true\" aria-labelledby=\"monitorTitle\"><h1 id=\"monitorTitle\" class=\"monitor-title\">实时运行</h1><p class=\"model\">实时吞吐与最近调用检查器</p><div id=\"monitorMetrics\" class=\"monitor-metrics\"><div><span class=\"eyebrow\">阶段 / 活动 / 服务</span><strong id=\"monitorPhase\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">预填充</span><strong id=\"monitorPrefill\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">解码 / 进度</span><strong id=\"monitorDecode\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">请求 KV 命中</span><strong id=\"monitorCacheHit\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">上下文利用率</span><strong id=\"monitorContext\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">队列 / 客户端</span><strong id=\"monitorQueue\" class=\"mono\">—</strong></div></div><div class=\"monitor-grid\"><section class=\"monitor-panel\" aria-labelledby=\"monitorCallsTitle\"><div class=\"section-head\"><h2 id=\"monitorCallsTitle\">最近调用</h2><p id=\"monitorCallsActive\" class=\"caption\">当前活动请求：—</p></div><div class=\"call-filters\"><input id=\"callFilterCaller\" data-call-filter=\"caller\" aria-label=\"按调用方筛选\" placeholder=\"调用方\"><select id=\"callFilterClient\" data-call-filter=\"client\" aria-label=\"按服务筛选\"><option value=\"\">全部服务</option></select><select id=\"callFilterApi\" data-call-filter=\"api\" aria-label=\"按 API 筛选\"><option value=\"\">全部 API</option></select><select id=\"callFilterStatus\" data-call-filter=\"result\" aria-label=\"按结果筛选\"><option value=\"\">全部结果</option><option value=\"active\">进行中</option><option value=\"completed\">完成</option><option value=\"failed\">失败</option><option value=\"cancelled\">已取消</option></select></div><div class=\"monitor-table-wrap call-table-wrap\"><table class=\"monitor-table\"><thead><tr><th>请求</th><th>服务</th><th>调用方</th><th>API</th><th>结果</th><th>时长</th><th>错误</th></tr></thead><tbody id=\"monitorCalls\"></tbody></table></div></section><aside id=\"requestInspector\" class=\"monitor-panel inspector\" tabindex=\"-1\" aria-labelledby=\"requestInspectorTitle\"><h2 id=\"requestInspectorTitle\">请求检查器</h2><p class=\"caption\">请选择一条调用记录</p></aside><section id=\"monitorHost\" class=\"monitor-host\" aria-labelledby=\"monitorHostTitle\"><div class=\"section-head\"><h2 id=\"monitorHostTitle\">主机资源</h2><p class=\"caption\">系统采样不可用时明确标注。</p></div><div class=\"host-ruler\"><div><span class=\"eyebrow\">内存压力 / Swap</span><strong id=\"monitorHostPressure\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">物理内存 已用 / 总量 / 可用</span><strong id=\"monitorHostPhysical\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">DS4 RSS</span><strong id=\"monitorHostRss\" class=\"mono\">不可用</strong></div></div></section></div></section>"
 "</main><script>"
 "const $=id=>document.getElementById(id),dash=$('dashboard');window.__ds4InitialMode=(()=>{try{return localStorage.getItem('ds4-dashboard-mode')}catch(e){return null}})();let lastSnapshot=null,lastUpdatedAt=0,online=false,adminLocal=true,kvEnabled=false,currentKvBudgetBytes=null,kvState='idle',kvReview=null,kvTrigger=null,pollGeneration=0,pollFailures=0,contextLocal=true,contextBusy=false,kvTargetTouched=false,contextTargetTouched=false,selectedRequestId=null;"
 "const themeValues=['paper','terminal','calm','glass'];function setTheme(value){const theme=themeValues.includes(value)?value:'paper';document.documentElement.dataset.theme=theme;dash.dataset.theme=theme;try{localStorage.setItem('ds4-dashboard-theme',theme)}catch(e){}document.querySelectorAll('[data-theme-choice]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.themeChoice===theme)))}"
 "const finite=n=>typeof n==='number'&&Number.isFinite(n),nonnegative=n=>finite(n)&&n>=0,num=n=>finite(n)?n:0,ratio=(n,d)=>num(d)>0?num(n)/num(d):null,pct=v=>v==null?'—':(v*100).toFixed(1)+'%',activeId=value=>{const id=value==null?'':String(value);return id&&id!=='0'?id:null};"
 "const bytes=n=>{n=num(n);if(n>=1073741824)return (n/1073741824).toFixed(1)+' GB';if(n>=1048576)return (n/1048576).toFixed(1)+' MB';if(n>=1024)return (n/1024).toFixed(1)+' KB';return Math.round(n)+' B'};"
-"const text=(id,v)=>{const node=$(id),next=String(v);if(node.textContent===next)return;node.textContent=next;if(['monitorPrefill','monitorDecode','monitorCacheHit'].includes(id)){node.classList.remove('value-changing');void node.offsetWidth;node.classList.add('value-changing')}};"
+"const text=(id,v)=>{const node=$(id),next=String(v);if(node.textContent===next)return;node.textContent=next};"
 "function freshnessLabel(stale){if(!lastUpdatedAt)return '尚未更新';const seconds=Math.max(0,Math.floor((Date.now()-lastUpdatedAt)/1000)),age=seconds<1?'刚刚更新':seconds+' 秒前更新';return stale?'数据已过期 · '+age:age}"
 "function validateSnapshot(s){const object=(value,name)=>{if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('invalid '+name);return value},number=(value,name)=>{if(!nonnegative(value))throw new Error('invalid '+name)},string=(value,name)=>{if(typeof value!=='string')throw new Error('invalid '+name)};object(s,'snapshot');if(typeof s.active!=='boolean')throw new Error('invalid active');string(s.phase,'phase');number(s.queue_depth,'queue_depth');number(s.clients,'clients');const model=object(s.model,'model');string(model.name,'model.name');string(model.backend,'model.backend');number(model.context_length,'model.context_length');const kv=object(s.kv_cache,'kv_cache');if(typeof kv.enabled!=='boolean')throw new Error('invalid kv_cache.enabled');if(kv.enabled){number(kv.used_bytes,'kv_cache.used_bytes');number(kv.budget_bytes,'kv_cache.budget_bytes');number(kv.entries,'kv_cache.entries')}const context=object(s.context,'context');for(const field of ['current_tokens','limit_tokens','next_limit_tokens','remaining'])number(context[field],'context.'+field);if(!finite(context.utilization)||context.utilization<0||context.utilization>1)throw new Error('invalid context.utilization');const request=object(s.request,'request'),prefill=object(s.prefill,'prefill'),decode=object(s.decode,'decode'),calls=object(s.calls,'calls');if(s.active){for(const field of ['prompt_tokens','cached_tokens','elapsed_sec'])number(request[field],'request.'+field);if(['prefill','decode'].includes(s.phase))for(const field of ['current','total','avg_tps'])number(prefill[field],'prefill.'+field);if(s.phase==='decode')for(const field of ['generated','max_tokens','avg_tps'])number(decode[field],'decode.'+field)}if(!Array.isArray(calls.records)||!calls.records.every(record=>record&&typeof record==='object'&&!Array.isArray(record)))throw new Error('invalid calls.records')}"
 "function setKvState(state){kvState=state;dash.dataset.kvState=state;const reviewing=state==='review';$('kvReview').hidden=!reviewing;const available=online&&adminLocal&&kvEnabled,locked=['checking','review','applying','saving'].includes(state)||!available;for(const id of ['kvBudgetInput','kvBudgetUnit','kvApplyNow','kvSaveRestart'])$(id).disabled=locked;$('kvConfirmApply').disabled=!reviewing||!available;$('kvCancelApply').disabled=!reviewing}"
 "function contextControls(){const disabled=contextBusy||!online||!contextLocal;$('contextNextInput').disabled=disabled;$('contextSaveRestart').disabled=disabled}"
 "function setKvInvalid(value){for(const id of ['kvBudgetInput','kvBudgetUnit'])$(id).setAttribute('aria-invalid',String(value))}"
-"function callStatus(value){return ({active:'进行中',completed:'完成',failed:'失败'})[value]||'未知'}"
+"function callStatus(value){return ({active:'进行中',completed:'完成',failed:'失败',cancelled:'已取消'})[value]||'未知'}"
 "function replaceOptions(id,values,label){const select=$(id),next=[''].concat(values),options=[...select.options],same=options.length===next.length&&options.every((option,i)=>option.value===next[i]&&option.textContent===(next[i]||label));if(same)return;const old=select.value;select.replaceChildren();for(const value of next){const option=document.createElement('option');option.value=value;option.textContent=value||label;select.append(option)}select.value=values.includes(old)?old:''}"
 "function inspectorFact(root,label,value){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value==null||value===''?'—':String(value);root.append(dt,dd)}"
 "function requestDuration(record,request,currentId,snapshotActive){const started=nonnegative(record.started_at)?Number(record.started_at):null,finished=nonnegative(record.finished_at)?Number(record.finished_at):null;if(record.status!=='active')return started!==null&&finished!==null&&finished>=started?(finished-started).toFixed(1)+'s':'—';if(snapshotActive&&currentId&&String(record.request_id)===currentId){if(nonnegative(request&&request.elapsed_sec))return Number(request.elapsed_sec).toFixed(1)+'s';const now=Date.now()/1000;if(started!==null&&started<=now)return (now-started).toFixed(1)+'s'}return '—'}"
@@ -8274,9 +8332,13 @@ static const char dashboard_html[] =
 "function contextNotice(message,bad){$('contextNotice').className=bad?'notice bad':'notice';text('contextNotice',message)}async function saveContext(){if(contextBusy||!online||!contextLocal){contextControls();return}const value=Number($('contextNextInput').value);if(!Number.isInteger(value)||value<4096||value>2147483647){$('contextNextInput').setAttribute('aria-invalid','true');contextNotice('请输入 4,096 到 2,147,483,647 之间的整数 token 上限。',true);return}$('contextNextInput').setAttribute('aria-invalid','false');contextBusy=true;contextNotice('正在保存下次启动设置…',false);contextControls();try{const response=await fetch('/ds4/admin/context',{method:'POST',headers:{'Content-Type':'application/json','X-DS4-Admin':'1'},body:JSON.stringify({context_tokens:value})});let body;try{body=await response.json()}catch(e){throw new Error('服务器返回了无法读取的上下文设置结果。')}if(response.status===403){contextLocal=false;throw new Error('上下文设置仅可从本机管理。')}if(!body.ok&&!(body.persistent&&body.persistent.committed))throw new Error('上下文设置失败，请检查数值后重试。');const p=body.persistent||{};contextNotice(p.committed&&p.durable?'已保存：下次启动生效，需要重启；当前运行值未改变。':p.committed?'已提交，但尚未确认已持久化；下次启动生效，需要重启；当前运行值未改变。':'未能提交下次启动设置。',!p.committed||!p.durable)}catch(e){contextNotice(e.message,true)}finally{contextBusy=false;contextControls()}}"
 "function setMode(value){const mode=['management','monitor'].includes(value)?value:'management';dash.dataset.mode=mode;for(const name of ['management','monitor']){const root=$(name+'Layout'),active=name===mode;root.hidden=!active;root.setAttribute('aria-hidden',String(!active))}try{localStorage.setItem('ds4-dashboard-mode',mode)}catch(e){}document.querySelectorAll('[data-mode-choice]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.modeChoice===mode)))}const filterLabels={callFilterCaller:'调用方',callFilterClient:'服务',callFilterApi:'API',callFilterStatus:'结果'};for(const [id,labelText] of Object.entries(filterLabels)){const control=$(id),field=document.createElement('div'),label=document.createElement('label');field.className='filter-field';label.className='eyebrow';label.htmlFor=id;label.textContent=labelText;control.before(field);field.append(label,control)}try{setMode(localStorage.getItem('ds4-dashboard-mode'))}catch(e){setMode('management')}document.querySelectorAll('[data-mode-choice]').forEach(b=>b.addEventListener('click',()=>setMode(b.dataset.modeChoice)));const touchKvTarget=()=>{kvTargetTouched=true;setKvInvalid(false);updateKvTargetState()};$('kvBudgetInput').addEventListener('input',touchKvTarget);$('kvBudgetUnit').addEventListener('input',touchKvTarget);$('kvBudgetUnit').addEventListener('change',touchKvTarget);$('contextNextInput').addEventListener('input',()=>{contextTargetTouched=true;$('contextNextInput').setAttribute('aria-invalid','false')});['callFilterCaller','callFilterClient','callFilterApi','callFilterStatus'].forEach(id=>$(id).addEventListener('input',()=>{const s=lastSnapshot||{};paintCalls(s.calls,s.request,s.active===true)}));"
 "document.querySelectorAll('[data-theme-choice]').forEach(b=>b.addEventListener('click',()=>setTheme(b.dataset.themeChoice)));try{setTheme(localStorage.getItem('ds4-dashboard-theme'))}catch(e){setTheme('paper')}let glassLightFrame=0;addEventListener('pointermove',e=>{if(glassLightFrame)return;glassLightFrame=requestAnimationFrame(()=>{glassLightFrame=0;const root=document.documentElement;if(root.dataset.theme!=='glass')return;root.style.setProperty('--mx',(e.clientX/innerWidth*100).toFixed(1)+'%');root.style.setProperty('--my',(e.clientY/innerHeight*100).toFixed(1)+'%')})},{passive:true});"
-"const STATUS_TIMEOUT_MS=2000;/* Bound a status request without overlapping client polls. */async function tick(){const generation=++pollGeneration,controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),STATUS_TIMEOUT_MS);try{const response=await fetch('/ds4/status',{cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error('status '+response.status);const snapshot=await response.json();if(generation===pollGeneration){pollFailures=0;paint(snapshot)}}catch(e){if(generation===pollGeneration){pollFailures++;online=false;dash.classList.add('stale');text('health',lastSnapshot?'数据已过期':'不可用');text('updatedAt',freshnessLabel(true));setKvState(kvState);contextControls()}}finally{clearTimeout(timeout);if(generation===pollGeneration)if(pollFailures)setTimeout(tick,Math.min(5000,1000*pollFailures));else setTimeout(tick,1000)}}$('kvApplyNow').addEventListener('click',checkKvImpact);$('kvSaveRestart').addEventListener('click',persistKvBudget);$('kvConfirmApply').addEventListener('click',confirmKvApply);$('kvCancelApply').addEventListener('click',cancelKvApply);$('contextSaveRestart').addEventListener('click',saveContext);setInterval(()=>text('updatedAt',freshnessLabel(!online)),1000);setKvState(kvState);contextControls();tick();"
+"const STATUS_TIMEOUT_MS=2000;/* Bound a status request without overlapping client polls. */async function tick(){const generation=++pollGeneration,controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),STATUS_TIMEOUT_MS);try{const response=await fetch('/ds4/status',{cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error('status '+response.status);const snapshot=await response.json();if(generation===pollGeneration){pollFailures=0;paint(snapshot)}}catch(e){if(generation===pollGeneration){pollFailures++;ds4MetricMotionReset();online=false;dash.classList.add('stale');text('health',lastSnapshot?'数据已过期':'不可用');text('updatedAt',freshnessLabel(true));setKvState(kvState);contextControls()}}finally{clearTimeout(timeout);if(generation===pollGeneration)if(pollFailures)setTimeout(tick,Math.min(5000,1000*pollFailures));else setTimeout(tick,1000)}}$('kvApplyNow').addEventListener('click',checkKvImpact);$('kvSaveRestart').addEventListener('click',persistKvBudget);$('kvConfirmApply').addEventListener('click',confirmKvApply);$('kvCancelApply').addEventListener('click',cancelKvApply);$('contextSaveRestart').addEventListener('click',saveContext);setInterval(()=>text('updatedAt',freshnessLabel(!online)),1000);setKvState(kvState);contextControls();tick();"
 "const ds4UnknownClient=value=>{const text=String(value==null?'':value).trim();return !text||text==='未标识服务'||text==='—'};const ds4StableClient=(record,records)=>{const raw=String(record&&record.client!=null?record.client:'').trim();if(!ds4UnknownClient(raw))return raw;const caller=String(record&&record.caller!=null?record.caller:'').trim();if(!caller)return raw||'未标识服务';const known=[...new Set((records||[]).filter(item=>String(item&&item.caller!=null?item.caller:'').trim()===caller).map(item=>String(item&&item.client!=null?item.client:'').trim()).filter(item=>!ds4UnknownClient(item)))];return known.length===1?known[0]:raw||'未标识服务'};const ds4StableCalls=calls=>{const source=Array.isArray(calls&&calls.records)?calls.records:[],records=source.map(record=>({...record,client:ds4StableClient(record,source)}));return {...(calls||{}),records}};const rawPaintCalls=paintCalls;paintCalls=function(calls,request,snapshotActive){return rawPaintCalls(ds4StableCalls(calls),request,snapshotActive)};const rawPaintRecentCalls=paintRecentCalls;paintRecentCalls=function(calls,request,snapshotActive){return rawPaintRecentCalls(ds4StableCalls(calls),request,snapshotActive)};const rawPaintMonitor=paintMonitor;paintMonitor=function(snapshot){const stable={...snapshot,calls:ds4StableCalls(snapshot&&snapshot.calls)};rawPaintMonitor(stable);const calls=stable.calls||{},currentId=stable.active===true?activeId(calls.active_request_id):null,current=(calls.records||[]).find(record=>currentId&&String(record.request_id)===currentId),prefill=stable.prefill||{},decode=stable.decode||{},active=stable.active===true&&!!current,showPrefill=active&&['prefill','decode'].includes(stable.phase)&&finite(prefill.current)&&finite(prefill.total)&&prefill.total>0,showDecode=active&&stable.phase==='decode'&&finite(decode.generated)&&finite(decode.max_tokens)&&decode.max_tokens>0;const setProgress=(id,show,value,total)=>{const node=$(id);if(node)node.style.width=(show?Math.max(0,Math.min(100,value/total*100)):0)+'%'};setProgress('monitorPrefillBar',showPrefill,num(prefill.current),num(prefill.total));setProgress('monitorDecodeBar',showDecode,num(decode.generated),num(decode.max_tokens))};const metricCells=[...document.querySelectorAll('#monitorMetrics>div')];[[1,'monitorPrefillBar'],[2,'monitorDecodeBar']].forEach(([index,id])=>{const cell=metricCells[index];if(!cell)return;cell.classList.add('metric-primary');let bar=cell.querySelector('.metric-bar');if(!bar){bar=document.createElement('div');bar.className='metric-bar';bar.setAttribute('aria-hidden','true');const span=document.createElement('span');span.id=id;bar.append(span);cell.append(bar)}});document.querySelectorAll('[data-mode-choice]').forEach(button=>button.addEventListener('click',()=>{const activeLayout=document.querySelector('.mode-layout:not([hidden])');if(activeLayout){activeLayout.classList.remove('mode-enter');void activeLayout.offsetWidth;activeLayout.classList.add('mode-enter')}}));if(!['management','monitor'].includes(window.__ds4InitialMode))setMode('monitor')"
 ";const ds4ClientMemoryKey='ds4-dashboard-client-map',ds4KnownClients=(()=>{try{const raw=JSON.parse(localStorage.getItem(ds4ClientMemoryKey)||'{}');return new Map(Object.entries(raw).filter(([caller,client])=>caller&&client&&caller.length<=160&&client.length<=160).slice(-128))}catch(e){return new Map()}})(),ds4PersistClients=()=>{try{localStorage.setItem(ds4ClientMemoryKey,JSON.stringify(Object.fromEntries([...ds4KnownClients].slice(-128))))}catch(e){}};const ds4StableCallsPersistent=calls=>{const source=Array.isArray(calls&&calls.records)?calls.records:[];let clientsChanged=false;source.slice().reverse().forEach(record=>{const caller=String(record&&record.caller!=null?record.caller:'').trim(),client=String(record&&record.client!=null?record.client:'').trim();if(caller&&!ds4UnknownClient(client)&&ds4KnownClients.get(caller)!==client){ds4KnownClients.set(caller,client);clientsChanged=true}});const records=source.map(record=>{const raw=String(record&&record.client!=null?record.client:'').trim();if(!ds4UnknownClient(raw))return record;const caller=String(record&&record.caller!=null?record.caller:'').trim(),mapped=caller&&ds4KnownClients.get(caller);return {...record,client:mapped||raw||'未标识服务'}});if(clientsChanged)ds4PersistClients();return {...(calls||{}),records}};const ds4PaintCallsWithMemory=paintCalls;paintCalls=function(calls,request,snapshotActive){return ds4PaintCallsWithMemory(ds4StableCallsPersistent(calls),request,snapshotActive)};const ds4PaintRecentWithMemory=paintRecentCalls;paintRecentCalls=function(calls,request,snapshotActive){return ds4PaintRecentWithMemory(ds4StableCallsPersistent(calls),request,snapshotActive)};const ds4MetricCells=[...document.querySelectorAll('#monitorMetrics>div')],ds4MetricMeta=(index,id,label,klass)=>{const cell=ds4MetricCells[index];if(!cell)return;const eyebrow=cell.querySelector('.eyebrow');if(eyebrow)eyebrow.textContent=label;let node=$(id);if(!node){node=document.createElement('span');node.id=id;node.className=klass||'metric-subvalue';node.textContent='—';cell.append(node)}};ds4MetricMeta(0,'monitorPhaseMeta','服务','metric-phase-meta');ds4MetricMeta(1,'monitorPrefillMeta','预填充速度');ds4MetricMeta(2,'monitorDecodeMeta','解码速度');const ds4FormatProgress=(value,total)=>finite(value)&&finite(total)&&total>0?num(value).toLocaleString()+' / '+num(total).toLocaleString()+' token · '+Math.min(100,value/total*100).toFixed(1)+'%':'不可用';const ds4PaintMonitorWithMemory=paintMonitor;paintMonitor=function(snapshot){const stable={...snapshot,calls:ds4StableCallsPersistent(snapshot&&snapshot.calls)};ds4PaintMonitorWithMemory(stable);const phase=$('monitorPhase'),phaseMeta=$('monitorPhaseMeta'),phaseParts=String(phase&&phase.textContent||'').split(' · ');if(phase&&phaseMeta){phase.textContent=phaseParts.length>2?phaseParts.slice(0,2).join(' · '):phaseParts.join(' · ');phaseMeta.textContent='服务 · '+(phaseParts.length>2?phaseParts.slice(2).join(' · '):'—')}const p=stable.prefill||{},d=stable.decode||{},prefillMeta=$('monitorPrefillMeta'),decodeMeta=$('monitorDecodeMeta');if(prefillMeta)prefillMeta.textContent=ds4FormatProgress(p.current,p.total);if(decodeMeta)decodeMeta.textContent=ds4FormatProgress(d.generated,d.max_tokens);for(const [id,metaId] of [['monitorPrefill','monitorPrefillMeta'],['monitorDecode','monitorDecodeMeta']]){const node=$(id),meta=$(metaId),raw=String(node&&node.textContent||''),marker=' · ',at=raw.indexOf(marker);if(node&&meta&&at>0){node.textContent=raw.slice(0,at)}}};"
+"const ds4MetricMotionValues=Object.create(null),ds4MetricMotionText=Object.create(null);"
+"const ds4MetricMotionReset=()=>{for(const id of ['monitorPrefill','monitorDecode','monitorCacheHit','monitorContext','monitorQueue']){delete ds4MetricMotionValues[id];delete ds4MetricMotionText[id];const node=$(id);if(node)node.__ds4MetricMotionToken=(node.__ds4MetricMotionToken||0)+1}};"
+"const ds4MetricText=(id,value,raw)=>{const node=$(id),next=String(value);if(!node)return;let viewport=node.querySelector('.metric-value-window');if(!viewport){const layer=document.createElement('span');layer.className='metric-value-layer';layer.textContent=next;viewport=document.createElement('span');viewport.className='metric-value-window';viewport.append(layer);node.replaceChildren(viewport)}node.setAttribute('aria-live','polite');const numeric=finite(raw)?Number(raw):null,previous=ds4MetricMotionValues[id],direction=numeric!=null&&previous!=null&&numeric!==previous?(numeric>previous?'increase':'decrease'):'none';node.dataset.motionDirection=direction;if(numeric==null)delete ds4MetricMotionValues[id];else ds4MetricMotionValues[id]=numeric;if(ds4MetricMotionText[id]===next)return;const incoming=document.createElement('span');incoming.className='metric-value-layer';incoming.textContent=next;const token=(node.__ds4MetricMotionToken||0)+1;node.__ds4MetricMotionToken=token;const finish=()=>{if(node.__ds4MetricMotionToken!==token)return;viewport.replaceChildren(incoming);incoming.className='metric-value-layer';incoming.removeAttribute('aria-hidden')};if(direction==='none'||window.matchMedia('(prefers-reduced-motion: reduce)').matches){viewport.replaceChildren(incoming);ds4MetricMotionText[id]=next;return}const outgoing=document.createElement('span');outgoing.className='metric-value-layer metric-value-layer-out-'+direction;outgoing.textContent=ds4MetricMotionText[id]||viewport.textContent||'—';outgoing.setAttribute('aria-hidden','true');incoming.className='metric-value-layer metric-value-layer-in-'+direction;viewport.replaceChildren(outgoing,incoming);incoming.addEventListener('animationend',finish,{once:true});window.setTimeout(finish,460);ds4MetricMotionText[id]=next};"
+"const ds4MetricMotionPaint=paintMonitor;paintMonitor=function(snapshot){ds4MetricMotionPaint(snapshot);const s=snapshot||{},p=s.prefill||{},d=s.decode||{},r=s.request||{},x=s.context||{},calls=s.calls||{},currentId=s.active===true?activeId(calls.active_request_id):null,current=(calls.records||[]).find(call=>currentId&&String(call.request_id)===currentId),hasCurrent=!!current,cacheRatio=hasCurrent?ratio(r.cached_tokens,r.prompt_tokens):null;for(const [id,raw] of [['monitorPrefill',hasCurrent&&['prefill','decode'].includes(s.phase)&&finite(p.avg_tps)?p.avg_tps:null],['monitorDecode',hasCurrent&&s.phase==='decode'&&finite(d.avg_tps)?d.avg_tps:null],['monitorCacheHit',cacheRatio],['monitorContext',finite(x.utilization)?x.utilization:null],['monitorQueue',finite(s.queue_depth)&&finite(s.clients)?s.queue_depth:null]])ds4MetricText(id,$(id).textContent,raw)};"
 "</script></body></html>\n";
 
 static bool send_dashboard_page(int fd, bool enable_cors) {
@@ -8287,7 +8349,8 @@ static bool send_dashboard_page(int fd, bool enable_cors) {
 
 static const char *call_status_name(ds4_call_status status) {
 	return status == DS4_CALL_ACTIVE ? "active" :
-		status == DS4_CALL_COMPLETED ? "completed" : "failed";
+		status == DS4_CALL_COMPLETED ? "completed" :
+		status == DS4_CALL_CANCELLED ? "cancelled" : "failed";
 }
 
 static void append_status_calls_json(buf *b, const ds4_call_history_snapshot *calls,
@@ -8388,11 +8451,13 @@ static void append_status_json(buf *b, const server_status *st,
                st->decode_chunk_tps,
                st->decode_elapsed_s);
     buf_printf(b, ",\"totals\":{\"requests\":%llu,\"completed\":%llu,\"failed\":%llu,"
+				  "\"cancelled\":%llu,"
                   "\"cache\":{\"prompt_tokens\":%llu,\"cached_tokens\":%llu,"
                   "\"prompt_requests\":%llu,\"hit_requests\":%llu}}",
                (unsigned long long)st->total_requests,
                (unsigned long long)st->completed_requests,
                (unsigned long long)st->failed_requests,
+			   (unsigned long long)st->cancelled_requests,
                (unsigned long long)st->total_prompt_tokens,
                (unsigned long long)st->total_cached_tokens,
                (unsigned long long)st->prompt_requests,
@@ -9657,6 +9722,23 @@ static void server_kv_reset_continued_store(server *s) {
 	pthread_mutex_lock(&s->kv_mu);
 	s->kv.continued_last_store_tokens = 0;
 	pthread_mutex_unlock(&s->kv_mu);
+}
+
+static void server_discard_cancelled_live_state(server *s) {
+	if (!s) return;
+	if (s->session) ds4_session_invalidate(s->session);
+	server_kv_reset_continued_store(s);
+	responses_live_clear(s);
+	anthropic_live_clear(s);
+	thinking_live_clear(s);
+}
+
+static void server_finish_cancelled_active(server *s, const job *j,
+	int output_tokens, const char *cache_source, const char *reason) {
+	server_discard_cancelled_live_state(s);
+	server_call_history_finish(s, j, DS4_CALL_CANCELLED, output_tokens,
+		cache_source, "cancelled", reason);
+	server_status_finish_request(s, "cancelled", reason);
 }
 
 static int server_kv_cold_store_len(server *s, const ds4_tokens *prompt,
@@ -11132,13 +11214,34 @@ static void generate_job(server *s, job *j) {
 			server_kv_suppress_continued_store(s, cold_store_len);
     }
 
-	if (kv_policy.enabled &&
+    if (kv_policy.enabled &&
 		cold_store_len >= kv_policy.min_tokens &&
         cold_store_len < prompt_for_sync->len)
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (ds4_session_sync(s->session, &prefix, err, sizeof(err)) != 0) {
+		int sync_rc = ds4_session_sync(s->session, &prefix, err, sizeof(err));
+		if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED ||
+		    (sync_rc == 0 && server_job_client_disconnected(j)))
+		{
+			ds4_tokens_free(&prefix);
+			ds4_tokens_free(&effective_prompt);
+			ds4_session_set_progress(s->session, NULL, NULL);
+			ds4_session_set_display_progress(s->session, NULL, NULL);
+			server_kv_restore_suppressed_continued(s,
+				suppressed_continued_last, cold_store_len);
+			free(disk_cache_path);
+			trace_event(s, trace_id,
+				"prefill cancelled: client disconnected during prefill");
+			server_log(DS4_LOG_GENERATION,
+				"ds4-server: %s ctx=%s%s%s cancelled: client disconnected during prefill",
+				j->req.kind == REQ_CHAT ? "chat" : "completion",
+				ctx_span, req_flags[0] ? " " : "", req_flags);
+			server_finish_cancelled_active(s, j, 0, cache_source,
+				"client disconnected during prefill");
+			return;
+		}
+        if (sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
@@ -11164,7 +11267,27 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
+	int sync_rc = ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err));
+	if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED ||
+	    (sync_rc == 0 && server_job_client_disconnected(j)))
+	{
+		ds4_tokens_free(&effective_prompt);
+		ds4_session_set_progress(s->session, NULL, NULL);
+		ds4_session_set_display_progress(s->session, NULL, NULL);
+		server_kv_restore_suppressed_continued(s,
+			suppressed_continued_last, cold_store_len);
+		free(disk_cache_path);
+		trace_event(s, trace_id,
+			"prefill cancelled: client disconnected during prefill");
+		server_log(DS4_LOG_GENERATION,
+			"ds4-server: %s ctx=%s%s%s cancelled: client disconnected during prefill",
+			j->req.kind == REQ_CHAT ? "chat" : "completion",
+			ctx_span, req_flags[0] ? " " : "", req_flags);
+		server_finish_cancelled_active(s, j, 0, cache_source,
+			"client disconnected during prefill");
+		return;
+	}
+    if (sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
         ds4_session_set_display_progress(s->session, NULL, NULL);
@@ -11322,6 +11445,12 @@ decode_again:
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
+		if (server_job_client_disconnected(j)) {
+			finish = "cancelled";
+			snprintf(err, sizeof(err),
+				"client disconnected during decode");
+			break;
+		}
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
@@ -11362,20 +11491,45 @@ decode_again:
                                                        err,
                                                        sizeof(err));
             if (ntok < 0) {
-                finish = "error";
+				if (server_job_client_disconnected(j)) {
+					finish = "cancelled";
+					snprintf(err, sizeof(err),
+						"client disconnected during decode");
+				} else {
+					finish = "error";
+				}
                 break;
             }
         } else {
             if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
-                finish = "error";
+				if (server_job_client_disconnected(j)) {
+					finish = "cancelled";
+					snprintf(err, sizeof(err),
+						"client disconnected during decode");
+				} else {
+					finish = "error";
+				}
                 break;
             }
             toks[0] = token;
             ntok = 1;
         }
+		if (server_job_client_disconnected(j)) {
+			finish = "cancelled";
+			snprintf(err, sizeof(err),
+				"client disconnected during decode");
+			break;
+		}
 
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
+			if (server_job_client_disconnected(j)) {
+				finish = "cancelled";
+				snprintf(err, sizeof(err),
+					"client disconnected during decode");
+				stop_decode = true;
+				break;
+			}
             token = toks[ti];
             if (token == ds4_token_eos(s->engine)) {
                 finish = "stop";
@@ -11564,14 +11718,20 @@ decode_again:
         }
         if (stop_decode) break;
     }
+	if (server_job_client_disconnected(j)) {
+		finish = "cancelled";
+		snprintf(err, sizeof(err), "client disconnected during decode");
+	}
 
-    if (g_stop_requested && strcmp(finish, "error") != 0) {
+    if (g_stop_requested && strcmp(finish, "error") != 0 &&
+		strcmp(finish, "cancelled") != 0) {
         finish = "error";
         snprintf(err, sizeof(err), "shutdown requested");
     }
 
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
-        saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
+		saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0 &&
+		strcmp(finish, "cancelled") != 0)
     {
         /* Deterministically complete a simple truncation.  Anything more than
          * missing closing tags stays model-owned: for non-streaming requests,
@@ -11621,23 +11781,32 @@ decode_again:
                                                 recovery_err,
                                                 sizeof(recovery_err)))
                 {
-                    dsml_recovery_attempted = true;
-                    server_log(DS4_LOG_GENERATION,
-                               "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
-                               ctx_span,
-                               req_flags[0] ? " " : "",
-                               req_flags,
-                               recovery_tokens);
-                    trace_event(s, trace_id,
-                                "tool-error continuation appended %d tokens",
-                                recovery_tokens);
-                    buf_free(&repaired);
-                    buf_free(&text);
-                    goto decode_again;
+					if (server_job_client_disconnected(j)) {
+						finish = "cancelled";
+						snprintf(err, sizeof(err),
+							"client disconnected during decode");
+					} else {
+						dsml_recovery_attempted = true;
+						server_log(DS4_LOG_GENERATION,
+								   "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
+								   ctx_span,
+								   req_flags[0] ? " " : "",
+								   req_flags,
+								   recovery_tokens);
+						trace_event(s, trace_id,
+									"tool-error continuation appended %d tokens",
+									recovery_tokens);
+						buf_free(&repaired);
+						buf_free(&text);
+						goto decode_again;
+					}
                 }
-                finish = "error";
-                snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
-                         recovery_err[0] ? recovery_err : "unknown error");
+				if (strcmp(finish, "cancelled")) {
+					finish = "error";
+					snprintf(err, sizeof(err),
+						"invalid tool call recovery failed: %s",
+						recovery_err[0] ? recovery_err : "unknown error");
+				}
             } else {
                 finish = "error";
                 snprintf(err, sizeof(err), "unterminated tool call");
@@ -11645,6 +11814,11 @@ decode_again:
         }
         buf_free(&repaired);
     }
+
+	if (server_job_client_disconnected(j)) {
+		finish = "cancelled";
+		snprintf(err, sizeof(err), "client disconnected during decode");
+	}
 
     if (completion > last_decode_log_completion) {
         log_decode_progress(j->req.kind, prompt_tokens, completion,
@@ -11669,7 +11843,7 @@ decode_again:
     char *parsed_reasoning = NULL;
     const char *final_finish = finish;
     bool recovered_tool_parse_failure = false;
-    if (j->req.kind == REQ_CHAT) {
+	if (j->req.kind == REQ_CHAT && strcmp(final_finish, "cancelled")) {
         bool parsed_ok = parse_generated_message_for_response(
             text.ptr ? text.ptr : "",
             j->req.has_tools,
@@ -11704,27 +11878,36 @@ decode_again:
                                                 recovery_err,
                                                 sizeof(recovery_err)))
                 {
-                    dsml_recovery_attempted = true;
-                    server_log(DS4_LOG_GENERATION,
-                               "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
-                               ctx_span,
-                               req_flags[0] ? " " : "",
-                               req_flags,
-                               recovery_tokens);
-                    trace_event(s, trace_id,
-                                "tool-error continuation appended %d tokens",
-                                recovery_tokens);
-                    free(parsed_content);
-                    free(parsed_reasoning);
-                    tool_calls_free(&parsed_calls);
-                    buf_free(&text);
-                    goto decode_again;
+					if (server_job_client_disconnected(j)) {
+						final_finish = "cancelled";
+						snprintf(err, sizeof(err),
+							"client disconnected during decode");
+					} else {
+						dsml_recovery_attempted = true;
+						server_log(DS4_LOG_GENERATION,
+								   "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
+								   ctx_span,
+								   req_flags[0] ? " " : "",
+								   req_flags,
+								   recovery_tokens);
+						trace_event(s, trace_id,
+									"tool-error continuation appended %d tokens",
+									recovery_tokens);
+						free(parsed_content);
+						free(parsed_reasoning);
+						tool_calls_free(&parsed_calls);
+						buf_free(&text);
+						goto decode_again;
+					}
                 }
-                final_finish = "error";
-                snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
-                         recovery_err[0] ? recovery_err : "unknown error");
+				if (strcmp(final_finish, "cancelled")) {
+					final_finish = "error";
+					snprintf(err, sizeof(err),
+						"invalid tool call recovery failed: %s",
+						recovery_err[0] ? recovery_err : "unknown error");
+				}
             }
-            if (!parsed_ok) {
+			if (!parsed_ok && strcmp(final_finish, "cancelled")) {
                 /* Print raw DSML snippet for debugging */
                 size_t dsml_snippet_len = 0;
                 const char *dsml_start = NULL;
@@ -11766,26 +11949,44 @@ decode_again:
                             final_finish);
             }
         }
-        if (parsed_calls.len) {
+		if (server_job_client_disconnected(j)) {
+			final_finish = "cancelled";
+			snprintf(err, sizeof(err),
+				"client disconnected during decode");
+		}
+		if (strcmp(final_finish, "cancelled") && parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
             if (j->req.api == API_ANTHROPIC && j->req.stream)
                 apply_anthropic_stream_tool_ids(&parsed_calls, &anthropic_live);
             assign_tool_call_ids(s, &parsed_calls, j->req.api);
-            tool_memory_remember(s, &parsed_calls);
+			tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
-        } else if (j->req.api == API_RESPONSES) {
+		} else if (strcmp(final_finish, "cancelled") &&
+		           j->req.api == API_RESPONSES) {
             responses_live_clear(s);
         }
     }
-    log_tool_calls_summary(ctx_span, &parsed_calls,
-                           responses_protocol);
+	if (server_job_client_disconnected(j)) {
+		final_finish = "cancelled";
+		snprintf(err, sizeof(err), "client disconnected during decode");
+	}
+	if (strcmp(final_finish, "cancelled")) {
+		log_tool_calls_summary(ctx_span, &parsed_calls,
+			responses_protocol);
+		trace_finish(s, trace_id, &j->req, final_finish, completion,
+			saw_tool_start, saw_tool_end,
+			parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+			parsed_reasoning, &parsed_calls, now_sec() - t0);
+	} else {
+		tool_calls cancelled_calls = {0};
+		trace_event(s, trace_id,
+			"request cancelled: client disconnected during decode");
+		trace_finish(s, trace_id, &j->req, final_finish, completion,
+			false, false, "", NULL, &cancelled_calls, now_sec() - t0);
+	}
 
-    trace_finish(s, trace_id, &j->req, final_finish, completion,
-                 saw_tool_start, saw_tool_end,
-                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                 parsed_reasoning, &parsed_calls, now_sec() - t0);
-
-    if (j->req.api == API_RESPONSES) {
+	if (strcmp(final_finish, "cancelled") &&
+		j->req.api == API_RESPONSES) {
         if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
             /* Store the post-turn visible transcript plus the live token
              * frontier.  The next Responses request may replay only this
@@ -11807,7 +12008,8 @@ decode_again:
             responses_live_clear(s);
         }
     }
-    if (j->req.api == API_ANTHROPIC) {
+	if (strcmp(final_finish, "cancelled") &&
+		j->req.api == API_ANTHROPIC) {
         if (parsed_calls.len && strcmp(final_finish, "error") &&
             strcmp(final_finish, "length"))
         {
@@ -11817,32 +12019,44 @@ decode_again:
         }
     }
 
-    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
-        j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls))
-    {
+	if (strcmp(final_finish, "cancelled")) {
+		if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+			j->req.api != API_RESPONSES &&
+			should_canonicalize_tool_checkpoint(s, &parsed_calls))
+		{
         /* Chat/completions has no protocol object that binds the next request
          * to this live KV state.  Canonicalize only the fallback tool-call
          * path where we lack exact sampled DSML replay; when raw DSML is known,
          * replaying those bytes keeps future prompts aligned without rebuilding
          * hidden reasoning.  Responses deliberately skips this path because its
          * previous_response_id contract binds the next turn to live state. */
-        canonicalize_tool_checkpoint(s, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "",
-                                     parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s);
-    } else if (parsed_calls.len) {
-        thinking_live_clear(s);
-    } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
-        remember_thinking_checkpoint(s, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "");
-    } else if (!parsed_calls.len) {
-        thinking_live_clear(s);
-    }
+			canonicalize_tool_checkpoint(s, j, ctx_span, trace_id,
+				parsed_content ? parsed_content : "",
+				parsed_reasoning, &parsed_calls);
+			thinking_live_clear(s);
+		} else if (parsed_calls.len) {
+			thinking_live_clear(s);
+		} else if (!parsed_calls.len &&
+			should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
+			remember_thinking_checkpoint(s, j, ctx_span, trace_id,
+				parsed_content ? parsed_content : "");
+		} else if (!parsed_calls.len) {
+			thinking_live_clear(s);
+		}
+	}
 
+	if (server_job_client_disconnected(j)) {
+		if (strcmp(final_finish, "cancelled")) {
+			trace_event(s, trace_id,
+				"request cancelled before final response: client disconnected during decode");
+		}
+		final_finish = "cancelled";
+		snprintf(err, sizeof(err), "client disconnected during decode");
+	}
     bool response_ok = true;
-    if (j->req.stream) {
+	if (!strcmp(final_finish, "cancelled")) {
+		server_discard_cancelled_live_state(s);
+	} else if (j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
@@ -11884,26 +12098,27 @@ decode_again:
                        req_flags);
         }
     } else if (j->req.api == API_ANTHROPIC) {
-        anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
+		response_ok = anthropic_final_response(j->fd, s->enable_cors,
+			&j->req, id,
+			parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+			parsed_reasoning, &parsed_calls, final_finish,
+			prompt_tokens, completion);
     } else if (j->req.api == API_RESPONSES) {
-        responses_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
+		response_ok = responses_final_response(j->fd, s->enable_cors,
+			&j->req, id,
+			parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+			parsed_reasoning, &parsed_calls, final_finish,
+			prompt_tokens, completion);
     } else {
-        final_response(j->fd, s->enable_cors, &j->req, id,
-                       parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                       parsed_reasoning,
-                       &parsed_calls, final_finish,
-                       prompt_tokens, completion);
+		response_ok = final_response(j->fd, s->enable_cors, &j->req, id,
+			parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+			parsed_reasoning, &parsed_calls, final_finish,
+			prompt_tokens, completion);
     }
 	server_finalize_call_history(s, j, completion, cache_source, &final_finish,
-							 err, sizeof(err), response_ok);
+								 err, sizeof(err), response_ok);
+	if (!response_ok && !j->req.stream && !strcmp(final_finish, "cancelled"))
+		server_discard_cancelled_live_state(s);
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),
@@ -11912,7 +12127,8 @@ decode_again:
                   thinking.inside,
                   saw_tool_start,
                   saw_tool_end);
-        if (!strcmp(final_finish, "error") && err[0]) {
+		if ((!strcmp(final_finish, "error") ||
+		     !strcmp(final_finish, "cancelled")) && err[0]) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
                        ctx_span,
@@ -11940,7 +12156,8 @@ decode_again:
                   thinking.inside,
                   false,
                   false);
-        if (!strcmp(final_finish, "error") && err[0]) {
+		if ((!strcmp(final_finish, "error") ||
+		     !strcmp(final_finish, "cancelled")) && err[0]) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -11964,7 +12181,8 @@ decode_again:
         }
     }
     server_status_finish_request(s, final_finish,
-                                 !strcmp(final_finish, "error") && err[0] ? err : "");
+		(!strcmp(final_finish, "error") ||
+		 !strcmp(final_finish, "cancelled")) && err[0] ? err : "");
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -12010,9 +12228,14 @@ static void *worker_main(void *arg) {
 	for (;;) {
 		job *j = dequeue(s);
 		if (!j) break;
-		server_worker_active_call_set(s, j->call_request_id);
-		generate_job(s, j);
-		server_worker_active_call_clear(s, j->call_request_id);
+		if (!server_drop_disconnected_queued_job(s, j)) {
+			server_worker_active_call_set(s, j->call_request_id);
+			if (!j->req.stream)
+				ds4_session_set_cancel(s->session, server_job_cancel_cb, j);
+			generate_job(s, j);
+			ds4_session_set_cancel(s->session, NULL, NULL);
+			server_worker_active_call_clear(s, j->call_request_id);
+		}
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -14058,6 +14281,8 @@ static void test_dashboard_page_is_served_as_html(void) {
     TEST_ASSERT(strstr(out, "data-call-filter=\"caller\"") != NULL);
     TEST_ASSERT(strstr(out, "id=\"callFilterClient\"") != NULL);
     TEST_ASSERT(strstr(out, "data-call-filter=\"client\"") != NULL);
+	TEST_ASSERT(strstr(out, "<option value=\"cancelled\">已取消</option>") != NULL);
+	TEST_ASSERT(strstr(out, "cancelled:'已取消'") != NULL);
     TEST_ASSERT(strstr(out, "selectedRequestId") != NULL);
     TEST_ASSERT(strstr(out, "/ds4/admin/context") != NULL);
     TEST_ASSERT(strstr(out, "/ds4/admin/kv-cache") != NULL);
@@ -14969,9 +15194,74 @@ static void test_start_server_context_precedence(void) {
 	TEST_ASSERT(strstr(out, "--ctx 262144") != NULL); free(out);
 	TEST_ASSERT(unlink(file) == 0);
 	out = test_start_server_dry_run();
-	TEST_ASSERT(strstr(out, "--ctx 204800") != NULL); free(out);
+	TEST_ASSERT(strstr(out, "--ctx 51200") != NULL); free(out);
 	rmdir(ds4dir); rmdir(root);
 cleanup:
+	test_env_restore(&dry_run);
+	test_env_restore(&model);
+	test_env_restore(&ctx);
+	test_env_restore(&ctx_file);
+	test_env_restore(&home);
+}
+
+static void test_start_server_performance_profiles(void) {
+	test_env_value home = {0}, ctx_file = {0}, ctx = {0}, model = {0};
+	test_env_value dry_run = {0}, profile = {0}, prefill_chunk = {0}, mtp_path = {0};
+	test_env_snapshot(&home, "HOME");
+	test_env_snapshot(&ctx_file, "DS4_CTX_FILE");
+	test_env_snapshot(&ctx, "DS4_CTX");
+	test_env_snapshot(&model, "DS4_MODEL");
+	test_env_snapshot(&dry_run, "DS4_DRY_RUN");
+	test_env_snapshot(&profile, "DS4_PROFILE");
+	test_env_snapshot(&prefill_chunk, "DS4_PREFILL_CHUNK");
+	test_env_snapshot(&mtp_path, "DS4_MTP_PATH");
+	char tmpl[] = "/tmp/ds4-performance-launcher.XXXXXX";
+	char *root = mkdtemp(tmpl);
+	TEST_ASSERT(root != NULL);
+	if (!root) goto cleanup;
+	TEST_ASSERT(setenv("HOME", root, 1) == 0);
+	TEST_ASSERT(unsetenv("DS4_CTX_FILE") == 0);
+	TEST_ASSERT(unsetenv("DS4_CTX") == 0);
+	TEST_ASSERT(setenv("DS4_MODEL", "", 1) == 0);
+	TEST_ASSERT(setenv("DS4_DRY_RUN", "1", 1) == 0);
+	TEST_ASSERT(unsetenv("DS4_PROFILE") == 0);
+	TEST_ASSERT(unsetenv("DS4_PREFILL_CHUNK") == 0);
+	TEST_ASSERT(unsetenv("DS4_MTP_PATH") == 0);
+
+	char *out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--ctx 51200") != NULL);
+	TEST_ASSERT(strstr(out, "--prefill-chunk 5120") != NULL);
+	TEST_ASSERT(strstr(out, "--mtp") == NULL);
+	free(out);
+
+	TEST_ASSERT(setenv("DS4_PROFILE", "greedy", 1) == 0);
+	out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--ctx 51200") != NULL);
+	TEST_ASSERT(strstr(out, "--prefill-chunk 5120") != NULL);
+	const char *default_mtp = "gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf";
+	if (access(default_mtp, F_OK) == 0) {
+		TEST_ASSERT(strstr(out, "--mtp gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf") != NULL);
+		TEST_ASSERT(strstr(out, "--mtp-draft 2") != NULL);
+	} else {
+		TEST_ASSERT(strstr(out, "--mtp") == NULL);
+	}
+	free(out);
+
+	TEST_ASSERT(setenv("DS4_MTP_PATH", "Makefile", 1) == 0);
+	out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--mtp Makefile") != NULL);
+	TEST_ASSERT(strstr(out, "--mtp-draft 2") != NULL);
+	free(out);
+
+	TEST_ASSERT(setenv("DS4_MTP_PATH", "", 1) == 0);
+	out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--mtp") == NULL);
+	free(out);
+	TEST_ASSERT(rmdir(root) == 0);
+cleanup:
+	test_env_restore(&mtp_path);
+	test_env_restore(&prefill_chunk);
+	test_env_restore(&profile);
 	test_env_restore(&dry_run);
 	test_env_restore(&model);
 	test_env_restore(&ctx);
@@ -15288,6 +15578,8 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
     s.status.session_pos = 40;
     buf b = {0};
     append_status_json(&b, &s.status, &kv, &host, &calls, history.capacity, 0);
+	TEST_ASSERT(strstr(b.ptr, "\"totals\":{\"requests\":3,\"completed\":0,"
+		"\"failed\":0,\"cancelled\":0,") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"cache\":{\"prompt_tokens\":150,"
                               "\"cached_tokens\":75,\"prompt_requests\":2,"
                               "\"hit_requests\":1}") != NULL);
@@ -15356,9 +15648,95 @@ static void test_status_json_reports_cache_totals_and_capacity(void) {
     s.status.failed_requests = UINT64_MAX;
     server_status_finish_request(&s, "error", "test error");
     TEST_ASSERT(s.status.failed_requests == UINT64_MAX);
+	s.status.cancelled_requests = UINT64_MAX;
+	server_status_finish_request(&s, "cancelled", "client disconnected");
+	TEST_ASSERT(s.status.cancelled_requests == UINT64_MAX);
 
     request_free(&r);
     pthread_mutex_destroy(&s.status_mu);
+}
+
+static void test_cancelled_request_counts_separately(void) {
+	server s = {0};
+	pthread_mutex_init(&s.status_mu, NULL);
+	request r;
+	request_init(&r, REQ_CHAT, 16);
+
+	server_status_begin_request(&s, &r, 0, 0, "none");
+	server_status_finish_request(&s, "cancelled",
+		"client disconnected during decode");
+
+	TEST_ASSERT(!s.status.active);
+	TEST_ASSERT(!strcmp(s.status.finish, "cancelled"));
+	TEST_ASSERT(s.status.cancelled_requests == 1);
+	TEST_ASSERT(s.status.completed_requests == 0);
+	TEST_ASSERT(s.status.failed_requests == 0);
+
+	request_free(&r);
+	pthread_mutex_destroy(&s.status_mu);
+}
+
+static void test_cancelled_active_request_discards_live_state(void) {
+	server s = {0};
+	job j = {0};
+	pthread_mutex_init(&s.kv_mu, NULL);
+	pthread_mutex_init(&s.tool_mu, NULL);
+	pthread_mutex_init(&s.status_mu, NULL);
+	pthread_mutex_init(&s.call_history_mu, NULL);
+	ds4_call_history_init(&s.call_history);
+	request_init(&j.req, REQ_CHAT, 16);
+
+	s.kv.continued_last_store_tokens = 123;
+	s.responses_live.valid = true;
+	s.responses_live.live_tokens = 101;
+	s.responses_live.visible_text = xstrdup("responses live");
+	s.responses_live.visible_len = strlen(s.responses_live.visible_text);
+	s.anthropic_live.valid = true;
+	s.anthropic_live.live_tokens = 102;
+	s.anthropic_live.visible_text = xstrdup("anthropic live");
+	s.anthropic_live.visible_len = strlen(s.anthropic_live.visible_text);
+	s.thinking_live.valid = true;
+	s.thinking_live.live_tokens = 103;
+	s.thinking_live.visible_text = xstrdup("thinking live");
+	s.thinking_live.visible_len = strlen(s.thinking_live.visible_text);
+	j.call_request_id = ds4_call_history_begin(&s.call_history, "caller", NULL,
+		"openai", "chat", false, false, 1.0);
+	server_status_begin_request(&s, &j.req, 0, 12, "none");
+
+	server_finish_cancelled_active(&s, &j, 0, "disk",
+		"client disconnected during prefill");
+
+	TEST_ASSERT(s.kv.continued_last_store_tokens == 0);
+	TEST_ASSERT(!s.responses_live.valid);
+	TEST_ASSERT(s.responses_live.visible_text == NULL);
+	TEST_ASSERT(!s.anthropic_live.valid);
+	TEST_ASSERT(s.anthropic_live.visible_text == NULL);
+	TEST_ASSERT(!s.thinking_live.valid);
+	TEST_ASSERT(s.thinking_live.visible_text == NULL);
+	TEST_ASSERT(s.call_history.len == 1);
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_CANCELLED);
+	TEST_ASSERT(s.call_history.records[0].output_tokens == 0);
+	TEST_ASSERT(!strcmp(s.call_history.records[0].cache_source, "disk"));
+	TEST_ASSERT(!strcmp(s.call_history.records[0].finish, "cancelled"));
+	TEST_ASSERT(!strcmp(s.call_history.records[0].error,
+		"client disconnected during prefill"));
+	TEST_ASSERT(!s.status.active);
+	TEST_ASSERT(!strcmp(s.status.finish, "cancelled"));
+	TEST_ASSERT(!strcmp(s.status.last_error,
+		"client disconnected during prefill"));
+	TEST_ASSERT(s.status.cancelled_requests == 1);
+	TEST_ASSERT(s.status.completed_requests == 0);
+	TEST_ASSERT(s.status.failed_requests == 0);
+
+	request_free(&j.req);
+	live_tool_state_free(&s.responses_live);
+	live_tool_state_free(&s.anthropic_live);
+	visible_live_free(&s.thinking_live);
+	ds4_call_history_free(&s.call_history);
+	pthread_mutex_destroy(&s.call_history_mu);
+	pthread_mutex_destroy(&s.status_mu);
+	pthread_mutex_destroy(&s.tool_mu);
+	pthread_mutex_destroy(&s.kv_mu);
 }
 
 static void test_call_history_capacity_keeps_active_calls(void) {
@@ -15460,6 +15838,35 @@ static void test_call_history_clamps_tokens_and_aggregates_failures(void) {
     TEST_ASSERT(snap.callers[0].recent_activity == 14.0);
     ds4_call_history_snapshot_free(&snap);
     ds4_call_history_free(&h);
+}
+
+static void test_call_history_tracks_cancelled_without_failure(void) {
+	server s = {0};
+	job j = {0};
+	pthread_mutex_init(&s.call_history_mu, NULL);
+	ds4_call_history_init(&s.call_history);
+	j.call_request_id = ds4_call_history_begin(&s.call_history, "client", NULL, "openai",
+		"chat", false, false, 10.0);
+	const char *final_finish = "cancelled";
+	char err[160] = "client disconnected during decode";
+	server_finalize_call_history(&s, &j, 0, "none", &final_finish,
+		err, sizeof(err), true);
+
+	TEST_ASSERT(s.call_history.len == 1);
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_CANCELLED);
+	TEST_ASSERT(!strcmp(call_status_name(s.call_history.records[0].status),
+		"cancelled"));
+	ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(
+		&s.call_history, 20.0);
+	TEST_ASSERT(snap.callers_len == 1);
+	TEST_ASSERT(snap.callers[0].failures == 0);
+	TEST_ASSERT(!strcmp(snap.records[0].finish, "cancelled"));
+	TEST_ASSERT(!strcmp(snap.records[0].error,
+		"client disconnected during decode"));
+
+	ds4_call_history_snapshot_free(&snap);
+	ds4_call_history_free(&s.call_history);
+	pthread_mutex_destroy(&s.call_history_mu);
 }
 
 static void test_call_history_keeps_clients_separate_per_caller(void) {
@@ -15595,6 +16002,7 @@ static void test_call_history_marks_final_stream_write_failure(void) {
 	char err[160] = {0};
 	int sv[2];
 	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	j.fd = sv[0];
 	request r;
 	request_init(&r, REQ_CHAT, 16);
 	r.model = xstrdup("test");
@@ -15602,20 +16010,101 @@ static void test_call_history_marks_final_stream_write_failure(void) {
 	void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
 	bool response_ok = sse_chunk(sv[0], &r, "test", NULL, "stop");
 	signal(SIGPIPE, old_sigpipe);
-	close(sv[0]);
 	request_free(&r);
 	TEST_ASSERT(!response_ok);
 	server_finalize_call_history(&s, &j, 3, "memory-token", &final_finish,
 							 err, sizeof(err), response_ok);
-	TEST_ASSERT(!strcmp(final_finish, "error"));
+	TEST_ASSERT(!strcmp(final_finish, "cancelled"));
 	TEST_ASSERT(err[0] != '\0');
 	TEST_ASSERT(s.call_history.len == 1);
-	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_FAILED);
-	TEST_ASSERT(!strcmp(s.call_history.records[0].finish, "error"));
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_CANCELLED);
+	TEST_ASSERT(!strcmp(s.call_history.records[0].finish, "cancelled"));
 	TEST_ASSERT(s.call_history.records[0].error[0] != '\0');
 	ds4_call_history_snapshot snap = ds4_call_history_snapshot_take(&s.call_history, 2.0);
-	TEST_ASSERT(snap.callers_len == 1 && snap.callers[0].failures == 1);
+	TEST_ASSERT(snap.callers_len == 1 && snap.callers[0].failures == 0);
 	ds4_call_history_snapshot_free(&snap);
+	close(sv[0]);
+	ds4_call_history_free(&s.call_history);
+	pthread_mutex_destroy(&s.call_history_mu);
+}
+
+extern int ds4_dist_test_cancelled_result_wait(void);
+
+static void test_distributed_result_wait_observes_cancellation(void) {
+	TEST_ASSERT(ds4_dist_test_cancelled_result_wait() == 0);
+}
+
+static void test_nonstream_client_disconnect_probe_contract(void) {
+	int sv[2] = {-1, -1};
+	int rc = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+	TEST_ASSERT(rc == 0);
+	if (rc != 0) return;
+	int flags = fcntl(sv[0], F_GETFL, 0);
+	TEST_ASSERT(flags >= 0);
+	TEST_ASSERT(flags >= 0 && fcntl(sv[0], F_SETFL, flags | O_NONBLOCK) == 0);
+
+	TEST_ASSERT(!server_client_disconnected(sv[0]));
+	const char sentinel = 'x';
+	TEST_ASSERT(send(sv[1], &sentinel, 1, 0) == 1);
+	TEST_ASSERT(!server_client_disconnected(sv[0]));
+	char received = '\0';
+	TEST_ASSERT(recv(sv[0], &received, 1, 0) == 1);
+	TEST_ASSERT(received == sentinel);
+
+	/* DS4 handles exactly one request per connection, so after its request body
+	 * is consumed, peer EOF (including SHUT_WR) means that request was abandoned. */
+	TEST_ASSERT(shutdown(sv[1], SHUT_WR) == 0);
+	TEST_ASSERT(server_client_disconnected(sv[0]));
+
+	close(sv[0]);
+	close(sv[1]);
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	TEST_ASSERT(send(sv[1], &sentinel, 1, 0) == 1);
+	TEST_ASSERT(shutdown(sv[1], SHUT_WR) == 0);
+	TEST_ASSERT(server_client_disconnected(sv[0]));
+	TEST_ASSERT(recv(sv[0], &received, 1, 0) == 1);
+	TEST_ASSERT(received == sentinel);
+
+	close(sv[0]);
+	close(sv[1]);
+}
+
+static void test_worker_drops_disconnected_nonstream_job(void) {
+	server s = {0};
+	job j = {0};
+	int sv[2] = {-1, -1};
+	pthread_mutex_init(&s.call_history_mu, NULL);
+	ds4_call_history_init(&s.call_history);
+	request_init(&j.req, REQ_CHAT, 16);
+	TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	if (sv[0] < 0 || sv[1] < 0) goto cleanup;
+	j.fd = sv[0];
+	j.call_request_id = ds4_call_history_begin(&s.call_history, "caller", NULL,
+		"openai", "chat", false, false, 1.0);
+
+	TEST_ASSERT(!server_drop_disconnected_queued_job(&s, &j));
+	TEST_ASSERT(s.call_history.len == 1);
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_ACTIVE);
+	TEST_ASSERT(shutdown(sv[1], SHUT_WR) == 0);
+	j.req.stream = true;
+	TEST_ASSERT(!server_job_cancel_cb(&j));
+	TEST_ASSERT(!server_drop_disconnected_queued_job(&s, &j));
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_ACTIVE);
+	j.req.stream = false;
+	TEST_ASSERT(server_job_cancel_cb(&j));
+	TEST_ASSERT(server_drop_disconnected_queued_job(&s, &j));
+	TEST_ASSERT(s.call_history.records[0].status == DS4_CALL_CANCELLED);
+	TEST_ASSERT(s.call_history.records[0].output_tokens == 0);
+	TEST_ASSERT(!strcmp(s.call_history.records[0].cache_source, "none"));
+	TEST_ASSERT(!strcmp(s.call_history.records[0].finish, "cancelled"));
+	TEST_ASSERT(!strcmp(s.call_history.records[0].error,
+		"client disconnected while queued"));
+	TEST_ASSERT(s.status.total_requests == 0);
+
+cleanup:
+	if (sv[0] >= 0) close(sv[0]);
+	if (sv[1] >= 0) close(sv[1]);
+	request_free(&j.req);
 	ds4_call_history_free(&s.call_history);
 	pthread_mutex_destroy(&s.call_history_mu);
 }
@@ -19691,16 +20180,22 @@ static void ds4_server_unit_tests_run(void) {
     test_dashboard_page_is_served_as_html();
     test_status_json_reports_idle_metrics_shape();
     test_status_json_reports_cache_totals_and_capacity();
+	test_cancelled_request_counts_separately();
+	test_cancelled_active_request_discards_live_state();
     test_call_history_capacity_keeps_active_calls();
 	test_call_history_never_exceeds_full_active_window();
     test_call_history_clamps_tokens_and_aggregates_failures();
+	test_call_history_tracks_cancelled_without_failure();
     test_call_history_keeps_clients_separate_per_caller();
     test_call_history_snapshot_owns_copies();
 	test_status_worker_active_call_is_not_newest_queued_call();
 	test_status_host_snapshot_does_not_wait_for_sampler();
 	test_status_host_cache_ttl_uses_monotonic_age();
 	test_status_external_timestamps_are_wall_clock();
-    test_call_history_marks_final_stream_write_failure();
+	test_call_history_marks_final_stream_write_failure();
+	test_distributed_result_wait_observes_cancellation();
+	test_nonstream_client_disconnect_probe_contract();
+	test_worker_drops_disconnected_nonstream_job();
     test_peer_caller_formats_direct_addresses();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
@@ -19783,6 +20278,7 @@ static void ds4_server_unit_tests_run(void) {
 	test_kv_admin_actual_route_and_peer_auth();
 	test_context_admin_route_auth_and_active_context();
 	test_start_server_context_precedence();
+	test_start_server_performance_profiles();
 	test_context_admin_tests_preserve_environment();
 	test_kv_admin_rejects_headers_before_body();
 	test_http_content_length_framing_is_strict();
