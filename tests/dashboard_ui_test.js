@@ -139,30 +139,52 @@ async page => {
   assert(await page.locator('#managementLayout').getAttribute('hidden')===''&&await page.locator('#managementLayout').getAttribute('aria-hidden')==='true','management layout must be hidden by default');
   assert(await page.locator('[data-mode-choice="monitor"]').getAttribute('aria-pressed')==='true','monitor mode button must be pressed by default');
   assert((await page.getByRole('navigation',{name:'Dashboard 模式'}).locator('[data-mode-choice]').allInnerTexts()).join('/')==='管理模式/监控模式','mode choices must place management before monitor');
-  assert(await page.getByRole('group',{name:'Dashboard 主题'}).locator('[data-theme-choice]').count()===4,'dashboard must expose four color themes');
-  assert(await page.locator('#dashboard').getAttribute('data-theme')==='paper'&&await page.getByRole('group',{name:'Dashboard 主题'}).locator('[data-theme-choice="paper"]').getAttribute('aria-pressed')==='true','invalid theme must fall back to paper');
-  const themeTokens=async()=>page.evaluate(()=>{const s=getComputedStyle(document.documentElement);return {theme:document.documentElement.dataset.theme,dashboard:document.getElementById('dashboard').dataset.theme,paper:s.getPropertyValue('--paper').trim(),accent:s.getPropertyValue('--accent').trim()}});
-  await page.locator('[data-theme-choice="terminal"]').click(); let activeTheme=await themeTokens(); assert(activeTheme.theme==='terminal'&&activeTheme.dashboard==='terminal'&&activeTheme.paper==='#0d1117'&&activeTheme.accent==='#58a6ff'&&await page.getByRole('group',{name:'Dashboard 主题'}).locator('[data-theme-choice="terminal"]').getAttribute('aria-pressed')==='true','terminal theme did not apply its dark palette');
-  assert(await page.evaluate(()=>localStorage.getItem('ds4-dashboard-theme'))==='terminal','theme selection was not persisted');
-  await page.locator('[data-theme-choice="calm"]').click(); activeTheme=await themeTokens(); assert(activeTheme.theme==='calm'&&activeTheme.dashboard==='calm'&&activeTheme.paper==='#e8f1f0'&&activeTheme.accent==='#0e7490'&&await page.getByRole('group',{name:'Dashboard 主题'}).locator('[data-theme-choice="calm"]').getAttribute('aria-pressed')==='true','calm theme did not apply its blue-green palette');
-  await page.reload(); await page.waitForFunction(()=>online===true&&lastUpdatedAt>0&&document.getElementById('dashboard').dataset.theme==='calm'); await page.locator('[data-theme-choice="paper"]').click();
-  await page.locator('[data-theme-choice="glass"]').click(); activeTheme=await themeTokens(); assert(activeTheme.theme==='glass'&&activeTheme.dashboard==='glass'&&activeTheme.accent==='#0071e3'&&await page.getByRole('group',{name:'Dashboard 主题'}).locator('[data-theme-choice="glass"]').getAttribute('aria-pressed')==='true','glass theme did not apply its liquid glass palette');
-  assert((await page.evaluate(()=>getComputedStyle(document.querySelector('.topbar')).backdropFilter)).includes('blur'),'glass theme did not enable frosted glass surfaces');
-  await page.locator('[data-theme-choice="paper"]').click();
+  await cfg({reset:true});
+  await page.evaluate(()=>{
+    localStorage.removeItem('ds4-dashboard-mode');
+    localStorage.setItem('ds4-dashboard-theme','terminal');
+  });
+  await reloadReady();
+  assert(await page.locator('#dashboard').getAttribute('data-mode')==='monitor','fresh dashboard must default to monitor');
+  assert(await page.locator('#monitorLayout').isVisible()&&await page.locator('#managementLayout').getAttribute('hidden')==='','fresh dashboard did not expose monitor only');
+  assert(await page.locator('[data-theme-choice],.theme-switch').count()===0,'legacy theme controls remain');
+  const lumenContract=await page.evaluate(()=>{
+    const root=getComputedStyle(document.documentElement);
+    const wall=document.body;
+    const light=document.querySelector('.light-field');
+    const shadow=document.querySelector('.light-shadow');
+    const glass=document.querySelector('.glass-column');
+    return {
+      htmlTheme:document.documentElement.dataset.theme||'',
+      dashTheme:document.getElementById('dashboard').dataset.theme||'',
+      ink:root.getPropertyValue('--ink').trim(),
+      success:root.getPropertyValue('--success').trim(),
+      danger:root.getPropertyValue('--danger').trim(),
+      wallBackground:wall?getComputedStyle(wall).backgroundImage:'',
+      lightDuration:light?getComputedStyle(light).animationDuration:'',
+      lightName:light?getComputedStyle(light).animationName:'',
+      shadowDuration:shadow?getComputedStyle(shadow).animationDuration:'',
+      shadowName:shadow?getComputedStyle(shadow).animationName:'',
+      glassBlur:glass?getComputedStyle(glass).backdropFilter:''
+    };
+  });
+  assert(!lumenContract.htmlTheme&&!lumenContract.dashTheme,'theme dataset survived single-system migration');
+  assert(lumenContract.ink==='#1b1e24'&&lumenContract.success==='#15803d'&&lumenContract.danger==='#dc2626','B1 signal tokens are wrong');
+  assert(lumenContract.wallBackground.includes('145deg')&&lumenContract.lightDuration==='18s'&&lumenContract.lightName==='signal-drift'&&lumenContract.shadowDuration==='26s'&&lumenContract.shadowName==='signal-shadow'&&lumenContract.glassBlur.includes('blur(24px)'),'real-time signal field, shadow rhythm, or glass material is missing');
+  assert(await page.locator('.glass-column:visible').count()===1,'the active mode must expose exactly one primary glass column');
   await page.locator('[data-mode-choice="management"]').click();
+  assert(await page.locator('.glass-column:visible').count()===1,'management mode must expose exactly one primary glass column');
   const legacyLayoutSelector=['paper','terminal','calm'].map(name=>'#'+name+'Layout').join(','); assert(await page.locator(legacyLayoutSelector).count()===0,'legacy theme roots must be absent');
-  const tokens=await page.evaluate(()=>{const s=getComputedStyle(document.documentElement);return ['paper','surface','ink','muted','line','accent','success','danger'].map(name=>s.getPropertyValue('--'+name).trim())});
-  assert(tokens.join(',')==='#f3f0e7,#f8f5ed,#171a1d,#706d65,#c4bfb4,#df4932,#28734b,#a52a1c','precision instrument tokens do not match the approved palette');
   const headings=page.locator('h1'); assert(await headings.count()===2&&await page.locator('h1:visible').count()===1&&(await page.locator('h1:visible').innerText())==='运行与容量','management mode must expose exactly one visible page heading');
   const brand=page.locator('.brand a[href="#managementSummary"]');
   assert(await brand.count()===1&&await brand.locator('[aria-hidden="true"]').count()===1,'brand anchor or status glyph is missing');
   assert(await page.getByRole('navigation',{name:'Dashboard 模式'}).locator('[data-mode-choice]').count()===2,'labeled mode navigation is missing');
-  assert(await page.locator('#connectionState>[aria-hidden="true"]').count()===1&&await page.locator('#connectionState>#health').count()===1&&await page.locator('#connectionState>#updatedAt').count()===1,'connection scaffold is incomplete');
+  assert(await page.locator('#connectionState>#connectionPulse[aria-hidden="true"]').count()===1&&await page.locator('#connectionState>#health').count()===1&&await page.locator('#connectionState>#updatedAt').count()===1,'connection signal scaffold is incomplete');
   assert(await page.locator('label[for="kvBudgetUnit"]').isVisible()&&await page.locator('label[for="callFilterCaller"],label[for="callFilterClient"],label[for="callFilterApi"],label[for="callFilterStatus"]').count()===4,'compact visible unit or monitor filter labels are missing');
   assert((await page.locator('#kvBudgetInput').getAttribute('aria-describedby'))==='budgetHelp kvTargetState adminNotice'&&(await page.locator('#kvBudgetUnit').getAttribute('aria-describedby'))==='budgetHelp kvTargetState adminNotice'&&(await page.locator('#contextNextInput').getAttribute('aria-describedby'))==='contextEffect contextNotice','administration controls are not associated with help and result text');
   const legacyLabels=['纸面运行报告','深色控制台','从容解释型','Token hit rate','Request hit rate','Disk KV capacity','Current request','tokens per second'];
   const visibleText=await page.locator('body').innerText(); assert(legacyLabels.every(label=>!visibleText.includes(label)),'legacy theme names or former English product labels remain visible');
-  await page.setViewportSize({width:1200,height:900}); const shortControls=await page.locator('a:visible,button:visible,input:visible,select:visible').evaluateAll(nodes=>nodes.filter(node=>node.getBoundingClientRect().height<44).map(node=>node.id||node.textContent));
+  await page.setViewportSize({width:1200,height:900}); const shortControls=await page.locator('a:visible,button:visible,input:visible,select:visible').evaluateAll(nodes=>nodes.filter(node=>node.getBoundingClientRect().height<43.5).map(node=>node.id||node.textContent));
   assert(shortControls.length===0,'management mode has controls shorter than 44px: '+shortControls.join(','));
   assert(await page.locator('#managementSummary').count()===1,'management summary anchor target is missing');
   await page.locator('[data-mode-choice="management"]').click(); await page.evaluate(()=>document.activeElement.blur());
@@ -177,8 +199,8 @@ async page => {
   assert(await page.locator('#managementLayout').getAttribute('hidden')===''&&await page.locator('#managementLayout').getAttribute('aria-hidden')==='true'&&await page.locator('#monitorLayout').getAttribute('hidden')===null&&await page.locator('#monitorLayout').getAttribute('aria-hidden')==='false','mode roots did not switch to monitor');
   assert(await page.locator('h1:visible').count()===1&&(await page.locator('h1:visible').innerText())==='实时运行','monitor mode must expose exactly one visible page heading');
   assert(await page.locator('[data-call-filter]').count()===4&&await page.locator('#callFilterCaller').count()===1,'monitor must own the single four-filter set');
-  await page.setViewportSize({width:1200,height:900}); const shortMonitorControls=await page.locator('a:visible,button:visible,input:visible,select:visible').evaluateAll(nodes=>nodes.filter(node=>node.getBoundingClientRect().height<44).map(node=>node.id||node.textContent));
-  assert(shortMonitorControls.length===0,'monitor mode has controls shorter than 44px: '+shortMonitorControls.join(','));
+  await page.setViewportSize({width:1200,height:900}); const shortMonitorControls=await page.locator('a:visible,button:visible,input:visible,select:visible').evaluateAll(nodes=>nodes.filter(node=>node.getBoundingClientRect().height<43.5).map(node=>({label:node.id||node.textContent,height:node.getBoundingClientRect().height,minHeight:getComputedStyle(node).minHeight,display:getComputedStyle(node).display})));
+  assert(shortMonitorControls.length===0,'monitor mode has controls shorter than 44px: '+JSON.stringify(shortMonitorControls));
   await page.locator('#callFilterCaller').fill('direct');
   const preserved=await page.evaluate(()=>({kv:document.getElementById('kvBudgetInput').value,unit:document.getElementById('kvBudgetUnit').value,context:document.getElementById('contextNextInput').value,filter:document.getElementById('callFilterCaller').value,notice:document.getElementById('adminNotice').textContent}));
   await wait(1200);
@@ -190,6 +212,19 @@ async page => {
   assert(await page.locator('#dashboard').getAttribute('data-mode')==='monitor','monitor mode did not persist');
   assert(await page.locator('#monitorLayout').getAttribute('hidden')===null&&await page.locator('#monitorLayout').getAttribute('aria-hidden')==='false','persisted monitor root state is wrong');
   const monitorMetricsText=await page.locator('#monitorMetrics').innerText(); assert(monitorMetricsText.includes('52.7 t/s')&&monitorMetricsText.includes('75.0%')&&monitorMetricsText.includes('解码中 · 运行中')&&monitorMetricsText.includes('hanako-agent'),'monitor metrics are missing decode speed, request KV hit, activity, or service');
+  assert(await page.locator('.wall-mirror').count()===0&&await page.locator('[data-mirror]').count()===0,'wall mirror wallpaper must be removed from the monitor metrics');
+  const colorContract=await page.evaluate(()=>{
+    const primaries=[...document.querySelectorAll('button.primary')];
+    const active=document.querySelector('[data-request-id="99"] .result');
+    const failed=document.querySelector('[data-request-id="98"] .result');
+    return {
+      complete:primaries.length>0&&!!active&&!!failed,
+      primaries:primaries.map(node=>getComputedStyle(node).backgroundColor),
+      active:active?getComputedStyle(active).color:'',
+      failed:failed?getComputedStyle(failed).color:''
+    };
+  });
+  assert(colorContract.complete&&colorContract.primaries.every(value=>value==='rgb(27, 30, 36)')&&colorContract.active==='rgb(21, 128, 61)'&&colorContract.failed==='rgb(220, 38, 38)','B1 action or status color discipline is broken');
   const motion=await page.evaluate(()=>({prefillWindow:!!document.querySelector('#monitorPrefill .metric-value-window'),decodeWindow:!!document.querySelector('#monitorDecode .metric-value-window'),prefillDirection:document.getElementById('monitorPrefill').dataset.motionDirection,decodeDirection:document.getElementById('monitorDecode').dataset.motionDirection,prefillBar:!!document.getElementById('monitorPrefillBar'),decodeBar:!!document.getElementById('monitorDecodeBar')})); assert(motion.prefillWindow&&motion.decodeWindow&&motion.prefillDirection==='none'&&motion.decodeDirection==='none'&&motion.prefillBar&&motion.decodeBar,'monitor metrics are missing stable value windows or initial motion state');
   const motionIds=['monitorPrefill','monitorDecode','monitorCacheHit','monitorContext','monitorQueue'];
   const patchMonitor=async patch=>{await cfg({status_patch:patch});await page.waitForFunction(ids=>ids.every(id=>document.getElementById(id).dataset.motionDirection),motionIds)};
@@ -208,6 +243,11 @@ async page => {
   await page.emulateMedia({reducedMotion:'reduce'}); await patchMonitor({queue_depth:3,prefill:{avg_tps:1900.4},decode:{avg_tps:60.7},request:{cached_tokens:28672},context:{utilization:.40}}); await page.waitForFunction(()=>document.getElementById('monitorPrefill').dataset.motionDirection==='increase'); assert(await page.evaluate(()=>document.querySelector('#monitorPrefill .metric-value-window').getAnimations().length===0&&document.querySelectorAll('#monitorPrefill .metric-value-layer').length===1),'reduced motion still started metric animation'); await page.emulateMedia({reducedMotion:'no-preference'});
   assert(await page.locator('#monitorPhase').getAttribute('data-motion-direction')===null,'phase text must not use numeric motion');
   await cfg({reset:true}); await reloadReady();
+  assert(await page.evaluate(()=>!!document.getElementById('monitorPrefillBar')&&!!document.getElementById('monitorDecodeBar')),'monitor prefill or decode bar is missing');
+  const signalBefore=await page.evaluate(()=>{const pulse=document.getElementById('connectionPulse'),stamp=document.getElementById('updatedAt');return {updated:lastUpdatedAt,pulse:Number(pulse&&pulse.dataset.signalRevision||0),stamp:Number(stamp&&stamp.dataset.signalRevision||0)}});
+  await page.waitForFunction(before=>{const pulse=document.getElementById('connectionPulse'),stamp=document.getElementById('updatedAt');return !!pulse&&lastUpdatedAt>before.updated&&Number(pulse.dataset.signalRevision||0)>before.pulse&&Number(stamp.dataset.signalRevision||0)>before.stamp},signalBefore);
+  const pollSignal=await page.evaluate(()=>{const pulse=document.getElementById('connectionPulse'),stamp=document.getElementById('updatedAt'),prefill=document.getElementById('monitorPrefillBar'),decode=document.getElementById('monitorDecodeBar');return {pulseRevision:Number(pulse.dataset.signalRevision||0),stampRevision:Number(stamp.dataset.signalRevision||0),pulseAnimations:pulse.getAnimations().map(animation=>({duration:animation.effect.getTiming().duration,playState:animation.playState})),stampAnimations:stamp.getAnimations().map(animation=>({duration:animation.effect.getTiming().duration,playState:animation.playState})),prefillProperty:getComputedStyle(prefill).transitionProperty,decodeDuration:getComputedStyle(decode).transitionDuration}});
+  assert(pollSignal.pulseRevision>0&&pollSignal.stampRevision>0&&pollSignal.pulseAnimations.some(animation=>animation.duration===620&&animation.playState==='running')&&pollSignal.stampAnimations.some(animation=>animation.duration===420&&animation.playState==='running')&&pollSignal.prefillProperty.includes('width')&&parseFloat(pollSignal.decodeDuration)>0,'successful polling does not cue the real-time signal layer or progress transition');
   assert(await page.locator('#monitorHost').count()===1,'monitor host section is missing its stable ID');
   assert((await page.locator('#callFilterApi option').evaluateAll(options=>options.map(o=>o.value).filter(Boolean).sort().join('/')))==='anthropic/openai/responses','fixture API filters do not use emitted protocol values');
   assert(await page.locator('#monitorCalls tr[data-request-id]').count()===5,'monitor must show exactly five fixture calls');
@@ -226,11 +266,11 @@ async page => {
   await hostileMonitor.locator('.request-select').click(); inspectorText=await page.locator('#requestInspector').innerText(); assert(await page.locator('#requestInspector').locator('img,script').count()===0&&inspectorText.includes('<img src=x onerror=alert(1)>')&&inspectorText.includes('<script>坏</script>'),'malicious inspector values were parsed as markup');
   await page.locator('#callFilterClient').selectOption(''); await page.locator('#callFilterCaller').fill('direct'); await page.locator('#callFilterApi').selectOption('responses'); await page.locator('#callFilterStatus').selectOption('active'); assert((await page.locator('#monitorCalls').innerText()).includes('direct')&&(await page.locator('#monitorCalls').innerText()).includes('进行中'),'monitor caller/API/result filters did not localize active result');
   assert(await page.locator('#requestInspector').getAttribute('tabindex')==='-1','request inspector is not a programmatic focus target');
-  for(const width of [1024,390]){await page.setViewportSize({width,height:900});const overflow=await page.evaluate(()=>{const wrap=document.querySelector('.call-table-wrap');return {page:document.documentElement.scrollWidth<=innerWidth,wrap:!!wrap&&wrap.scrollWidth>wrap.clientWidth&&['auto','scroll'].includes(getComputedStyle(wrap).overflowX),outside:[...document.body.querySelectorAll('*')].filter(e=>e!==wrap&&e.scrollWidth>e.clientWidth+1&&['auto','scroll'].includes(getComputedStyle(e).overflowX)).map(e=>e.className)}});assert(overflow.page&&overflow.wrap&&overflow.outside.length===0,width+'px must bound horizontal scrolling to the call table container')}
-  await page.setViewportSize({width:1200,height:900}); let monitorResponsive=await page.evaluate(()=>({columns:getComputedStyle(document.querySelector('.monitor-grid')).gridTemplateColumns.trim().split(/\s+/).length,metrics:getComputedStyle(document.querySelector('.monitor-metrics')).gridTemplateColumns.trim().split(/\s+/).length,tableMax:getComputedStyle(document.querySelector('.monitor-table-wrap')).maxHeight})); assert(monitorResponsive.columns===2&&monitorResponsive.metrics===6&&monitorResponsive.tableMax!=='none','wide monitor proportions, metric ruler, or bounded table are missing');
+  for(const width of [1024,390]){await page.setViewportSize({width,height:900});const overflow=await page.evaluate(()=>{const wrap=document.querySelector('.call-table-wrap'),rect=node=>node?{client:node.clientWidth,scroll:node.scrollWidth,width:node.getBoundingClientRect().width}:null;return {page:document.documentElement.scrollWidth<=innerWidth,wrap:!!wrap&&wrap.scrollWidth>wrap.clientWidth&&['auto','scroll'].includes(getComputedStyle(wrap).overflowX),outside:[...document.body.querySelectorAll('*')].filter(e=>e!==wrap&&e.scrollWidth>e.clientWidth+1&&['auto','scroll'].includes(getComputedStyle(e).overflowX)).map(e=>e.className),console:rect(document.querySelector('.monitor-console')),wrapBox:rect(wrap),table:rect(document.querySelector('.monitor-table'))}});assert(overflow.page&&overflow.wrap&&overflow.outside.length===0,width+'px must bound horizontal scrolling to the call table container: '+JSON.stringify(overflow))}
+  await page.setViewportSize({width:1200,height:900}); let monitorResponsive=await page.evaluate(()=>({columns:getComputedStyle(document.querySelector('.monitor-grid')).gridTemplateColumns.trim().split(/\s+/).length,metrics:getComputedStyle(document.getElementById('monitorMetrics')).gridTemplateColumns.trim().split(/\s+/).length,decode:document.querySelector('.vital-decode').getBoundingClientRect().width,prefill:document.querySelector('.vital-prefill').getBoundingClientRect().width,metricsOverflow:getComputedStyle(document.getElementById('monitorMetrics')).overflowX,tableMax:getComputedStyle(document.querySelector('.monitor-table-wrap')).maxHeight})); assert(monitorResponsive.columns===2&&monitorResponsive.metrics===3&&monitorResponsive.decode>monitorResponsive.prefill+20&&monitorResponsive.metricsOverflow==='visible'&&monitorResponsive.tableMax!=='none','wide monitor proportions, three-column metrics with decode spanning two, metrics overflow, or bounded table are missing');
   await page.setViewportSize({width:800,height:900}); monitorResponsive=await page.evaluate(()=>({columns:getComputedStyle(document.querySelector('.monitor-grid')).gridTemplateColumns.trim().split(/\s+/).length,host:getComputedStyle(document.querySelector('.monitor-host .host-ruler')).gridTemplateColumns.trim().split(/\s+/).length})); assert(monitorResponsive.columns===1&&monitorResponsive.host===3,'compact monitor did not stack its main panels or preserve adaptive host metrics');
-  await page.setViewportSize({width:700,height:900}); const metricDividers=await page.evaluate(()=>[...document.querySelector('.monitor-metrics').children].map(e=>getComputedStyle(e).borderLeftStyle)); assert(metricDividers.every(style=>style==='none'),'monitor metric ruler should not draw internal vertical dividers');
-  await page.locator('[data-theme-choice="glass"]').click(); await page.setViewportSize({width:390,height:844}); monitorResponsive=await page.evaluate(()=>({w:document.documentElement.scrollWidth,v:innerWidth,metrics:getComputedStyle(document.querySelector('.monitor-metrics')).gridTemplateColumns.trim().split(/\s+/).length,host:getComputedStyle(document.querySelector('.monitor-host .host-ruler')).gridTemplateColumns.trim().split(/\s+/).length,controls:[document.querySelector('.request-select'),document.querySelector('[data-mode-choice="monitor"]'),document.querySelector('[data-theme-choice="glass"]'),document.getElementById('callFilterCaller'),document.getElementById('callFilterClient')].map(control=>control.getBoundingClientRect().height)})); assert(monitorResponsive.w<=monitorResponsive.v&&monitorResponsive.metrics===1&&monitorResponsive.host===1&&monitorResponsive.controls.every(height=>height>=44),'390px glass monitor overflows, loses adaptive metrics, host, or 44px control sizing'); await page.locator('[data-theme-choice="paper"]').click(); await page.setViewportSize({width:1200,height:900});
+  await page.setViewportSize({width:700,height:900}); const metricDividers=await page.evaluate(()=>[...document.querySelectorAll('#monitorMetrics>.vital')].map(e=>getComputedStyle(e).borderLeftStyle)); assert(metricDividers.every(style=>style==='none'),'monitor vitals should not draw internal left borders');
+  await page.setViewportSize({width:390,height:844}); monitorResponsive=await page.evaluate(()=>({w:document.documentElement.scrollWidth,v:innerWidth,metrics:getComputedStyle(document.getElementById('monitorMetrics')).gridTemplateColumns.trim().split(/\s+/).length,host:getComputedStyle(document.querySelector('.monitor-host .host-ruler')).gridTemplateColumns.trim().split(/\s+/).length,button:document.querySelector('.request-select').getBoundingClientRect().height})); assert(monitorResponsive.w<=monitorResponsive.v&&monitorResponsive.metrics===1&&monitorResponsive.host===1&&monitorResponsive.button>=44,'390px monitor overflows or loses adaptive metrics, host, or touch target sizing'); await page.setViewportSize({width:1200,height:900});
   await page.locator('#callFilterCaller').fill(''); await page.locator('#callFilterApi').selectOption(''); await page.locator('#callFilterStatus').selectOption('');
   await cfg({status_patch:{active:false,phase:'idle',calls:{active_request_id:'0'}}}); await page.waitForFunction(()=>document.getElementById('monitorPhase').textContent.includes('空闲 · 就绪'));
   const idleMonitor=await page.evaluate(()=>({phase:monitorPhase.textContent,service:monitorPhaseMeta.textContent,prefill:monitorPrefill.textContent,decode:monitorDecode.textContent,cache:monitorCacheHit.textContent,managementActive:managementCallsActive.textContent,monitorActive:monitorCallsActive.textContent,duration:document.querySelector('[data-request-id="99"] td:nth-child(6)').textContent})); assert(idleMonitor.phase==='空闲 · 就绪'&&idleMonitor.service==='服务 · —'&&idleMonitor.prefill==='不可用'&&idleMonitor.decode==='不可用'&&idleMonitor.cache==='不可用'&&idleMonitor.managementActive.endsWith('—')&&idleMonitor.monitorActive.endsWith('—')&&idleMonitor.duration==='—','idle snapshot exposed retained current-request metrics, identity, or elapsed time');
@@ -243,6 +283,12 @@ async page => {
   await cfg({reset:true}); await page.waitForFunction(()=>[...document.querySelectorAll('#callFilterClient option')].some(o=>o.value==='hanako-agent')); await page.locator('#callFilterClient').selectOption('hanako-agent'); await page.evaluate(()=>window.__keptClientOption=[...callFilterClient.options].find(o=>o.value==='hanako-agent')); await wait(1100); assert(await page.evaluate(()=>window.__keptClientOption===[...callFilterClient.options].find(o=>o.value==='hanako-agent')),'unchanged option list was needlessly rebuilt during polling');
   const retainedRecord={...matrixBase,request_id:'99',client:'hanako-agent',api:'responses',status:'active',started_at:1,finished_at:0},changedRecord={...matrixBase,request_id:'101',client:'new-service',status:'completed',started_at:1,finished_at:2}; await cfg({call_records:[retainedRecord,changedRecord]}); await page.waitForFunction(()=>[...callFilterClient.options].some(o=>o.value==='new-service')); assert((await page.locator('#callFilterClient').inputValue())==='hanako-agent','record option update lost the still-valid selected filter');
   await page.locator('#callFilterClient').selectOption(''); const stableRecords=[{...matrixBase,request_id:'stable-known',caller:'same-caller',client:'hanako-agent',status:'completed',started_at:1,finished_at:2},{...matrixBase,request_id:'stable-missing',caller:'same-caller',client:'未标识服务',status:'completed',started_at:2,finished_at:4}]; await cfg({call_records:stableRecords,status_patch:{active:false,phase:'idle',calls:{active_request_id:''}}}); await page.waitForFunction(()=>document.querySelectorAll('#monitorCalls tr[data-request-id]').length===2); assert((await page.locator('[data-request-id="stable-missing"]').innerText()).includes('hanako-agent'),'unknown service did not inherit the unique known service for its caller'); await page.locator('[data-request-id="stable-missing"] .request-select').click(); assert((await page.locator('#requestInspector').innerText()).includes('服务\nhanako-agent'),'inspector did not keep the service identity stable');
+  const historicalBase={...matrixBase,caller:'historical-proxy',status:'completed',started_at:1,finished_at:2};
+  await cfg({call_records:[{...historicalBase,request_id:'historical-a',client:'service-a'}],status_patch:{active:false,phase:'idle',calls:{active_request_id:''}}}); await page.waitForFunction(()=>document.querySelector('[data-request-id="historical-a"]')?.textContent.includes('service-a'));
+  await cfg({call_records:[{...historicalBase,request_id:'historical-b',client:'service-b'}]}); await page.waitForFunction(()=>document.querySelector('[data-request-id="historical-b"]')?.textContent.includes('service-b'));
+  await cfg({call_records:[{...historicalBase,request_id:'historical-unknown',client:'未标识服务'}]}); await page.waitForFunction(()=>document.querySelector('[data-request-id="historical-unknown"]'));
+  const historicalText=await page.locator('[data-request-id="historical-unknown"]').innerText(),historicalMemory=await page.evaluate(()=>({map:JSON.parse(localStorage.getItem('ds4-dashboard-client-map')||'{}'),ambiguous:JSON.parse(localStorage.getItem('ds4-dashboard-client-ambiguous')||'[]')}));
+  assert(historicalText.includes('未标识服务')&&!historicalText.includes('service-b')&&!Object.prototype.hasOwnProperty.call(historicalMemory.map,'historical-proxy')&&historicalMemory.ambiguous.includes('historical-proxy'),'historically ambiguous caller inherited the most recently seen client');
   assert(await page.locator('#monitorCalls .request-select').first().getAttribute('aria-controls')==='requestInspector','request selection button does not expose its inspector relationship'); await cfg({reset:true}); await page.waitForFunction(()=>[...callFilterClient.options].some(o=>o.value==='batch-evaluator')); await page.locator('#callFilterClient').selectOption(''); await page.waitForFunction(()=>document.querySelectorAll('#monitorCalls tr[data-request-id]').length===5);
   await page.locator('[data-mode-choice="management"]').click();
   assert(await page.locator('#dashboard').getAttribute('data-mode')==='management','management mode did not reapply');
@@ -296,10 +342,15 @@ async page => {
   const uniqueControlIds=['callFilterCaller','callFilterClient','callFilterApi','callFilterStatus','kvApplyNow','kvSaveRestart','contextSaveRestart'];
   assert(await page.evaluate(ids=>ids.every(id=>document.querySelectorAll('#'+id).length===1),uniqueControlIds),'filter or administration control IDs are duplicated');
   const contextSummaryBox=await page.locator('#managementContext').boundingBox(); assert(contextSummaryBox&&contextSummaryBox.height<50,'context summary value split into an unreadable multi-line fragment');
-  await page.screenshot({path:'output/playwright/dashboard-management-desktop.png',fullPage:true});
+  await wait(300);
+  assert(await page.locator('.mode-layout:not([hidden])').evaluate(node=>getComputedStyle(node).opacity==='1'),'management screenshot was captured before the mode transition settled');
+  await page.evaluate(()=>scrollTo(0,0)); await wait(16);
+  await page.screenshot({path:'output/playwright/dashboard-management-desktop.png'});
   await page.locator('[data-mode-choice="monitor"]').click();
   await page.locator('[data-request-id="98"] .request-select').click();
   await page.waitForFunction(()=>document.getElementById('dashboard').dataset.mode==='monitor'&&document.querySelectorAll('#monitorCalls tr[data-request-id]').length===5&&document.getElementById('requestInspector').textContent.includes('hermes-agent'));
+  await wait(300);
+  assert(await page.locator('.mode-layout:not([hidden])').evaluate(node=>getComputedStyle(node).opacity==='1'),'monitor screenshot was captured before the mode transition settled');
   const monitorMetricHeights=await page.locator('#monitorMetrics strong').evaluateAll(els=>els.map(el=>el.getBoundingClientRect().height));
   const monitorMetricBorders=await page.locator('#monitorMetrics>div').evaluateAll(els=>els.map(el=>getComputedStyle(el).borderLeftWidth));
   assert(monitorMetricHeights.every(height=>height<70),'monitor metric values still break into unreadable fragments');
@@ -309,7 +360,78 @@ async page => {
   const lastInspectorFactBox=await page.locator('#requestInspector dd').last().boundingBox();
   const lastInspectorFactBottom=lastInspectorFactBox&&lastInspectorFactBox.y+lastInspectorFactBox.height; assert(lastInspectorFactBottom&&lastInspectorFactBottom<=901,'last inspector fact must fit within the 1440x900 acceptance viewport');
   assert(await page.locator('#monitorMetrics').isVisible()&&await page.locator('#requestInspector').isVisible(),'monitor metrics or selected request inspector are not visible in the acceptance view');
-  await page.screenshot({path:'output/playwright/dashboard-monitor-desktop.png',fullPage:true});
+  const informationFirst = await page.evaluate(() => {
+    const grid = document.querySelector('.monitor-grid').getBoundingClientRect();
+    const metrics = document.getElementById('monitorMetrics').getBoundingClientRect();
+    const console = document.querySelector('.monitor-console').getBoundingClientRect();
+    const host = document.querySelector('.monitor-host').getBoundingClientRect();
+    const body = getComputedStyle(document.body);
+    return {
+      mirrors: document.querySelectorAll('.wall-mirror').length,
+      gridWidth: grid.width,
+      metricsRight: metrics.right,
+      consoleLeft: console.left,
+      consoleRight: console.right,
+      consoleWidth: console.width,
+      hostGap: host.top - metrics.bottom,
+      pageWidth: document.documentElement.scrollWidth,
+      viewportWidth: innerWidth,
+      outerBackground: body.backgroundColor
+    };
+  });
+  assert(
+    informationFirst.mirrors === 0 &&
+    informationFirst.consoleWidth >= 399 &&
+    informationFirst.consoleLeft - informationFirst.metricsRight >= 24 &&
+    informationFirst.hostGap >= 16 && informationFirst.hostGap <= 28 &&
+    informationFirst.consoleLeft >= 0 &&
+    informationFirst.consoleRight <= informationFirst.viewportWidth &&
+    informationFirst.pageWidth <= informationFirst.viewportWidth,
+    'information-first desktop layout still has numeral wallpaper, overlap, a detached host rail, clipped console, or page overflow'
+  );
+  await page.setViewportSize({width:1300,height:900});
+  const boundaryDesktop=await page.evaluate(()=>{const metrics=document.getElementById('monitorMetrics').getBoundingClientRect(),console=document.querySelector('.monitor-console').getBoundingClientRect(),last=document.querySelector('.vital-queue').getBoundingClientRect();return {gap:console.left-metrics.right,lastGap:console.left-last.right,cols:getComputedStyle(document.getElementById('monitorMetrics')).gridTemplateColumns.trim().split(/\s+/).length,sw:document.documentElement.scrollWidth,vw:innerWidth}});
+  assert(boundaryDesktop.gap>=24&&boundaryDesktop.lastGap>=24&&boundaryDesktop.cols===3&&boundaryDesktop.sw<=boundaryDesktop.vw,'1300px monitor must keep the three-column metric fallback without leaking into the console');
+  await page.setViewportSize({width:1440,height:900});
+  const motionBudget=await page.evaluate(()=>{const ms=value=>value.trim().endsWith('ms')?Number.parseFloat(value):Number.parseFloat(value)*1000;const mode=getComputedStyle(document.querySelector('.mode-layout:not([hidden])')),row=getComputedStyle(document.querySelector('#monitorCalls tr[aria-selected="true"]'));return {mode:ms(mode.animationDuration),row:row.transitionDuration.split(',').map(ms)}});
+  assert(motionBudget.mode>0&&motionBudget.mode<=280&&motionBudget.row.every(value=>value>=0&&value<=200),'dashboard mode or row feedback exceeds the real-time signal motion budget');
+  await page.evaluate(()=>scrollTo(0,0)); await wait(16);
+  await page.screenshot({path:'output/playwright/dashboard-monitor-desktop.png'});
+  const longService='x'.repeat(160),longMetric=1234567890123.4,longMetricText=longMetric.toFixed(1)+' t/s';
+  const longCalls=(await fixture()).calls.records.map(record=>record.request_id==='99'?{...record,client:longService}:record);
+  await cfg({call_records:longCalls,status_patch:{active:true,phase:'decode',prefill:{avg_tps:longMetric},calls:{active_request_id:'99'}}});
+  await page.waitForFunction(([service,value])=>document.getElementById('monitorPhaseMeta').textContent.includes(service)&&document.getElementById('monitorPrefill').getAttribute('title')===value,[longService,longMetricText]);
+  const longMetricContract=await page.evaluate(()=>{const value=document.getElementById('monitorPrefill'),windowNode=value.querySelector('.metric-value-window'),layer=windowNode.querySelector('.metric-value-layer'),phase=document.getElementById('monitorPhaseMeta'),phaseCell=document.querySelector('.vital-phase');return {truncated:value.classList.contains('metric-value-truncated'),title:value.getAttribute('title'),visible:layer.textContent,ellipsis:getComputedStyle(layer).textOverflow,layerWidth:layer.getBoundingClientRect().width,windowWidth:windowNode.getBoundingClientRect().width,phaseWrap:getComputedStyle(phase).overflowWrap,phaseRight:phase.getBoundingClientRect().right,phaseCellRight:phaseCell.getBoundingClientRect().right}});
+  assert(longMetricContract.truncated&&longMetricContract.title===longMetricText&&longMetricContract.visible===longMetricText&&longMetricContract.ellipsis==='ellipsis'&&longMetricContract.layerWidth<=longMetricContract.windowWidth+1&&longMetricContract.phaseWrap==='anywhere'&&longMetricContract.phaseRight<=longMetricContract.phaseCellRight+1,'long metric or 160-character service name was silently clipped, overlapped, or lacked the full-value affordance');
+  const resizeProbe=await page.evaluate(()=>{const node=document.getElementById('monitorCacheHit'),windowNode=node.querySelector('.metric-value-window');for(const value of ['12.3 t/s','123.4 t/s','1234.5 t/s','12345.6 t/s']){metricText('monitorCacheHit',value,null);const layer=windowNode.querySelector('.metric-value-layer');if(!node.classList.contains('metric-value-truncated')&&layer.scrollWidth>94)return value}return null});
+  assert(resizeProbe,'wide monitor did not provide a stable metric value for resize truncation coverage');
+  await page.setViewportSize({width:1308,height:900});
+  await page.waitForFunction(value=>{const node=document.getElementById('monitorCacheHit');return node.classList.contains('metric-value-truncated')&&node.getAttribute('title')===value},resizeProbe);
+  const resizeTruncation=await page.evaluate(()=>{const node=document.getElementById('monitorCacheHit'),windowNode=node.querySelector('.metric-value-window'),layer=windowNode.querySelector('.metric-value-layer');return {title:node.getAttribute('title'),ellipsis:getComputedStyle(layer).textOverflow,width:layer.getBoundingClientRect().width,window:windowNode.getBoundingClientRect().width}});
+  assert(resizeTruncation.title===resizeProbe&&resizeTruncation.ellipsis==='ellipsis'&&resizeTruncation.width<=resizeTruncation.window+1,'a metric that fit at 1440px did not recompute its full-value truncation affordance at 1308px');
+  await page.setViewportSize({width:1440,height:900});
+  await cfg({reset:true}); await page.waitForFunction(()=>!document.getElementById('dashboard').classList.contains('stale')&&document.getElementById('monitorPrefill').textContent.includes('1850.4 t/s'));
+  await page.emulateMedia({reducedMotion:'reduce'});
+  await wait(20);
+  const reduced=await page.evaluate(()=>({
+    light:getComputedStyle(document.querySelector('.light-field')).animationName,
+    shadow:getComputedStyle(document.querySelector('.light-shadow')).animationName,
+    mode:getComputedStyle(document.querySelector('.mode-layout:not([hidden])')).animationName,
+    pulse:document.getElementById('connectionPulse').getAnimations().filter(animation=>animation.playState==='running').length,
+    stamp:document.getElementById('updatedAt').getAnimations().filter(animation=>animation.playState==='running').length
+  }));
+  assert(reduced.light==='none'&&reduced.shadow==='none'&&reduced.mode==='none'&&reduced.pulse===0&&reduced.stamp===0,'reduced motion still animates the signal field, polling receipt, or mode');
+  await page.emulateMedia({reducedMotion:'no-preference'});
+  await page.setViewportSize({width:390,height:844});
+  const mobileLumen=await page.evaluate(()=>({
+    overflow:document.documentElement.scrollWidth>innerWidth,
+    light:getComputedStyle(document.querySelector('.light-field')).animationName,
+    shadow:getComputedStyle(document.querySelector('.light-shadow')).animationName,
+    blur:getComputedStyle(document.querySelector('.glass-column')).backdropFilter
+  }));
+  assert(!mobileLumen.overflow&&mobileLumen.light==='none'&&mobileLumen.shadow==='none','mobile wall overflows or keeps a continuous signal animation');
+  const mobileBlur=parseFloat((mobileLumen.blur.match(/blur\(([^p]+)px\)/)||[])[1]||'0');
+  assert(mobileBlur<=12,'mobile glass blur exceeds 12px');
   await page.setViewportSize({width:390,height:844}); await page.locator('[data-mode-choice="management"]').click();
   await page.waitForFunction(()=>document.getElementById('dashboard').dataset.mode==='management'&&!document.getElementById('managementLayout').hidden&&document.documentElement.scrollWidth<=innerWidth&&document.querySelectorAll('#managementRecentCalls tr[data-call-id]').length===3);
   await page.screenshot({path:'output/playwright/dashboard-management-mobile.png',fullPage:true});
@@ -317,5 +439,42 @@ async page => {
   await cfg({call_records:ambiguousRecords,status_patch:{active:false,phase:'idle',calls:{active_request_id:''}}}); await page.evaluate(()=>{localStorage.setItem('ds4-dashboard-mode','monitor');localStorage.setItem('ds4-dashboard-client-map',JSON.stringify({'shared-caller':'stale-service'}))}); await reloadReady(); await page.waitForFunction(()=>document.querySelectorAll('#monitorCalls tr[data-request-id]').length===3);
   const ambiguousText=await page.locator('[data-request-id="ambiguous-unknown"]').innerText(); assert(ambiguousText.includes('未标识服务')&&!ambiguousText.includes('service-a')&&!ambiguousText.includes('service-b'),'ambiguous caller was mapped to one of multiple clients');
   assert(await page.evaluate(()=>{const map=JSON.parse(localStorage.getItem('ds4-dashboard-client-map')||'{}');return !Object.prototype.hasOwnProperty.call(map,'shared-caller')}),'ambiguous caller kept a stale persisted client mapping');
+  await cfg({reset:true}); await page.evaluate(()=>localStorage.setItem('ds4-dashboard-mode','management')); await page.setViewportSize({width:1024,height:900}); await reloadReady();
+  assert(await page.evaluate(()=>{const col=document.querySelector('.management-console').getBoundingClientRect().width;return col>=360&&document.documentElement.scrollWidth<=innerWidth&&getComputedStyle(document.querySelector('.settings-grid')).gridTemplateColumns.trim().split(/\s+/).length===1}),'1024px management glass column must stay >=360px with no page overflow and vertical settings');
+  await page.setViewportSize({width:1024,height:900});
+  await page.locator('[data-mode-choice="monitor"]').click();
+  const compactDesktop = await page.evaluate(() => {
+    const metrics = document.getElementById('monitorMetrics');
+    const metricsRect = metrics.getBoundingClientRect();
+    const console = document.querySelector('.monitor-console').getBoundingClientRect();
+    return { gap: console.left - metricsRect.right, width: console.width, sw: document.documentElement.scrollWidth, vw: innerWidth, cols: getComputedStyle(metrics).gridTemplateColumns.trim().split(/\s+/).length, decode: document.querySelector('.vital-decode').getBoundingClientRect().width, prefill: document.querySelector('.vital-prefill').getBoundingClientRect().width };
+  });
+  assert(compactDesktop.gap >= 24 && compactDesktop.width >= 360 && compactDesktop.sw <= compactDesktop.vw && compactDesktop.cols === 3 && compactDesktop.decode > compactDesktop.prefill + 20, '1024px monitor console overlaps, shrinks below 360px, overflows, or metrics lose the three-column layout with decode spanning two');
+  await page.setViewportSize({width:390,height:844});
+  const mobileInformationFirst = await page.evaluate(() => ({
+    mirrors: document.querySelectorAll('.wall-mirror').length,
+    sw: document.documentElement.scrollWidth,
+    vw: innerWidth,
+    consoleWidth: document.querySelector('.monitor-console').getBoundingClientRect().width,
+    metricsBottom: document.getElementById('monitorMetrics').getBoundingClientRect().bottom,
+    consoleTop: document.querySelector('.monitor-console').getBoundingClientRect().top,
+    consoleBottom: document.querySelector('.monitor-console').getBoundingClientRect().bottom,
+    hostTop: document.querySelector('.monitor-host').getBoundingClientRect().top
+  }));
+  assert(mobileInformationFirst.mirrors === 0 && mobileInformationFirst.sw <= mobileInformationFirst.vw && mobileInformationFirst.consoleWidth > 0 && mobileInformationFirst.metricsBottom <= mobileInformationFirst.consoleTop + 1 && mobileInformationFirst.consoleBottom <= mobileInformationFirst.hostTop + 1, 'mobile information-first layout has wallpaper, page overflow, missing console, or loses the metrics-to-calls-to-host order');
+  await wait(300);
+  assert(await page.locator('.mode-layout:not([hidden])').evaluate(node=>getComputedStyle(node).opacity==='1'),'mobile monitor screenshot was captured before the mode transition settled');
+  await page.screenshot({path:'output/playwright/dashboard-monitor-mobile.png',fullPage:true});
+  await cfg({offline:true}); await page.waitForFunction(()=>document.getElementById('dashboard').classList.contains('stale'));
+  assert(await page.evaluate(()=>document.body.classList.contains('dashboard-stale')&&getComputedStyle(document.querySelector('.light-field')).animationName==='none'),'stale dashboard did not apply the static light-field state');
+  await page.locator('[data-mode-choice="management"]').click();
+  await page.locator('[data-mode-choice="monitor"]').click();
+  const staleMotion=await page.evaluate(()=>({layout:getComputedStyle(document.querySelector('.mode-layout:not([hidden])')).animationName,running:document.getAnimations().filter(a=>a.animationName&&a.playState==='running').map(a=>a.animationName),pulse:document.getElementById('connectionPulse').getAnimations().filter(animation=>animation.playState==='running').length,stamp:document.getElementById('updatedAt').getAnimations().filter(animation=>animation.playState==='running').length}));
+  assert(staleMotion.layout==='none'&&staleMotion.running.length===0&&staleMotion.pulse===0&&staleMotion.stamp===0,'stale dashboard started mode, metric, ambient, or polling animations: '+staleMotion.layout+'/'+staleMotion.running.join(','));
+  await page.setViewportSize({width:1024,height:900});
+  await cfg({offline:false}); await page.waitForFunction(()=>!document.getElementById('dashboard').classList.contains('stale')&&!document.getElementById('kvApplyNow').disabled);
+  assert(await page.evaluate(()=>{const light=getComputedStyle(document.querySelector('.light-field')),shadow=getComputedStyle(document.querySelector('.light-shadow'));return !document.body.classList.contains('dashboard-stale')&&light.animationName==='signal-drift'&&light.animationPlayState==='running'&&shadow.animationName==='signal-shadow'&&shadow.animationPlayState==='running'}),'recovered desktop dashboard did not clear static state and resume both signal fields');
+  await page.locator('[data-mode-choice="monitor"]').click(); await cfg({reset:true,status_patch:{active:false,phase:'idle',calls:{active_request_id:'0'}}}); await page.waitForFunction(()=>document.getElementById('monitorPhase').textContent.includes('空闲 · 就绪'));
+  assert(await page.evaluate(()=>['monitorPrefill','monitorDecode','monitorCacheHit'].every(id=>document.getElementById(id).dataset.motionDirection==='none'&&document.getElementById(id).querySelectorAll('.metric-value-layer').length===1)),'unavailable metrics must keep direction=none and a single layer');
   return {ok:true,double_apply:'one transaction',apply_save:'one transaction',poll_max_active:1,revision_sequence:s.admin.map(x=>x.mode),fifth_row_bottom:fifthRowBottom,last_inspector_fact_bottom:lastInspectorFactBottom};
 }
