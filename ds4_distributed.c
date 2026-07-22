@@ -208,6 +208,7 @@ typedef struct {
 
 typedef struct ds4_dist_worker_entry {
     int fd;
+    uint64_t registration_id;
     char peer_host[NI_MAXHOST];
     char peer_port[NI_MAXSERV];
     char model_name[DS4_DIST_MAX_MODEL_NAME + 1u];
@@ -234,11 +235,12 @@ typedef struct {
     bool local_can_output_head;
     bool replay_check;
     bool debug;
-    bool use_control_for_work;
+    bool use_dedicated_work_connection;
     uint32_t prefill_chunk;
     uint32_t prefill_window;
     uint32_t activation_bits;
     uint64_t generation;
+    uint64_t next_registration_id;
     pthread_mutex_t mu;
     ds4_dist_worker_entry *workers;
     bool shutting_down;
@@ -352,6 +354,7 @@ typedef struct {
     uint32_t layer_end;
     uint32_t flags;
     int fd;
+    uint64_t registration_id;
 } ds4_dist_route_entry;
 
 typedef struct {
@@ -1939,6 +1942,12 @@ static int dist_recv_hello(int fd, ds4_dist_hello_fixed *hello, char *model_name
 }
 
 static void dist_coordinator_report_plan(ds4_dist_coordinator_state *state);
+static bool dist_coordinator_build_route_plan(
+        ds4_dist_coordinator_state *state,
+        ds4_dist_route_plan *plan,
+        uint64_t *generation,
+        char *err,
+        size_t errlen);
 
 static bool dist_coordinator_debug_enabled(const ds4_dist_coordinator_state *state) {
     return state && state->debug;
@@ -2000,6 +2009,7 @@ static void dist_coordinator_add_worker(
             old->has_output == hello->has_output)
         {
             *link = old->next;
+            if (old->fd >= 0) shutdown(old->fd, SHUT_RDWR);
             DIST_COORD_DEBUG(state,
                              "ds4: distributed coordinator: dropped stale worker %s:%s layers=%u:%u%s\n",
                              old->peer_host,
@@ -2013,9 +2023,12 @@ static void dist_coordinator_add_worker(
         link = &old->next;
     }
     entry->next = state->workers;
+    entry->registration_id = ++state->next_registration_id;
+    if (entry->registration_id == 0) {
+        entry->registration_id = ++state->next_registration_id;
+    }
     state->workers = entry;
     state->generation++;
-    pthread_mutex_unlock(&state->mu);
 
     char layer_end[32];
     if (entry->has_output) snprintf(layer_end, sizeof(layer_end), "output");
@@ -2031,6 +2044,7 @@ static void dist_coordinator_add_worker(
                      layer_end,
                      entry->has_hidden,
                      entry->ctx_size);
+    pthread_mutex_unlock(&state->mu);
     if (dist_coordinator_debug_enabled(state)) dist_coordinator_report_plan(state);
 }
 
@@ -2196,7 +2210,8 @@ static bool dist_route_entry_matches_worker(
         const ds4_dist_route_entry *route,
         const ds4_dist_worker_entry *worker) {
     const bool route_has_output = (route->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0;
-    return route->port == worker->listen_port &&
+    return route->registration_id == worker->registration_id &&
+           route->port == worker->listen_port &&
            strcmp(route->host, worker->peer_host) == 0 &&
            route->layer_start == worker->layer_start &&
            route->layer_end == worker->layer_end &&
@@ -2217,7 +2232,7 @@ static void dist_coordinator_forget_route_workers(
                 continue;
             }
             *link = entry->next;
-            close(entry->fd);
+            if (entry->fd >= 0) shutdown(entry->fd, SHUT_RDWR);
             DIST_COORD_DEBUG(state,
                              "ds4: distributed coordinator: forgot failed route worker %s:%u layers=%u:%u%s\n",
                              plan->entry[i].host,
@@ -2234,6 +2249,218 @@ static void dist_coordinator_forget_route_workers(
     pthread_mutex_unlock(&state->mu);
 
     if (removed_any && dist_coordinator_debug_enabled(state)) dist_coordinator_report_plan(state);
+}
+
+static bool dist_test_peer_observes_shutdown(int fd) {
+    struct pollfd pfd = {
+        .fd = fd,
+        .events = POLLIN,
+    };
+    int poll_rc;
+    do {
+        poll_rc = poll(&pfd, 1, 1000);
+    } while (poll_rc < 0 && errno == EINTR);
+    if (poll_rc <= 0 || (pfd.revents & (POLLIN | POLLHUP)) == 0) return false;
+    char byte = 0;
+    return recv(fd, &byte, 1, 0) == 0;
+}
+
+int ds4_dist_test_control_fd_ownership(void) {
+    ds4_dist_coordinator_state state = {0};
+    ds4_dist_route_entry route = {0};
+    ds4_dist_route_plan plan = {
+        .entry = &route,
+        .count = 1,
+    };
+    int sv[2] = {-1, -1};
+    if (pthread_mutex_init(&state.mu, NULL) != 0) return 1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        pthread_mutex_destroy(&state.mu);
+        return 1;
+    }
+
+    ds4_dist_worker_entry *entry = calloc(1, sizeof(*entry));
+    if (!entry) {
+        close(sv[0]);
+        close(sv[1]);
+        pthread_mutex_destroy(&state.mu);
+        return 1;
+    }
+    entry->fd = sv[0];
+    entry->registration_id = 1;
+    entry->listen_port = 19191;
+    entry->layer_start = 4;
+    entry->layer_end = 7;
+    snprintf(entry->peer_host, sizeof(entry->peer_host), "local-test");
+    state.workers = entry;
+    snprintf(route.host, sizeof(route.host), "local-test");
+    route.port = entry->listen_port;
+    route.layer_start = entry->layer_start;
+    route.layer_end = entry->layer_end;
+    route.registration_id = entry->registration_id;
+
+    dist_coordinator_forget_route_workers(&state, &plan);
+    int socket_type = 0;
+    socklen_t socket_type_len = sizeof(socket_type);
+    const bool owner_fd_still_open =
+        getsockopt(sv[0], SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_len) == 0;
+    const bool owner_woken = dist_test_peer_observes_shutdown(sv[1]);
+    const bool registry_removed = state.workers == NULL && state.generation == 1;
+
+    if (owner_fd_still_open) close(sv[0]);
+    close(sv[1]);
+    pthread_mutex_destroy(&state.mu);
+    return owner_fd_still_open && owner_woken && registry_removed ? 0 : 1;
+}
+
+int ds4_dist_test_route_forget_ignores_replacement(void) {
+    ds4_dist_coordinator_state state = {
+        .generation = 7,
+    };
+    ds4_dist_route_entry route = {
+        .port = 19191,
+        .layer_start = 4,
+        .layer_end = 7,
+        .registration_id = 1,
+    };
+    ds4_dist_route_plan plan = {
+        .entry = &route,
+        .count = 1,
+    };
+    int sv[2] = {-1, -1};
+    if (pthread_mutex_init(&state.mu, NULL) != 0) return 1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        pthread_mutex_destroy(&state.mu);
+        return 1;
+    }
+
+    ds4_dist_worker_entry *replacement = calloc(1, sizeof(*replacement));
+    if (!replacement) {
+        close(sv[0]);
+        close(sv[1]);
+        pthread_mutex_destroy(&state.mu);
+        return 1;
+    }
+    replacement->fd = sv[0];
+    replacement->registration_id = 2;
+    replacement->listen_port = route.port;
+    replacement->layer_start = route.layer_start;
+    replacement->layer_end = route.layer_end;
+    snprintf(replacement->peer_host, sizeof(replacement->peer_host), "local-test");
+    snprintf(route.host, sizeof(route.host), "local-test");
+    state.workers = replacement;
+
+    dist_coordinator_forget_route_workers(&state, &plan);
+    int socket_type = 0;
+    socklen_t socket_type_len = sizeof(socket_type);
+    const bool replacement_open =
+        getsockopt(sv[0], SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_len) == 0;
+    const bool replacement_retained =
+        state.workers == replacement && state.generation == 7;
+
+    if (state.workers == replacement) free(replacement);
+    if (replacement_open) close(sv[0]);
+    close(sv[1]);
+    pthread_mutex_destroy(&state.mu);
+    return replacement_open && replacement_retained ? 0 : 1;
+}
+
+int ds4_dist_test_stale_worker_wakes_owner(void) {
+    ds4_dist_coordinator_state state = {0};
+    ds4_dist_hello_fixed hello = {
+        .model_id = 1,
+        .layer_start = 4,
+        .layer_end = 7,
+        .listen_port = 19191,
+    };
+    int old_sv[2] = {-1, -1};
+    int new_sv[2] = {-1, -1};
+    if (pthread_mutex_init(&state.mu, NULL) != 0) return 1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, old_sv) != 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, new_sv) != 0) {
+        if (old_sv[0] >= 0) close(old_sv[0]);
+        if (old_sv[1] >= 0) close(old_sv[1]);
+        if (new_sv[0] >= 0) close(new_sv[0]);
+        if (new_sv[1] >= 0) close(new_sv[1]);
+        pthread_mutex_destroy(&state.mu);
+        return 1;
+    }
+
+    dist_coordinator_add_worker(&state, old_sv[0], "local-test", "1001", &hello, "test");
+    dist_coordinator_add_worker(&state, new_sv[0], "local-test", "1002", &hello, "test");
+
+    int socket_type = 0;
+    socklen_t socket_type_len = sizeof(socket_type);
+    const bool owner_fd_still_open =
+        getsockopt(old_sv[0], SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_len) == 0;
+    const bool owner_woken = dist_test_peer_observes_shutdown(old_sv[1]);
+    const bool replacement_registered =
+        state.workers && state.workers->fd == new_sv[0] &&
+        state.workers->next == NULL && state.generation == 2;
+
+    while (state.workers) {
+        ds4_dist_worker_entry *next = state.workers->next;
+        free(state.workers);
+        state.workers = next;
+    }
+    close(old_sv[0]);
+    close(old_sv[1]);
+    close(new_sv[0]);
+    close(new_sv[1]);
+    pthread_mutex_destroy(&state.mu);
+    return owner_fd_still_open && owner_woken && replacement_registered ? 0 : 1;
+}
+
+int ds4_dist_test_registration_ids_reach_route_plan(void) {
+    ds4_dist_coordinator_state state = {
+        .n_layers = 8,
+        .local_start = 0,
+        .local_end = 3,
+    };
+    ds4_dist_hello_fixed first = {
+        .model_id = 1,
+        .layer_start = 4,
+        .layer_end = 7,
+        .has_output = 1,
+        .listen_port = 19191,
+    };
+    ds4_dist_hello_fixed second = first;
+    second.layer_start = 5;
+    second.listen_port = 19192;
+    if (pthread_mutex_init(&state.mu, NULL) != 0) return 1;
+
+    dist_coordinator_add_worker(&state, -1, "local-test", "1001", &first, "test");
+    dist_coordinator_add_worker(&state, -1, "local-test", "1002", &second, "test");
+    ds4_dist_worker_entry *route_worker = NULL;
+    bool ids_valid = state.next_registration_id == 2;
+    for (ds4_dist_worker_entry *it = state.workers; it; it = it->next) {
+        ids_valid = ids_valid && it->registration_id != 0;
+        if (it->layer_start == first.layer_start) route_worker = it;
+    }
+    ids_valid = ids_valid && route_worker != NULL &&
+                state.workers != NULL && state.workers->next != NULL &&
+                state.workers->registration_id != state.workers->next->registration_id;
+
+    ds4_dist_route_plan plan = {0};
+    uint64_t generation = 0;
+    char err[128] = {0};
+    const bool built = dist_coordinator_build_route_plan(&state,
+                                                          &plan,
+                                                          &generation,
+                                                          err,
+                                                          sizeof(err));
+    const bool propagated = built && plan.count == 1 && route_worker &&
+                            plan.entry[0].registration_id == route_worker->registration_id &&
+                            generation == state.generation;
+
+    dist_route_plan_free(&plan);
+    while (state.workers) {
+        ds4_dist_worker_entry *next = state.workers->next;
+        free(state.workers);
+        state.workers = next;
+    }
+    pthread_mutex_destroy(&state.mu);
+    return ids_valid && propagated ? 0 : 1;
 }
 
 static bool dist_route_plan_append_blob(
@@ -2372,18 +2599,7 @@ static bool dist_coordinator_build_route_plan(
         entry.layer_start = w->layer_start;
         entry.layer_end = w->layer_end;
         entry.flags = w->has_output ? DS4_DIST_ROUTE_F_OUTPUT_LOGITS : 0u;
-        if (state->use_control_for_work && plan->count == 0) {
-            entry.fd = dup(w->fd);
-            if (entry.fd < 0) {
-                pthread_mutex_unlock(&state->mu);
-                free(workers);
-                free(path);
-                dist_route_plan_free(plan);
-                if (errlen) snprintf(err, errlen, "failed to duplicate first-hop worker connection: %s", strerror(errno));
-                return false;
-            }
-            dist_set_socket_low_latency(entry.fd);
-        }
+        entry.registration_id = w->registration_id;
 
         ds4_dist_route_entry *new_entries = realloc(plan->entry, (size_t)(plan->count + 1u) * sizeof(plan->entry[0]));
         if (!new_entries) {
@@ -2430,7 +2646,36 @@ static bool dist_coordinator_ensure_route(
         uint64_t *generation,
         char *err,
         size_t errlen) {
-    return dist_coordinator_build_route_plan(state, plan, generation, err, errlen);
+    if (!dist_coordinator_build_route_plan(state, plan, generation, err, errlen)) {
+        return false;
+    }
+    if (!state->use_dedicated_work_connection || plan->count == 0) return true;
+
+    /* Keep registration/control ownership independent from cancellable work.
+     * Pipeline cleanup may shutdown this data connection without forcing a
+     * healthy worker to deregister and reconnect. */
+    ds4_dist_route_entry *first = &plan->entry[0];
+    first->fd = dist_connect_endpoint(first->host, (int)first->port, err, errlen);
+    if (first->fd < 0) {
+        dist_route_plan_free(plan);
+        return false;
+    }
+
+    bool still_registered = false;
+    pthread_mutex_lock(&state->mu);
+    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) {
+        if (dist_route_entry_matches_worker(first, it)) {
+            still_registered = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&state->mu);
+    if (still_registered) return true;
+
+    if (errlen) snprintf(err, errlen,
+                         "first-hop worker changed while opening work connection");
+    dist_route_plan_free(plan);
+    return false;
 }
 
 static uint64_t dist_coordinator_generation(ds4_dist_coordinator_state *state) {
@@ -2800,6 +3045,17 @@ static int dist_coordinator_eval_remote_on_fd(
     return 1;
 }
 
+static int dist_local_layer_slice_result(int rc) {
+    return rc == DS4_SESSION_SYNC_INTERRUPTED ? DS4_DIST_RECV_INTERRUPTED : rc;
+}
+
+int ds4_dist_test_local_interrupt_mapping(void) {
+    return dist_local_layer_slice_result(DS4_SESSION_SYNC_INTERRUPTED) ==
+               DS4_DIST_RECV_INTERRUPTED &&
+           dist_local_layer_slice_result(0) == 0 &&
+           dist_local_layer_slice_result(1) == 1 ? 0 : 1;
+}
+
 static int dist_coordinator_eval_span(
         ds4_dist_coordinator_state *state,
         ds4_session *session,
@@ -2875,6 +3131,7 @@ static int dist_coordinator_eval_span(
                                           local_logits ? logits : NULL,
                                           err,
                                           errlen);
+    rc = dist_local_layer_slice_result(rc);
     const double local_t1 = profile ? dist_now_sec() : 0.0;
     double remote_t0 = 0.0, remote_t1 = 0.0;
     if (rc == 0 && plan->count != 0) {
@@ -3447,6 +3704,27 @@ static bool dist_prefill_reader_wait_emit_progress(
     return finished;
 }
 
+static int dist_prefill_pipeline_result(int local_rc, int reader_rc) {
+    if (local_rc == DS4_DIST_RECV_INTERRUPTED ||
+        reader_rc == DS4_DIST_RECV_INTERRUPTED) {
+        return DS4_DIST_RECV_INTERRUPTED;
+    }
+    if (reader_rc != 0) return reader_rc;
+    return local_rc == 0 ? 0 : 1;
+}
+
+int ds4_dist_test_pipeline_interrupt_precedence(void) {
+    return dist_prefill_pipeline_result(DS4_DIST_RECV_INTERRUPTED,
+                                        DS4_DIST_RECV_TRANSPORT_ERROR) ==
+               DS4_DIST_RECV_INTERRUPTED &&
+           dist_prefill_pipeline_result(1, DS4_DIST_RECV_INTERRUPTED) ==
+               DS4_DIST_RECV_INTERRUPTED &&
+           dist_prefill_pipeline_result(0, 0) == 0 &&
+           dist_prefill_pipeline_result(1, 0) == 1 &&
+           dist_prefill_pipeline_result(0, DS4_DIST_RECV_REMOTE_ERROR) ==
+               DS4_DIST_RECV_REMOTE_ERROR ? 0 : 1;
+}
+
 static bool dist_prefill_reader_wait_flow_window(
         ds4_dist_prefill_result_reader *reader,
         uint32_t submitted,
@@ -3809,6 +4087,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
                                           NULL,
                                           err,
                                           errlen);
+        rc = dist_local_layer_slice_result(rc);
         const double local_t1 = dist_now_sec();
         local_eval_sec += local_t1 - local_t0;
         if (rc != 0) break;
@@ -3850,7 +4129,8 @@ static int dist_coordinator_prefill_prompt_pipelined(
     }
     pthread_join(reader_tid, NULL);
     const double pipeline_t1 = dist_now_sec();
-    if (rc == 0 && reader.rc == 0) {
+    const int pipeline_rc = dist_prefill_pipeline_result(rc, reader.rc);
+    if (pipeline_rc == 0) {
         const double total_sec = pipeline_t1 - pipeline_t0;
         DIST_COORD_DEBUG(state,
                          "ds4: distributed coordinator: pipelined prefill done tokens=%u chunks=%u total=%.3fs %.2f t/s local=%.3fs send=%.3fs %.2f MiB/s\n",
@@ -3864,23 +4144,19 @@ static int dist_coordinator_prefill_prompt_pipelined(
                              ? ((double)sender.send_bytes / (1024.0 * 1024.0)) / sender.send_sec
                              : 0.0);
     }
-    if (reader.rc != 0) {
-        if (errlen) snprintf(err, errlen, "%s", reader.err[0] ? reader.err : "distributed pipelined prefill failed");
-        int reader_rc = reader.rc;
-        free(reader.final_payload);
-        free(reader.expected_hashes);
-        dist_prefill_sender_destroy(&sender);
-        pthread_cond_destroy(&reader.progress_cv);
-        pthread_mutex_destroy(&reader.progress_mu);
-        return reader_rc;
+    if (pipeline_rc == DS4_DIST_RECV_INTERRUPTED) {
+        if (errlen) snprintf(err, errlen, "interrupted");
+    } else if (pipeline_rc != 0 && reader.rc != 0) {
+        if (errlen) snprintf(err, errlen, "%s",
+                             reader.err[0] ? reader.err : "distributed pipelined prefill failed");
     }
     dist_prefill_sender_destroy(&sender);
     free(reader.expected_hashes);
     pthread_cond_destroy(&reader.progress_cv);
     pthread_mutex_destroy(&reader.progress_mu);
-    if (rc != 0) {
+    if (pipeline_rc != 0) {
         free(reader.final_payload);
-        return rc == DS4_DIST_RECV_INTERRUPTED ? DS4_DIST_RECV_INTERRUPTED : 1;
+        return pipeline_rc;
     }
     const uint32_t logits_bytes =
         (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
@@ -4382,7 +4658,7 @@ static void *dist_coordinator_client_main(void *arg) {
 
     dist_coordinator_add_worker(state, fd, peer_host, peer_port, &hello, model_name);
 
-    if (state->use_control_for_work) {
+    if (state->use_dedicated_work_connection) {
         dist_coordinator_monitor_worker_fd(state, fd, peer_host, peer_port);
     } else {
         for (;;) {
@@ -4478,12 +4754,112 @@ static int dist_session_ensure_route(ds4_dist_session *d, char *err, size_t errl
     return 0;
 }
 
-static void dist_session_drop_route(ds4_dist_session *d) {
+static void dist_session_discard_route(ds4_dist_session *d) {
     if (!d) return;
-    dist_coordinator_forget_route_workers(&d->state, &d->plan);
     dist_route_plan_free(&d->plan);
     d->plan_ready = false;
     d->plan_generation = 0;
+}
+
+int ds4_dist_test_interrupt_route_discard_preserves_workers(void) {
+    ds4_dist_session session = {
+        .state = {
+            .n_layers = 8,
+            .local_start = 0,
+            .local_end = 3,
+            .generation = 11,
+            .use_dedicated_work_connection = true,
+        },
+    };
+    int control[2] = {-1, -1};
+    int listener_fd = -1;
+    int work_peer_fd = -1;
+    int route_fd = -1;
+    int rc = 1;
+    bool route_discarded = false;
+    bool route_fd_closed = false;
+    char err[256];
+    if (pthread_mutex_init(&session.state.mu, NULL) != 0) return 1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, control) != 0) goto cleanup;
+
+    listener_fd = dist_open_listener("127.0.0.1", 0, err, sizeof(err));
+    if (listener_fd < 0) goto cleanup;
+    const int listen_port = dist_listener_port(listener_fd);
+    if (listen_port <= 0) goto cleanup;
+
+    ds4_dist_worker_entry *worker = calloc(1, sizeof(*worker));
+    if (!worker) goto cleanup;
+    worker->fd = control[0];
+    worker->registration_id = 1;
+    worker->listen_port = (uint32_t)listen_port;
+    worker->layer_start = 4;
+    worker->layer_end = 7;
+    worker->has_output = 1;
+    worker->has_hidden = 1;
+    snprintf(worker->peer_host, sizeof(worker->peer_host), "127.0.0.1");
+    session.state.workers = worker;
+
+    uint64_t generation = 0;
+    if (!dist_coordinator_ensure_route(&session.state,
+                                       &session.plan,
+                                       &generation,
+                                       err,
+                                       sizeof(err))) {
+        goto cleanup;
+    }
+    session.plan_ready = true;
+    session.plan_generation = generation;
+    route_fd = session.plan.entry[0].fd;
+
+    struct pollfd pfd = {
+        .fd = listener_fd,
+        .events = POLLIN,
+    };
+    if (poll(&pfd, 1, 1000) <= 0 || !(pfd.revents & POLLIN)) goto cleanup;
+    work_peer_fd = accept(listener_fd, NULL, NULL);
+    if (work_peer_fd < 0 || route_fd < 0) goto cleanup;
+
+    if (shutdown(route_fd, SHUT_RDWR) != 0) goto cleanup;
+
+    dist_session_discard_route(&session);
+    route_discarded = true;
+    int socket_type = 0;
+    socklen_t socket_type_len = sizeof(socket_type);
+    errno = 0;
+    route_fd_closed =
+        getsockopt(route_fd, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_len) < 0 &&
+        errno == EBADF;
+    const bool worker_retained = session.state.workers != NULL &&
+                                 session.state.generation == 11;
+    const bool plan_discarded = session.plan.entry == NULL &&
+                                session.plan.count == 0 &&
+                                !session.plan_ready &&
+                                session.plan_generation == 0;
+    bool control_usable = false;
+    if (worker_retained) {
+        const char sent = 'x';
+        char received = '\0';
+        control_usable = send(control[1], &sent, 1, 0) == 1 &&
+                         recv(control[0], &received, 1, 0) == 1 &&
+                         received == sent;
+    }
+    const bool work_peer_woken = dist_test_peer_observes_shutdown(work_peer_fd);
+    rc = route_fd_closed && worker_retained && plan_discarded &&
+         control_usable && work_peer_woken ? 0 : 1;
+
+cleanup:
+    if (route_discarded) {
+        if (!route_fd_closed && route_fd >= 0) close(route_fd);
+    } else {
+        dist_route_plan_free(&session.plan);
+    }
+    if (session.state.workers) free(session.state.workers);
+    if (work_peer_fd >= 0) close(work_peer_fd);
+    if (listener_fd >= 0) close(listener_fd);
+    if (control[0] >= 0) close(control[0]);
+    if (control[1] >= 0) close(control[1]);
+    pthread_mutex_destroy(&session.state.mu);
+    return rc;
 }
 
 /* =========================================================================
@@ -5566,7 +5942,7 @@ int ds4_dist_session_create(
     d->state.local_can_output_head = ds4_engine_has_output_head(engine);
     d->state.replay_check = opt->replay_check;
     d->state.debug = opt->debug;
-    d->state.use_control_for_work = true;
+    d->state.use_dedicated_work_connection = true;
     d->state.prefill_chunk = opt->prefill_chunk;
     d->state.prefill_window = opt->prefill_window;
     d->state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
@@ -5683,7 +6059,7 @@ int ds4_dist_session_sync(
                                                                        errlen);
             if (prefill_rc != 0) {
                 if (prefill_rc == DS4_DIST_RECV_INTERRUPTED) {
-                    dist_session_drop_route(d);
+                    dist_session_discard_route(d);
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
                 int rebuild_rc = dist_coordinator_rebuild_from_transcript(&d->state,
@@ -5701,7 +6077,7 @@ int ds4_dist_session_sync(
                     d->plan_ready = false;
                     d->plan_generation = 0;
                     if (rebuild_rc == DS4_DIST_RECV_INTERRUPTED) {
-                        dist_session_drop_route(d);
+                        dist_session_discard_route(d);
                         return DS4_SESSION_SYNC_INTERRUPTED;
                     }
                     return 1;
@@ -5729,7 +6105,7 @@ int ds4_dist_session_sync(
                                                      errlen);
             if (eval_rc != 0) {
                 if (eval_rc == DS4_DIST_RECV_INTERRUPTED) {
-                    dist_session_drop_route(d);
+                    dist_session_discard_route(d);
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
                 int rebuild_rc = dist_coordinator_rebuild_from_transcript(&d->state,
@@ -5747,7 +6123,7 @@ int ds4_dist_session_sync(
                     d->plan_ready = false;
                     d->plan_generation = 0;
                     if (rebuild_rc == DS4_DIST_RECV_INTERRUPTED) {
-                        dist_session_drop_route(d);
+                        dist_session_discard_route(d);
                         return DS4_SESSION_SYNC_INTERRUPTED;
                     }
                     return 1;
@@ -5772,7 +6148,7 @@ int ds4_dist_session_sync(
                                                      errlen);
     if (prefill_rc != 0) {
         if (prefill_rc == DS4_DIST_RECV_INTERRUPTED) {
-            dist_session_drop_route(d);
+            dist_session_discard_route(d);
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
         int rebuild_rc = dist_coordinator_rebuild_from_transcript(&d->state,
@@ -5790,7 +6166,7 @@ int ds4_dist_session_sync(
             d->plan_ready = false;
             d->plan_generation = 0;
             if (rebuild_rc == DS4_DIST_RECV_INTERRUPTED) {
-                dist_session_drop_route(d);
+                dist_session_discard_route(d);
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             return 1;
@@ -5832,7 +6208,7 @@ int ds4_dist_session_eval(
                                         errlen);
     if (rc != 0) {
         if (rc == DS4_DIST_RECV_INTERRUPTED) {
-            dist_session_drop_route(d);
+            dist_session_discard_route(d);
             ds4_tokens_free(&transcript);
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
@@ -5852,7 +6228,7 @@ int ds4_dist_session_eval(
             d->plan_generation = 0;
             ds4_tokens_free(&transcript);
             if (rebuild_rc == DS4_DIST_RECV_INTERRUPTED) {
-                dist_session_drop_route(d);
+                dist_session_discard_route(d);
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             return 1;
@@ -5888,7 +6264,7 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
     state.local_can_output_head = ds4_engine_has_output_head(engine);
     state.replay_check = opt->replay_check;
     state.debug = opt->debug;
-    state.use_control_for_work = gen && gen->prompt;
+    state.use_dedicated_work_connection = gen && gen->prompt;
     state.prefill_chunk = opt->prefill_chunk;
     state.prefill_window = opt->prefill_window;
     state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);

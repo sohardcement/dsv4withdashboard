@@ -26375,6 +26375,28 @@ static DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, c
     s->mtp_draft_valid = false;
 }
 
+static bool ds4_test_cancel_immediately(void *ud) {
+    int *checks = ud;
+    (*checks)++;
+    return true;
+}
+
+typedef enum {
+    DS4_LAYER_SLICE_CANCEL_NONE = 0,
+    DS4_LAYER_SLICE_CANCEL_POLL,
+    DS4_LAYER_SLICE_CANCEL_SPLIT_COMMANDS,
+} ds4_layer_slice_cancel_policy;
+
+static ds4_layer_slice_cancel_policy ds4_layer_slice_cancel_mode(
+        ds4_backend backend,
+        uint32_t n_tokens,
+        bool has_cancel) {
+    if (!has_cancel || n_tokens <= 1) return DS4_LAYER_SLICE_CANCEL_NONE;
+    return backend == DS4_BACKEND_METAL ?
+        DS4_LAYER_SLICE_CANCEL_SPLIT_COMMANDS :
+        DS4_LAYER_SLICE_CANCEL_POLL;
+}
+
 int ds4_session_eval_layer_slice(ds4_session *s,
                                  const int *tokens,
                                  uint32_t n_tokens,
@@ -26390,6 +26412,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
+    }
+    if (ds4_session_cancelled(s)) {
+        if (errlen) snprintf(err, errlen, "interrupted");
+        return DS4_SESSION_SYNC_INTERRUPTED;
     }
     if (layer_start > layer_end || layer_end >= (uint32_t)DS4_N_LAYER) {
         if (errlen) snprintf(err, errlen, "invalid layer-slice layer range %u:%u",
@@ -26445,8 +26471,12 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 
     ds4_engine *e = s->engine;
     ds4_gpu_graph *g = &s->graph;
+    const ds4_layer_slice_cancel_policy cancel_mode =
+        ds4_layer_slice_cancel_mode(e->backend, n_tokens, s->cancel != NULL);
+    const bool cancellable_prefill = cancel_mode != DS4_LAYER_SLICE_CANCEL_NONE;
     if (!input_hc && !output_hc && output_logits &&
-        layer_start == 0 && layer_end + 1u == (uint32_t)DS4_N_LAYER) {
+        layer_start == 0 && layer_end + 1u == (uint32_t)DS4_N_LAYER &&
+        !cancellable_prefill) {
         bool ok = false;
         ds4_tokens span = {0};
         if (pos0 == 0) {
@@ -26629,6 +26659,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     };
 
     bool ok = true;
+    bool cancelled = false;
+    const bool split_cancellable_prefill =
+        cancel_mode == DS4_LAYER_SLICE_CANCEL_SPLIT_COMMANDS;
     if (g->ssd_streaming && !input_hc) {
         g->streaming_static_decode_map_current = false;
         ok = metal_graph_stream_map_token(&e->model, &e->weights);
@@ -26655,6 +26688,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
          metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens));
     if (g->ssd_streaming) {
         for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+            if (cancellable_prefill && ds4_session_cancelled(s)) {
+                cancelled = true;
+                break;
+            }
             g->streaming_static_decode_map_current = false;
             ok = batch_selected_addr ?
                  metal_graph_stream_map_layer_decode(&e->model, &e->weights, il) :
@@ -26670,9 +26707,49 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             }
             if (ok) ok = ds4_gpu_end_commands() != 0;
         }
+        if (ok && !cancelled && cancellable_prefill && ds4_session_cancelled(s)) {
+            cancelled = true;
+        }
+    } else if (split_cancellable_prefill) {
+        /* Bound cancellation latency without paying one command-buffer wait per
+         * layer on the mmap-backed Metal path. Decode remains unsplit. */
+        const uint32_t cancel_group_layers = 4;
+        bool commands_open = false;
+        for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+            const bool group_start =
+                (il - layer_start) % cancel_group_layers == 0;
+            if (group_start) {
+                if (commands_open) {
+                    ok = ds4_gpu_end_commands() != 0;
+                    commands_open = false;
+                }
+                if (ok && ds4_session_cancelled(s)) {
+                    cancelled = true;
+                    break;
+                }
+                if (ok) {
+                    ok = ds4_gpu_begin_commands() != 0;
+                    commands_open = ok;
+                }
+            }
+            if (ok) {
+                ok = metal_graph_encode_layer_batch(g,
+                                                    &e->model,
+                                                    &e->weights.layer[il],
+                                                    il,
+                                                    pos0,
+                                                    n_tokens);
+            }
+        }
+        if (ok && commands_open) ok = ds4_gpu_end_commands() != 0;
+        if (ok && !cancelled && ds4_session_cancelled(s)) cancelled = true;
     } else {
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+            if (cancellable_prefill && ds4_session_cancelled(s)) {
+                cancelled = true;
+                break;
+            }
             ok = metal_graph_encode_layer_batch(g,
                                                 &e->model,
                                                 &e->weights.layer[il],
@@ -26680,8 +26757,11 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                 pos0,
                                                 n_tokens);
         }
+        if (ok && !cancelled && cancellable_prefill && ds4_session_cancelled(s)) {
+            cancelled = true;
+        }
     }
-    if (ok && output_logits) {
+    if (ok && !cancelled && output_logits) {
         saved_cur = g->cur_hc;
         last_hc = metal_graph_tensor_row_view(g->batch_cur_hc, n_tokens - 1u, hc_dim);
         ok = last_hc != NULL;
@@ -26691,15 +26771,24 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
         if (ok) {
             g->cur_hc = last_hc;
-            if (g->ssd_streaming) ok = ds4_gpu_begin_commands() != 0;
+            if (g->ssd_streaming || split_cancellable_prefill) ok = ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
-            if (ok && g->ssd_streaming) ok = ds4_gpu_end_commands() != 0;
+            if (ok && (g->ssd_streaming || split_cancellable_prefill)) ok = ds4_gpu_end_commands() != 0;
             g->cur_hc = saved_cur;
         }
     }
-    if (ok && !g->ssd_streaming) ok = ds4_gpu_end_commands() != 0;
+    if (ok && !g->ssd_streaming && !split_cancellable_prefill) ok = ds4_gpu_end_commands() != 0;
     if (saved_cur) g->cur_hc = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
+
+    if (ok && !cancelled && cancellable_prefill && ds4_session_cancelled(s)) {
+        cancelled = true;
+    }
+    if (cancelled) {
+        if (errlen) snprintf(err, errlen, "interrupted");
+        ds4_session_invalidate(s);
+        return DS4_SESSION_SYNC_INTERRUPTED;
+    }
 
     if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
     if (ok && output_hc) {
@@ -26721,6 +26810,44 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     ds4_session_slice_commit_timeline(s, tokens, n_tokens);
     return 0;
 #endif
+}
+
+int ds4_test_layer_slice_observes_precancel(void) {
+    ds4_engine engine = {0};
+    ds4_session session = {
+        .engine = &engine,
+        .ctx_size = 16,
+    };
+    int checks = 0;
+    session.cancel = ds4_test_cancel_immediately;
+    session.cancel_ud = &checks;
+    int tokens[2] = {1, 2};
+    char err[64] = {0};
+    int rc = ds4_session_eval_layer_slice(&session,
+                                          tokens,
+                                          2,
+                                          0,
+                                          0,
+                                          0,
+                                          NULL,
+                                          NULL,
+                                          false,
+                                          NULL,
+                                          err,
+                                          sizeof(err));
+    return rc == DS4_SESSION_SYNC_INTERRUPTED && checks > 0 &&
+           strcmp(err, "interrupted") == 0 ? 0 : 1;
+}
+
+int ds4_test_layer_slice_cancel_policy(void) {
+    return ds4_layer_slice_cancel_mode(DS4_BACKEND_METAL, 2, true) ==
+               DS4_LAYER_SLICE_CANCEL_SPLIT_COMMANDS &&
+           ds4_layer_slice_cancel_mode(DS4_BACKEND_CUDA, 2, true) ==
+               DS4_LAYER_SLICE_CANCEL_POLL &&
+           ds4_layer_slice_cancel_mode(DS4_BACKEND_METAL, 1, true) ==
+               DS4_LAYER_SLICE_CANCEL_NONE &&
+           ds4_layer_slice_cancel_mode(DS4_BACKEND_METAL, 2, false) ==
+               DS4_LAYER_SLICE_CANCEL_NONE ? 0 : 1;
 }
 
 #ifndef DS4_NO_GPU
@@ -26759,6 +26886,76 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
+static int ds4_session_finish_distributed_call(ds4_session *s, int rc) {
+    if (rc != 0) ds4_session_invalidate(s);
+    return rc;
+}
+
+int ds4_test_distributed_interrupt_invalidates_checkpoint(void) {
+    ds4_session session = {0};
+    token_vec_push(&session.checkpoint, 7);
+    session.checkpoint_valid = true;
+    session.mtp_draft_valid = true;
+    const int rc = ds4_session_finish_distributed_call(
+        &session, DS4_SESSION_SYNC_INTERRUPTED);
+    const bool invalidated = !session.checkpoint_valid &&
+                             session.checkpoint.len == 0 &&
+                             !session.mtp_draft_valid;
+    token_vec_free(&session.checkpoint);
+    return rc == DS4_SESSION_SYNC_INTERRUPTED && invalidated ? 0 : 1;
+}
+
+int ds4_test_distributed_failure_invalidates_checkpoint(void) {
+    ds4_session session = {0};
+    token_vec_push(&session.checkpoint, 7);
+    session.checkpoint_valid = true;
+    session.mtp_draft_valid = true;
+    const int rc = ds4_session_finish_distributed_call(&session, 1);
+    const bool invalidated = !session.checkpoint_valid &&
+                             session.checkpoint.len == 0 &&
+                             !session.mtp_draft_valid;
+    token_vec_free(&session.checkpoint);
+    return rc == 1 && invalidated ? 0 : 1;
+}
+
+int ds4_test_distributed_failure_invalidates_logits(void) {
+    ds4_session session = {0};
+    const size_t bytes = (size_t)DS4_N_VOCAB * sizeof(float);
+    session.logits = malloc(bytes);
+    float *copied = malloc(bytes);
+    if (!session.logits || !copied) {
+        free(session.logits);
+        free(copied);
+        return 1;
+    }
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) session.logits[i] = (float)i;
+
+    const int rc = ds4_session_finish_distributed_call(&session, 1);
+    const int copied_n = ds4_session_copy_logits(&session, copied, DS4_N_VOCAB);
+    bool invalidated = copied_n == (int)DS4_N_VOCAB;
+    for (uint32_t i = 0; invalidated && i < DS4_N_VOCAB; i++) {
+        invalidated = copied[i] == DS4_NEG_INF;
+    }
+
+    free(session.logits);
+    free(copied);
+    return rc == 1 && invalidated ? 0 : 1;
+}
+
+int ds4_test_distributed_success_preserves_checkpoint(void) {
+    ds4_session session = {0};
+    token_vec_push(&session.checkpoint, 7);
+    session.checkpoint_valid = true;
+    session.mtp_draft_valid = true;
+    const int rc = ds4_session_finish_distributed_call(&session, 0);
+    const bool preserved = session.checkpoint_valid &&
+                           session.checkpoint.len == 1 &&
+                           session.checkpoint.v[0] == 7 &&
+                           session.mtp_draft_valid;
+    token_vec_free(&session.checkpoint);
+    return rc == 0 && preserved ? 0 : 1;
+}
+
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
@@ -26770,13 +26967,14 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
-        return ds4_dist_session_sync(s->distributed,
-                                     s,
-                                     checkpoint,
-                                     prompt,
-                                     s->logits,
-                                     err,
-                                     errlen);
+        int rc = ds4_dist_session_sync(s->distributed,
+                                       s,
+                                       checkpoint,
+                                       prompt,
+                                       s->logits,
+                                       err,
+                                       errlen);
+        return ds4_session_finish_distributed_call(s, rc);
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
@@ -27142,13 +27340,14 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             return 1;
         }
         (void)probe_mtp;
-        return ds4_dist_session_eval(s->distributed,
-                                     s,
-                                     &s->checkpoint,
-                                     token,
-                                     s->logits,
-                                     err,
-                                     errlen);
+        int rc = ds4_dist_session_eval(s->distributed,
+                                       s,
+                                       &s->checkpoint,
+                                       token,
+                                       s->logits,
+                                       err,
+                                       errlen);
+        return ds4_session_finish_distributed_call(s, rc);
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
@@ -27840,6 +28039,11 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+    if (s->logits) {
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+            s->logits[i] = DS4_NEG_INF;
+        }
+    }
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
