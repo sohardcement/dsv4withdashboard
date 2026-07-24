@@ -25,7 +25,7 @@ state = {"kv": dict(base_kv), "admin": [], "status_active": 0, "status_max": 0,
 lock = threading.Lock()
 
 def status():
-    result = {"phase":"decode","active":True,"queue_depth":2,"clients":3,
+    result = {"phase":"decode","active":True,"uptime_sec":9384.0,"queue_depth":2,"clients":3,
       "model":{"name":"DeepSeek V4 Flash","backend":"Metal","context_length":163840,"session_pos":48120},
       "request":{"kind":"chat","api":"responses","stream":True,"tools":True,"prompt_tokens":32768,"cached_tokens":24576,"cache_write_tokens":8192,"elapsed_sec":18.4,"cache_source":"disk-text","finish":"","last_error":""},
       "prefill":{"current":8192,"total":8192,"percent":100,"avg_tps":1850.4,"chunk_tps":2011.2,"elapsed_sec":4.4,"eta_sec":0},
