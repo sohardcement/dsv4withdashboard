@@ -754,11 +754,13 @@ also include:
   server restarts.
 
 The dashboard uses a precision-instrument visual system with two task modes.
-**监控** is the default: decode and runtime indicators lead into a live
-inference timeline, request trace, request inspector, and compact KV, expert,
-and memory summaries. **管理** keeps the same hierarchy for runtime state,
-disk-KV and context settings, their effects, and operation results. The color
-theme can follow the system or use an explicit charcoal or mist-gray surface.
+**监控** is the default: a dominant live-decode signal stage leads into a
+proportional inference timeline and request trace, while a fixed analysis rail
+combines the selected request's token composition with KV capacity, expert
+routing, and memory-pressure visualizations. **管理** keeps the same hierarchy
+for runtime state, disk-KV and context settings, their effects, and operation
+results. The color theme can follow the system or use an explicit charcoal or
+mist-gray surface.
 The selected mode and theme are saved only in that browser's `localStorage`,
 under `ds4-dashboard-mode` and `ds4-dashboard-theme`; neither changes server
 configuration or data. Ambient light is low contrast, while timeline and
