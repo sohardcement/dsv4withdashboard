@@ -753,14 +753,18 @@ also include:
   Records deliberately omit prompts and request bodies, and reset when the
   server restarts.
 
-The dashboard has two task modes under one visual system. **管理** is the default
-for runtime state, disk-KV and context settings, their effects, and operation
-results. **监控** focuses on live metrics, filterable recent calls, the request
-inspector, and host resources; the header presents them in that order. The same
-header also offers three color themes—暖纸面, 深色终端, and 冷静蓝绿. The selected
-mode and theme are saved only in that browser's `localStorage` under
-`ds4-dashboard-mode` and `ds4-dashboard-theme`; they do not change server
-configuration or data.
+The dashboard uses a precision-instrument visual system with two task modes.
+**监控** is the default: decode and runtime indicators lead into a live
+inference timeline, request trace, request inspector, and compact KV, expert,
+and memory summaries. **管理** keeps the same hierarchy for runtime state,
+disk-KV and context settings, their effects, and operation results. The color
+theme can follow the system or use an explicit charcoal or mist-gray surface.
+The selected mode and theme are saved only in that browser's `localStorage`,
+under `ds4-dashboard-mode` and `ds4-dashboard-theme`; neither changes server
+configuration or data. Ambient light is low contrast, while timeline and
+rainbow status motion run only for live data. Continuous motion stops on narrow
+screens, while stale data is shown, and when the browser requests reduced
+motion.
 
 Disk-KV runtime changes first use an inline dry-run review that shows the old and
 new limits and any required eviction before explicit confirmation. Persisting a
