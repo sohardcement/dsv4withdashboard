@@ -226,6 +226,12 @@ async page => {
   assert(await page.locator('#dashboard').getAttribute('data-mode')==='monitor','monitor mode did not persist');
   assert(await page.locator('#monitorLayout').getAttribute('hidden')===null&&await page.locator('#monitorLayout').getAttribute('aria-hidden')==='false','persisted monitor root state is wrong');
   const monitorMetricsText=await page.locator('#monitorMetrics').innerText(); assert(monitorMetricsText.includes('52.7 t/s')&&monitorMetricsText.includes('75.0%')&&monitorMetricsText.includes('解码中 · 运行中')&&monitorMetricsText.includes('hanako-agent'),'monitor metrics are missing decode speed, request KV hit, activity, or service');
+  const usageHistory=page.locator('#tokenHistory');
+  assert(await usageHistory.count()===1&&await usageHistory.getAttribute('aria-labelledby')==='tokenHistoryTitle','token usage history panel or accessible title is missing');
+  const usageText=await usageHistory.innerText();
+  assert(['Token 使用历史','1,309,600','1,264,000','45,600','最近 30 天 · 本机持久化'].every(value=>usageText.includes(value)),'persistent token usage totals or retention copy are missing');
+  assert(await page.locator('#tokenHistoryChart [data-usage-day]').count()===7,'token usage history did not render every daily fixture bucket');
+  assert((await page.locator('#tokenHistoryChart').getAttribute('aria-label')).includes('最近 30 天 token 使用趋势'),'token usage chart is missing an accessible summary');
   assert(await page.locator('.wall-mirror').count()===0&&await page.locator('[data-mirror]').count()===0,'wall mirror wallpaper must be removed from the monitor metrics');
   const colorContract=await page.evaluate(()=>{
     const primaries=[...document.querySelectorAll('button.primary')];

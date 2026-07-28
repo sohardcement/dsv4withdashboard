@@ -1038,6 +1038,9 @@ also include:
   **未标识服务**. This label is metadata, not authentication or authorization.
   Records deliberately omit prompts and request bodies, and reset when the
   server restarts.
+- `token_usage`: 30 UTC days of persistent prompt, output, total-token, and
+  request aggregates. The dashboard renders the most recent 14 daily buckets
+  while keeping the full retained totals in the status document.
 
 The dashboard uses a precision-instrument visual system with two task modes.
 **监控** is the default: a dominant live-decode signal stage leads into a
@@ -1081,6 +1084,12 @@ next launcher invocation, a valid explicit `DS4_CTX` wins over this saved value,
 which wins over the selected profile default. The analogous disk-KV file is
 `${DS4_KV_SPACE_FILE:-$HOME/.ds4/kv-space-mb}`, with valid `DS4_KV_SPACE`
 taking precedence. Invalid saved values are ignored with a launcher warning.
+
+Token usage history is stored atomically in
+`${DS4_TOKEN_HISTORY_FILE-$HOME/.ds4/token-usage.tsv}` with mode `0600`.
+Setting `DS4_TOKEN_HISTORY_FILE` to an empty value disables persistence. Only
+daily token and request counts are stored; prompts, outputs, client labels, and
+request bodies are never written to this file.
 
 The local launcher also maps the latest optional serving controls from
 environment variables:

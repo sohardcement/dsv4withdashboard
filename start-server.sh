@@ -20,6 +20,7 @@ else
     DEFAULT_CONFIG_SNAPSHOT=
 fi
 CONFIG_SNAPSHOT=${DS4_CONFIG_SNAPSHOT-$DEFAULT_CONFIG_SNAPSHOT}
+TOKEN_HISTORY_FILE=${DS4_TOKEN_HISTORY_FILE-$HOME/.ds4/token-usage.tsv}
 EXTRA_SSD_STREAMING=0
 EXTRA_MTP=0
 
@@ -287,6 +288,7 @@ if [ -n "$CONFIG_SNAPSHOT" ]; then
         printf 'port=%s\n' "$PORT"
         printf 'dashboard_url=%s\n' "$DASHBOARD_URL"
         printf 'trace=%s\n' "$TRACE"
+        printf 'token_history_file=%s\n' "$TOKEN_HISTORY_FILE"
         printf 'server_log=%s\n' "$SERVER_LOG"
         printf 'kv_dir=%s\n' "$KV_DIR"
         printf 'kv_space_file=%s\n' "$KV_SPACE_FILE"

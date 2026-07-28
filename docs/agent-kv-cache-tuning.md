@@ -87,12 +87,21 @@ administrative actions; changing it has no server-side effect.
 
 `/ds4/status` supplements KV information with a `context` object (current,
 limit, remaining, utilization in tokens), a `host` object (physical memory,
-pressure, swap, and DS4 RSS), and a `calls` object. Host sampling may be
-unavailable on a platform; that is an unknown measurement, not zero usage.
+pressure, swap, and DS4 RSS), a `calls` object, and a persistent `token_usage`
+object. `token_usage` retains 30 UTC days of prompt, output, total-token, and
+request aggregates; the dashboard chart displays the latest 14 daily buckets.
+Host sampling may be unavailable on a platform; that is an unknown measurement,
+not zero usage.
 Call records hold at most 200 recent requests in memory and are discarded on
 restart. They retain direct TCP peer address, API kind, outcome, token counts,
 and a short error when present, but never request body or prompt text. DS4 does
 not infer callers from or trust `X-Forwarded-For`.
+
+Usage aggregates survive restart in
+`${DS4_TOKEN_HISTORY_FILE-$HOME/.ds4/token-usage.tsv}`. The server rewrites the
+file atomically with mode `0600`; an explicitly empty
+`DS4_TOKEN_HISTORY_FILE` disables persistence. The file contains counts only,
+never prompts, outputs, request bodies, peer addresses, or client labels.
 
 For a useful service label in the call table and aggregates, callers can send
 an optional `X-DS4-Client` header, for example `X-DS4-Client: hanako-agent`.
@@ -152,7 +161,8 @@ The start script writes a sidecar config snapshot next to the trace
 (`/tmp/ds4-trace.jsonl.config` by default). `trace-cache-summary.py --json`
 loads that sidecar automatically so saved metrics retain the startup profile
 even when summarized from a different shell. The snapshot also records
-`started_at`, `cwd`, and the full `command_line` for traceability.
+`started_at`, `cwd`, the token-history path, and the full `command_line` for
+traceability.
 
 The 2048 continued interval retains the cache-coverage choice from the local
 agent sweep. The 5120 Metal prefill chunk is a separate raw-throughput choice;
