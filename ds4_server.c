@@ -10181,15 +10181,11 @@ static bool server_kv_evict(server *s, const ds4_tokens *live,
 }
 #endif
 
-static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb,
-                          bool reject_different_quant, kv_cache_options opt) {
-    return ds4_kvstore_open(kc, dir, budget_mb, reject_different_quant, opt,
-                            "ds4-server", kv_cache_log_cb, NULL);
-}
-
+#ifdef DS4_SERVER_TEST
 static void kv_cache_close(kv_disk_cache *kc) {
     ds4_kvstore_close(kc);
 }
+#endif
 
 static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
     return ds4_kvstore_render_tokens_text(engine, tokens, out_len);
@@ -10216,6 +10212,7 @@ static void build_prompt_from_exact_prefix_and_text_suffix(
         engine, exact_prefix, suffix_text, out);
 }
 
+#ifdef DS4_SERVER_TEST
 static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
     return ds4_kvstore_store_len(kc, tokens);
 }
@@ -10226,6 +10223,7 @@ static int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
                                     int assistant_token_id) {
     return ds4_kvstore_chat_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
 }
+#endif
 
 
 static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens) {
