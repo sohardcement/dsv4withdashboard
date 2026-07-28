@@ -173,6 +173,10 @@ CACHE_MIN=${DS4_CACHE_MIN:-$DEFAULT_CACHE_MIN}
 BOUNDARY_TRIM=${DS4_BOUNDARY_TRIM:-$DEFAULT_BOUNDARY_TRIM}
 BOUNDARY_ALIGN=${DS4_BOUNDARY_ALIGN:-$DEFAULT_BOUNDARY_ALIGN}
 TOOL_MEMORY_MAX=${DS4_TOOL_MEMORY_MAX:-$DEFAULT_TOOL_MEMORY_MAX}
+BATCHED_SESSION=${DS4_BATCHED_SESSION-}
+GPU_VRAM=${DS4_GPU_VRAM-}
+GPU_DEVICES=${DS4_GPU_DEVICES-}
+CUDA_TENSOR_PARALLEL=${DS4_CUDA_TENSOR_PARALLEL:-0}
 if [ "$HOST" = "0.0.0.0" ] || [ "$HOST" = "::" ]; then
     DASHBOARD_HOST=127.0.0.1
 else
@@ -223,12 +227,24 @@ args=(
     --tool-memory-max-ids "$TOOL_MEMORY_MAX"
 )
 
-if [ -n "$PREFILL_CHUNK" ] && [ "$PREFILL_CHUNK" != 0 ]; then
-    args+=(--prefill-chunk "$PREFILL_CHUNK")
+append_value_arg() {
+    local flag=$1 value=$2
+    if [ -n "$value" ]; then
+        args+=("$flag" "$value")
+    fi
+}
+
+if [ "$PREFILL_CHUNK" != 0 ]; then
+    append_value_arg --prefill-chunk "$PREFILL_CHUNK"
 fi
 
-if [ -n "$MODEL" ]; then
-    args+=(--model "$MODEL")
+append_value_arg --model "$MODEL"
+append_value_arg --batched-session "$BATCHED_SESSION"
+append_value_arg --gpu-vram "$GPU_VRAM"
+append_value_arg --gpu-devices "$GPU_DEVICES"
+
+if [ "$CUDA_TENSOR_PARALLEL" != 0 ]; then
+    args+=(--cuda-tensor-parallel)
 fi
 
 if [ -n "$MTP_PATH" ]; then
@@ -265,7 +281,7 @@ if [ -n "$CONFIG_SNAPSHOT" ]; then
         printf 'profile=%s\n' "$PROFILE"
         printf 'model=%s\n' "$MODEL"
         printf 'ctx=%s\n' "$CTX"
-		printf 'ctx_file=%s\n' "$CTX_FILE"
+        printf 'ctx_file=%s\n' "$CTX_FILE"
         printf 'threads=%s\n' "$THREADS"
         printf 'host=%s\n' "$HOST"
         printf 'port=%s\n' "$PORT"
@@ -282,6 +298,10 @@ if [ -n "$CONFIG_SNAPSHOT" ]; then
         printf 'boundary_align=%s\n' "$BOUNDARY_ALIGN"
         printf 'tool_memory_max_ids=%s\n' "$TOOL_MEMORY_MAX"
         printf 'prefill_chunk=%s\n' "$PREFILL_CHUNK"
+        printf 'batched_session=%s\n' "$BATCHED_SESSION"
+        printf 'gpu_vram=%s\n' "$GPU_VRAM"
+        printf 'gpu_devices=%s\n' "$GPU_DEVICES"
+        printf 'cuda_tensor_parallel=%s\n' "$CUDA_TENSOR_PARALLEL"
         printf 'mtp_path=%s\n' "$MTP_PATH"
         printf 'mtp_draft=%s\n' "$MTP_DRAFT"
         printf 'mtp_margin=%s\n' "$MTP_MARGIN"

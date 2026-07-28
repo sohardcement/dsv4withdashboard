@@ -1082,6 +1082,21 @@ which wins over the selected profile default. The analogous disk-KV file is
 `${DS4_KV_SPACE_FILE:-$HOME/.ds4/kv-space-mb}`, with valid `DS4_KV_SPACE`
 taking precedence. Invalid saved values are ignored with a launcher warning.
 
+The local launcher also maps the latest optional serving controls from
+environment variables:
+
+| Environment variable | `ds4-server` option |
+| --- | --- |
+| `DS4_BATCHED_SESSION` | `--batched-session` |
+| `DS4_GPU_VRAM` | `--gpu-vram` |
+| `DS4_GPU_DEVICES` | `--gpu-devices` |
+| nonzero `DS4_CUDA_TENSOR_PARALLEL` | `--cuda-tensor-parallel` |
+
+They have no launcher defaults, so the existing single-session Metal profile
+is unchanged. Extra command-line arguments are still appended last. Choose the
+session count and context size together because each resident session owns a KV
+allocation.
+
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
 `seed`, `stream`, `stream_options.include_usage`, `tools`, and `tool_choice`.

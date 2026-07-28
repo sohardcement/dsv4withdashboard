@@ -34,6 +34,14 @@ The table shows profile defaults. A valid saved dashboard context or disk-KV
 capacity still overrides the corresponding profile value according to the
 precedence rules below.
 
+The launcher leaves upstream's optional multi-session and CUDA placement
+controls disabled unless they are explicitly configured. Use
+`DS4_BATCHED_SESSION`, `DS4_GPU_VRAM`, `DS4_GPU_DEVICES`, and nonzero
+`DS4_CUDA_TENSOR_PARALLEL` to emit the corresponding `--batched-session`,
+`--gpu-vram`, `--gpu-devices`, and `--cuda-tensor-parallel` options. These
+resolved values are included in the launch configuration snapshot. Command-line
+arguments remain available for one-off overrides.
+
 The 51200 context default is a capacity and memory-headroom choice, not a claim
 that a smaller allocation makes short prompts compute faster. In a same-process
 M3 Max check with 2048 fixed prefill tokens, 128 fixed decode tokens, and a 5120

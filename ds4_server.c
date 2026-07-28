@@ -16762,6 +16762,39 @@ cleanup:
 	test_env_restore(&home);
 }
 
+static void test_start_server_latest_runtime_options(void) {
+	const char *names[] = {
+		"HOME", "DS4_MODEL", "DS4_DRY_RUN", "DS4_BATCHED_SESSION",
+		"DS4_GPU_VRAM", "DS4_GPU_DEVICES", "DS4_CUDA_TENSOR_PARALLEL",
+	};
+	test_env_value saved[sizeof(names) / sizeof(names[0])] = {0};
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+		test_env_snapshot(&saved[i], names[i]);
+
+	char tmpl[] = "/tmp/ds4-runtime-launcher.XXXXXX";
+	char *root = mkdtemp(tmpl);
+	TEST_ASSERT(root != NULL);
+	if (!root) goto cleanup;
+	TEST_ASSERT(setenv("HOME", root, 1) == 0);
+	TEST_ASSERT(setenv("DS4_MODEL", "", 1) == 0);
+	TEST_ASSERT(setenv("DS4_DRY_RUN", "1", 1) == 0);
+	TEST_ASSERT(setenv("DS4_BATCHED_SESSION", "4", 1) == 0);
+	TEST_ASSERT(setenv("DS4_GPU_VRAM", "auto", 1) == 0);
+	TEST_ASSERT(setenv("DS4_GPU_DEVICES", "0,1", 1) == 0);
+	TEST_ASSERT(setenv("DS4_CUDA_TENSOR_PARALLEL", "1", 1) == 0);
+
+	char *out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--batched-session 4") != NULL);
+	TEST_ASSERT(strstr(out, "--gpu-vram auto") != NULL);
+	TEST_ASSERT(strstr(out, "--gpu-devices 0\\,1") != NULL);
+	TEST_ASSERT(strstr(out, "--cuda-tensor-parallel") != NULL);
+	free(out);
+	TEST_ASSERT(rmdir(root) == 0);
+cleanup:
+	for (size_t i = sizeof(names) / sizeof(names[0]); i > 0; i--)
+		test_env_restore(&saved[i - 1]);
+}
+
 static void test_context_admin_tests_preserve_environment(void) {
 	const char *names[] = {"HOME", "DS4_CTX_FILE", "DS4_CTX", "DS4_MODEL", "DS4_DRY_RUN"};
 	const char *values[] = {"/tmp/ds4-context-home-sentinel", "/tmp/ds4-context-file-sentinel",
@@ -22110,6 +22143,7 @@ static void ds4_server_unit_tests_run(void) {
 	test_context_admin_route_auth_and_active_context();
 	test_start_server_context_precedence();
 	test_start_server_performance_profiles();
+	test_start_server_latest_runtime_options();
 	test_context_admin_tests_preserve_environment();
 	test_kv_admin_rejects_headers_before_body();
 	test_http_content_length_framing_is_strict();
