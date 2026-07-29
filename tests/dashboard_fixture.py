@@ -31,7 +31,9 @@ def status():
       "prefill":{"current":8192,"total":8192,"percent":100,"avg_tps":1850.4,"chunk_tps":2011.2,"elapsed_sec":4.4,"eta_sec":0},
       "decode":{"generated":814,"max_tokens":4096,"avg_tps":52.7,"chunk_tps":55.1,"elapsed_sec":14},
       "totals":{"requests":48,"completed":45,"failed":2,"cache":{"prompt_tokens":1264000,"cached_tokens":782000,"prompt_requests":47,"hit_requests":31}},
-      "token_usage":{"persistent":True,"retention_days":30,"prompt_tokens":1264000,"output_tokens":45600,"total_tokens":1309600,"requests":48,"days":[
+      "token_usage":{"persistent":True,"retention":"unlimited","window_days":371,"prompt_tokens":1264000,"output_tokens":45600,"total_tokens":1309600,"requests":48,
+          "active_days":7,"peak_tokens":215100,"peak_day_start":1727568000,"current_streak":7,"longest_streak":7,
+          "first_day_start":1727481600,"last_day_start":1728000000,"days":[
           {"day_start":1727481600,"prompt_tokens":124000,"output_tokens":4200,"total_tokens":128200,"requests":5},
           {"day_start":1727568000,"prompt_tokens":208000,"output_tokens":7100,"total_tokens":215100,"requests":8},
           {"day_start":1727654400,"prompt_tokens":156000,"output_tokens":5300,"total_tokens":161300,"requests":6},

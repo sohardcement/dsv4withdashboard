@@ -24,31 +24,21 @@ static int64_t history_day(int64_t now_sec) {
 	return now_sec > 0 ? now_sec / 86400 : 0;
 }
 
-static void prune_days(ds4_token_history *history, int64_t current_day) {
-	if (!history || !history->len) return;
-	const int64_t oldest = current_day >= DS4_TOKEN_HISTORY_MAX_DAYS - 1 ?
-		current_day - (DS4_TOKEN_HISTORY_MAX_DAYS - 1) : 0;
-	size_t keep = 0;
-	for (size_t i = 0; i < history->len; i++) {
-		if (history->days[i].day < oldest ||
-			history->days[i].day > current_day) continue;
-		history->days[keep++] = history->days[i];
-	}
-	history->len = keep;
-}
-
 static ds4_token_history_day *find_or_add_day(ds4_token_history *history,
 	int64_t day) {
 	size_t at = 0;
 	while (at < history->len && history->days[at].day < day) at++;
 	if (at < history->len && history->days[at].day == day)
 		return &history->days[at];
-	if (history->len == DS4_TOKEN_HISTORY_MAX_DAYS) {
-		if (at == 0) return NULL;
-		memmove(&history->days[0], &history->days[1],
-			(history->len - 1) * sizeof(history->days[0]));
-		history->len--;
-		at--;
+	if (history->len == history->cap) {
+		size_t cap = history->cap ? history->cap * 2 : 32;
+		if (cap < history->cap ||
+			cap > SIZE_MAX / sizeof(history->days[0])) abort();
+		ds4_token_history_day *days = realloc(history->days,
+			cap * sizeof(history->days[0]));
+		if (!days) abort();
+		history->days = days;
+		history->cap = cap;
 	}
 	memmove(&history->days[at + 1], &history->days[at],
 		(history->len - at) * sizeof(history->days[0]));
@@ -81,7 +71,7 @@ static bool parse_day_line(const char *line, ds4_token_history_day *day) {
 	}
 	if (*p == '\r') p++;
 	if (*p == '\n') p++;
-	if (*p || values[0] > INT64_MAX) return false;
+	if (*p || values[0] > (uint64_t)(INT64_MAX / 86400)) return false;
 	*day = (ds4_token_history_day){
 		.day = (int64_t)values[0],
 		.prompt_tokens = values[1],
@@ -190,7 +180,7 @@ bool ds4_token_history_init(ds4_token_history *history, const char *path,
 		fclose(fp);
 		return false;
 	}
-	const int64_t current_day = history_day(now_sec);
+	(void)now_sec;
 	while (fgets(line, sizeof(line), fp)) {
 		ds4_token_history_day parsed;
 		if (!parse_day_line(line, &parsed)) continue;
@@ -201,13 +191,13 @@ bool ds4_token_history_init(ds4_token_history *history, const char *path,
 		day->requests = sat_add(day->requests, parsed.requests);
 	}
 	fclose(fp);
-	prune_days(history, current_day);
 	return true;
 }
 
 void ds4_token_history_free(ds4_token_history *history) {
 	if (!history) return;
 	free(history->path);
+	free(history->days);
 	memset(history, 0, sizeof(*history));
 }
 
@@ -217,12 +207,7 @@ bool ds4_token_history_record(ds4_token_history *history, int64_t now_sec,
 	if (!history) return false;
 	set_error(err, errlen, "");
 	const int64_t day_value = history_day(now_sec);
-	prune_days(history, day_value);
 	ds4_token_history_day *day = find_or_add_day(history, day_value);
-	if (!day) {
-		set_error(err, errlen, "token history day is outside retention");
-		return false;
-	}
 	day->prompt_tokens = sat_add(day->prompt_tokens, prompt_tokens);
 	day->output_tokens = sat_add(day->output_tokens, output_tokens);
 	day->requests = sat_add(day->requests, 1);
@@ -230,20 +215,44 @@ bool ds4_token_history_record(ds4_token_history *history, int64_t now_sec,
 }
 
 ds4_token_history_snapshot ds4_token_history_snapshot_take(
-	const ds4_token_history *history) {
+	const ds4_token_history *history, int64_t now_sec) {
 	ds4_token_history_snapshot snapshot = {0};
 	if (!history) return snapshot;
 	snapshot.persistent = history->enabled;
-	snapshot.len = history->len;
-	memcpy(snapshot.days, history->days,
-		history->len * sizeof(snapshot.days[0]));
-	for (size_t i = 0; i < snapshot.len; i++) {
-		snapshot.prompt_tokens = sat_add(snapshot.prompt_tokens,
-			snapshot.days[i].prompt_tokens);
-		snapshot.output_tokens = sat_add(snapshot.output_tokens,
-			snapshot.days[i].output_tokens);
-		snapshot.requests = sat_add(snapshot.requests,
-			snapshot.days[i].requests);
+	const size_t start = history->len > DS4_TOKEN_HISTORY_WINDOW_DAYS ?
+		history->len - DS4_TOKEN_HISTORY_WINDOW_DAYS : 0;
+	snapshot.len = history->len - start;
+	if (snapshot.len) {
+		memcpy(snapshot.days, &history->days[start],
+			snapshot.len * sizeof(snapshot.days[0]));
+		snapshot.first_day = history->days[0].day;
+		snapshot.last_day = history->days[history->len - 1].day;
 	}
+	uint64_t streak = 0;
+	int64_t previous_day = -2;
+	for (size_t i = 0; i < history->len; i++) {
+		const ds4_token_history_day *day = &history->days[i];
+		snapshot.prompt_tokens = sat_add(snapshot.prompt_tokens,
+			day->prompt_tokens);
+		snapshot.output_tokens = sat_add(snapshot.output_tokens,
+			day->output_tokens);
+		snapshot.requests = sat_add(snapshot.requests,
+			day->requests);
+		const uint64_t total = sat_add(day->prompt_tokens,
+			day->output_tokens);
+		if (!total && !day->requests) continue;
+		snapshot.active_days = sat_add(snapshot.active_days, 1);
+		streak = day->day == previous_day + 1 ? sat_add(streak, 1) : 1;
+		if (streak > snapshot.longest_streak)
+			snapshot.longest_streak = streak;
+		if (total > snapshot.peak_tokens) {
+			snapshot.peak_tokens = total;
+			snapshot.peak_day = day->day;
+		}
+		previous_day = day->day;
+	}
+	if (history->len &&
+		snapshot.last_day == history_day(now_sec))
+		snapshot.current_streak = streak;
 	return snapshot;
 }

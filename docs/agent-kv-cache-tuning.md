@@ -88,10 +88,11 @@ administrative actions; changing it has no server-side effect.
 `/ds4/status` supplements KV information with a `context` object (current,
 limit, remaining, utilization in tokens), a `host` object (physical memory,
 pressure, swap, and DS4 RSS), a `calls` object, and a persistent `token_usage`
-object. `token_usage` retains 30 UTC days of prompt, output, total-token, and
-request aggregates; the dashboard chart displays the latest 14 daily buckets.
-Host sampling may be unavailable on a platform; that is an unknown measurement,
-not zero usage.
+object. `token_usage` keeps daily prompt, output, total-token, and request
+aggregates without a time limit. Lifetime totals, peak-day and streak metrics
+cover the complete file; the status snapshot includes the latest 371 daily
+buckets for the dashboard's 53-week activity heatmap. Host sampling may be
+unavailable on a platform; that is an unknown measurement, not zero usage.
 Call records hold at most 200 recent requests in memory and are discarded on
 restart. They retain direct TCP peer address, API kind, outcome, token counts,
 and a short error when present, but never request body or prompt text. DS4 does
@@ -102,6 +103,7 @@ Usage aggregates survive restart in
 file atomically with mode `0600`; an explicitly empty
 `DS4_TOKEN_HISTORY_FILE` disables persistence. The file contains counts only,
 never prompts, outputs, request bodies, peer addresses, or client labels.
+Existing `DS4_TOKEN_USAGE_V1` files remain readable and their rows are preserved.
 
 For a useful service label in the call table and aggregates, callers can send
 an optional `X-DS4-Client` header, for example `X-DS4-Client: hanako-agent`.

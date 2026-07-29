@@ -1038,18 +1038,20 @@ also include:
   **未标识服务**. This label is metadata, not authentication or authorization.
   Records deliberately omit prompts and request bodies, and reset when the
   server restarts.
-- `token_usage`: 30 UTC days of persistent prompt, output, total-token, and
-  request aggregates. The dashboard renders the most recent 14 daily buckets
-  while keeping the full retained totals in the status document.
+- `token_usage`: permanent prompt, output, total-token, request, peak-day, and
+  streak aggregates. Daily rows are retained without a time limit; the status
+  snapshot carries the latest 371 days for the dashboard's 53-week activity
+  heatmap while its totals cover the complete stored history.
 
-The dashboard uses a precision-instrument visual system with two task modes.
+The dashboard uses a precision-instrument visual system with three task modes.
 **监控** is the default: a dominant live-decode signal stage leads into a
 proportional inference timeline and request trace, while a fixed analysis rail
 combines the selected request's token composition with KV capacity, expert
 routing, and memory-pressure visualizations. **管理** keeps the same hierarchy
 for runtime state, disk-KV and context settings, their effects, and operation
-results. The color theme can follow the system or use an explicit charcoal or
-mist-gray surface.
+results. **用量** shows lifetime totals and a 53-week daily heatmap backed by
+the permanent local history. The color theme can follow the system or use an
+explicit charcoal or mist-gray surface.
 The selected mode and theme are saved only in that browser's `localStorage`,
 under `ds4-dashboard-mode` and `ds4-dashboard-theme`; neither changes server
 configuration or data. Ambient light is low contrast, while timeline and
@@ -1089,7 +1091,9 @@ Token usage history is stored atomically in
 `${DS4_TOKEN_HISTORY_FILE-$HOME/.ds4/token-usage.tsv}` with mode `0600`.
 Setting `DS4_TOKEN_HISTORY_FILE` to an empty value disables persistence. Only
 daily token and request counts are stored; prompts, outputs, client labels, and
-request bodies are never written to this file.
+request bodies are never written to this file. Existing
+`DS4_TOKEN_USAGE_V1` files remain compatible; rows already present are kept and
+new daily rows are no longer pruned.
 
 The local launcher also maps the latest optional serving controls from
 environment variables:
