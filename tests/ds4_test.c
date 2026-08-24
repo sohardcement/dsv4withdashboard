@@ -6695,6 +6695,170 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+static uint64_t test_sampling_rng_next(uint64_t *state) {
+    uint64_t x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 0x2545f4914f6cdd1dULL;
+}
+
+static float test_sampling_uniform(uint64_t *state) {
+    return (float)((test_sampling_rng_next(state) >> 40) & 0xffffffu) /
+        16777216.0f;
+}
+
+static int test_sample_probability_pair(const float p[2], float u) {
+    return u < p[0] ? 0 : 1;
+}
+
+static void test_speculative_sampling(void) {
+    const float logits[] = {0.0f, 0.6931471805599453f,
+                            1.3862943611198906f, -1.0e30f};
+    float probs[4] = {0};
+    uint64_t target_rng0 = 0, draft_rng0 = 0, accept_rng0 = 0;
+    uint64_t target_rng1 = 0, draft_rng1 = 0, accept_rng1 = 0;
+
+    ds4_speculative_rng_init(
+        42, &target_rng0, &draft_rng0, &accept_rng0);
+    ds4_speculative_rng_init(
+        42, &target_rng1, &draft_rng1, &accept_rng1);
+    TEST_ASSERT(target_rng0 == target_rng1);
+    TEST_ASSERT(draft_rng0 == draft_rng1);
+    TEST_ASSERT(accept_rng0 == accept_rng1);
+    TEST_ASSERT(target_rng0 != 0 && draft_rng0 != 0 && accept_rng0 != 0);
+    TEST_ASSERT(target_rng0 != draft_rng0 && target_rng0 != accept_rng0);
+    TEST_ASSERT(draft_rng0 != accept_rng0);
+
+    TEST_ASSERT(ds4_sampling_distribution(
+        logits, 4, 1.0f, 0, 1.0f, 0.0f, probs) == 0);
+    TEST_ASSERT(fabsf(probs[0] - 1.0f / 7.0f) < 1e-6f);
+    TEST_ASSERT(fabsf(probs[1] - 2.0f / 7.0f) < 1e-6f);
+    TEST_ASSERT(fabsf(probs[2] - 4.0f / 7.0f) < 1e-6f);
+    TEST_ASSERT(probs[3] == 0.0f);
+
+    TEST_ASSERT(ds4_sampling_distribution(
+        logits, 4, 1.0f, 0, 1.0f, 0.3f, probs) == 0);
+    TEST_ASSERT(probs[0] == 0.0f);
+    TEST_ASSERT(fabsf(probs[1] - 1.0f / 3.0f) < 1e-6f);
+    TEST_ASSERT(fabsf(probs[2] - 2.0f / 3.0f) < 1e-6f);
+
+    TEST_ASSERT(ds4_sampling_distribution(
+        logits, 4, 1.0f, 2, 1.0f, 0.0f, probs) == 0);
+    TEST_ASSERT(probs[0] == 0.0f);
+    TEST_ASSERT(fabsf(probs[1] - 1.0f / 3.0f) < 1e-6f);
+    TEST_ASSERT(fabsf(probs[2] - 2.0f / 3.0f) < 1e-6f);
+
+    TEST_ASSERT(ds4_sampling_distribution(
+        logits, 4, 1.0f, 0, 0.7f, 0.0f, probs) == 0);
+    TEST_ASSERT(probs[0] == 0.0f);
+    TEST_ASSERT(fabsf(probs[1] - 1.0f / 3.0f) < 1e-6f);
+    TEST_ASSERT(fabsf(probs[2] - 2.0f / 3.0f) < 1e-6f);
+
+    TEST_ASSERT(ds4_sampling_distribution(
+        logits, 4, 2.0f, 0, 1.0f, 0.0f, probs) == 0);
+    TEST_ASSERT(probs[2] > probs[1] && probs[1] > probs[0]);
+    TEST_ASSERT(fabsf(probs[0] + probs[1] + probs[2] - 1.0f) < 1e-6f);
+
+    TEST_ASSERT(ds4_sampling_distribution(
+        logits, 4, 0.0f, 0, 1.0f, 0.0f, probs) == 0);
+    TEST_ASSERT(probs[0] == 0.0f && probs[1] == 0.0f &&
+                probs[2] == 1.0f && probs[3] == 0.0f);
+
+    {
+        const float p[] = {0.8f, 0.2f};
+        const float q[] = {0.2f, 0.8f};
+        bool accepted = true;
+        const int token = ds4_speculative_rejection_step(
+            p, q, 2, 1, 0.9f, 0.7f, &accepted);
+        TEST_ASSERT(token == 0);
+        TEST_ASSERT(!accepted);
+    }
+    {
+        const float p[] = {0.25f, 0.75f};
+        const float q[] = {0.25f, 0.75f};
+        bool accepted = false;
+        const int token = ds4_speculative_rejection_step(
+            p, q, 2, 1, 0.999f, 0.4f, &accepted);
+        TEST_ASSERT(token == 1);
+        TEST_ASSERT(accepted);
+    }
+    {
+        const float p[] = {1.0f, 0.0f};
+        const float q[] = {0.0f, 1.0f};
+        bool accepted = true;
+        const int token = ds4_speculative_rejection_step(
+            p, q, 2, 1, 0.1f, 0.5f, &accepted);
+        TEST_ASSERT(token == 0);
+        TEST_ASSERT(!accepted);
+    }
+    {
+        /* An invalid, non-normalized q can make the residual identically
+         * zero after rejection. The safe fallback samples target p. */
+        const float p[] = {0.2f, 0.2f};
+        const float q[] = {0.4f, 0.4f};
+        bool accepted = true;
+        const int token = ds4_speculative_rejection_step(
+            p, q, 2, 0, 0.9f, 0.75f, &accepted);
+        TEST_ASSERT(token == 1);
+        TEST_ASSERT(!accepted);
+    }
+    {
+        union { uint32_t u; float f; } quiet_nan = {0x7fc00000u};
+        union { uint32_t u; float f; } positive_inf = {0x7f800000u};
+        const float p[] = {quiet_nan.f, 0.75f, 0.25f};
+        const float q[] = {0.5f, positive_inf.f, 0.5f};
+        bool accepted = true;
+        const int token = ds4_speculative_rejection_step(
+            p, q, 3, 0, 0.9f, 0.1f, &accepted);
+        TEST_ASSERT(token == 1);
+        TEST_ASSERT(!accepted);
+    }
+    {
+        /* Token ids are opaque to rejection sampling: EOS and </think>
+         * corrections must be returned unchanged for the caller's ordinary
+         * stop/transition checks. */
+        const float p_eos[] = {0.0f, 0.0f, 1.0f};
+        const float q_eos[] = {1.0f, 0.0f, 0.0f};
+        bool accepted = true;
+        TEST_ASSERT(ds4_speculative_rejection_step(
+            p_eos, q_eos, 3, 0, 0.9f, 0.5f, &accepted) == 2);
+        TEST_ASSERT(!accepted);
+
+        const float p_think[] = {0.0f, 1.0f, 0.0f};
+        const float q_think[] = {1.0f, 0.0f, 0.0f};
+        TEST_ASSERT(ds4_speculative_rejection_step(
+            p_think, q_think, 3, 0, 0.9f, 0.5f, &accepted) == 1);
+        TEST_ASSERT(!accepted);
+    }
+
+    /* Independent draft/accept/residual draws must reproduce the target
+     * marginal, even when q puts most of its mass on the wrong token. */
+    {
+        const float p[] = {0.7f, 0.3f};
+        const float q[] = {0.2f, 0.8f};
+        uint64_t rng = 0x123456789abcdef0ULL;
+        int counts[2] = {0, 0};
+        const int trials = 200000;
+        for (int i = 0; i < trials; i++) {
+            const int draft = test_sample_probability_pair(
+                q, test_sampling_uniform(&rng));
+            bool accepted = false;
+            const int token = ds4_speculative_rejection_step(
+                p, q, 2, draft,
+                test_sampling_uniform(&rng),
+                test_sampling_uniform(&rng),
+                &accepted);
+            (void)accepted;
+            TEST_ASSERT(token == 0 || token == 1);
+            if (token >= 0 && token < 2) counts[token]++;
+        }
+        const float observed = (float)counts[0] / (float)trials;
+        TEST_ASSERT(fabsf(observed - p[0]) < 0.005f);
+    }
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -6719,6 +6883,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
+    {"--speculative-sampling", "speculative-sampling", "lossless speculative sampling distribution and rejection rules", test_speculative_sampling},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

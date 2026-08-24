@@ -167,6 +167,26 @@ This reads only the payloads needed for that tensor.  Add `--compare-gguf
 DeepSeek-V4-Flash-DSpark-support.gguf` to byte-compare against an existing
 support GGUF.
 
+### Repack a published dflash GGUF
+
+Some DSpark mirrors publish a standalone GGUF with
+`general.architecture=dflash`.  Its tensor names and MXFP4 routed-expert type
+are not directly loadable by DS4.  Repack it into the DS4 support layout with:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --dspark-gguf dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
+  --out DeepSeek-V4-Flash-0731-DSpark-Q4K-support.gguf
+```
+
+The repacker streams tensor rows instead of materializing the full checkpoint.
+It maps `dflash` names to `mtp.*`, copies Q8 tensors unchanged, converts the
+small semantic F32/F16 families to the DS4 support policy, and converts MXFP4
+routed experts to Q4_K.  Use `--dry-run` first to verify the tensor count, stage
+count, output types, and estimated file size without reading tensor payloads.
+The usual `--experts`, routed-family, dense-family, and `--tensor-type`
+overrides remain available.
+
 ## When No Imatrix Is Given
 
 `iq2_xxs` requires an importance vector.  If `--imatrix` is not provided and

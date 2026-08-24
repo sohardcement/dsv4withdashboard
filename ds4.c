@@ -32075,12 +32075,22 @@ static bool dspark_eval_confidence_probe(
     return true;
 }
 
+static float sample_rng_f32(uint64_t *state);
+static int ds4_sample_normalized_probabilities(
+        const float *probabilities,
+        uint32_t n_vocab,
+        float uniform);
+
 static bool dspark_apply_markov_confidence_lazy_runtime(
         ds4_gpu_graph          *g,
         const ds4_model        *dspark_model,
         const ds4_dspark_weights *dw,
         int                     first_prev_token,
         float                   confidence_threshold,
+        const ds4_sampling_options *sampling,
+        uint64_t               *sampling_rng,
+        float                  *draft_probabilities,
+        size_t                  draft_probability_rows,
         float                  *logits,
         float                  *markov_bias,
         float                  *features,
@@ -32090,11 +32100,17 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
         uint32_t               *confidence_len,
         uint32_t               *confidence_prefix_len,
         bool                    reuse_first_confidence,
-        float                  *confidence0) {
+        float                  *confidence0,
+        float                   confidence_probabilities[DS4_DSPARK_MAX_BLOCK_SIZE]) {
     if (proposal_len) *proposal_len = 0;
     if (confidence_len) *confidence_len = 0;
     if (confidence_prefix_len) *confidence_prefix_len = 0;
     if (confidence0 && !reuse_first_confidence) *confidence0 = 0.0f;
+    if (confidence_probabilities) {
+        for (uint32_t i = 0; i < DS4_DSPARK_MAX_BLOCK_SIZE; i++) {
+            confidence_probabilities[i] = 0.0f;
+        }
+    }
     if (!g ||
         !g->spec_logits ||
         !metal_graph_batch_ffn_norm(g) ||
@@ -32104,12 +32120,19 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
         !markov_bias ||
         !features ||
         !proposal ||
-        confidence_threshold <= 0.0f ||
+        confidence_threshold < 0.0f ||
         first_prev_token < 0 ||
         (uint32_t)first_prev_token >= DS4_N_VOCAB ||
         (reuse_first_confidence && !confidence0) ||
         !dspark_markov_probe_ready(dw) ||
         !dspark_confidence_probe_ready(dw)) {
+        return false;
+    }
+
+    const bool sampled = sampling && sampling->temperature > 0.0f;
+    if (sampled &&
+        (!sampling_rng || !draft_probabilities ||
+         draft_probability_rows < dw->block_size)) {
         return false;
     }
 
@@ -32154,8 +32177,13 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
                        features);
         }
         if (draft == 0 && confidence0) *confidence0 = confidence_logit;
+        const float confidence_probability = sigmoid_stable(confidence_logit);
+        if (confidence_probabilities) {
+            confidence_probabilities[draft] = confidence_probability;
+        }
         if (confidence_len) *confidence_len = draft + 1u;
-        if (sigmoid_stable(confidence_logit) < confidence_threshold) {
+        if (confidence_threshold > 0.0f &&
+            confidence_probability < confidence_threshold) {
             ok = true;
             break;
         }
@@ -32164,7 +32192,7 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
 #ifndef __APPLE__
         /* CUDA can apply the Markov bias and argmax without reading back the
          * full logits row. Metal currently falls through to the CPU path. */
-        if (ok && !dspark_markov_bias_disabled() &&
+        if (ok && !sampled && !dspark_markov_bias_disabled() &&
             getenv("DS4_DSPARK_NO_GPU_MARKOV") == NULL &&
             g->dspark_draft_tokens &&
             dw->markov_rank != 0 && (dw->markov_rank & 31u) == 0 &&
@@ -32210,8 +32238,11 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
             if (ok) {
                 uint32_t fused_token = 0;
                 if (dspark_markov_bias_disabled()) {
-                    token = (int32_t)dspark_argmax_f32(logits, DS4_N_VOCAB);
-                } else if (!dspark_disable_fused_cpu_markov_argmax() &&
+                    if (!sampled) {
+                        token = (int32_t)dspark_argmax_f32(logits, DS4_N_VOCAB);
+                    }
+                } else if (!sampled &&
+                    !dspark_disable_fused_cpu_markov_argmax() &&
                     dspark_markov_q8_0_argmax(&fused_token,
                                               dspark_model,
                                               final->markov_w2,
@@ -32223,7 +32254,25 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
                     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
                         logits[i] += markov_bias[i];
                     }
-                    token = (int32_t)dspark_argmax_f32(logits, DS4_N_VOCAB);
+                    if (!sampled) {
+                        token = (int32_t)dspark_argmax_f32(logits, DS4_N_VOCAB);
+                    }
+                }
+                if (sampled) {
+                    float *q = draft_probabilities +
+                        (uint64_t)draft * DS4_N_VOCAB;
+                    ok = ds4_sampling_distribution(
+                            logits,
+                            DS4_N_VOCAB,
+                            sampling->temperature,
+                            sampling->top_k,
+                            sampling->top_p,
+                            sampling->min_p,
+                            q) == 0;
+                    if (ok) {
+                        token = (int32_t)ds4_sample_normalized_probabilities(
+                            q, DS4_N_VOCAB, sample_rng_f32(sampling_rng));
+                    }
                 }
             }
         }
@@ -34209,7 +34258,8 @@ static bool metal_graph_verify_decode2_exact(
         int                   *top0,
         int                   *top1,
         float                 *logits0,
-        float                 *logits1) {
+        float                 *logits1,
+        bool                   capture_dspark_hidden) {
     if (!g || !top0 || (!top1 && !logits1) || g->raw_cap == 0) return false;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -34224,6 +34274,7 @@ static bool metal_graph_verify_decode2_exact(
     const bool saved_capture = g->spec_capture_prefix1;
 
     bool ok = true;
+    if (capture_dspark_hidden) metal_graph_dspark_capture_begin(g);
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
         saved_cur_by_tier[t] = g->cur_hc_by_tier[t];
         saved_after_by_tier[t] = g->after_ffn_hc_by_tier[t];
@@ -34327,6 +34378,10 @@ static bool metal_graph_verify_decode2_exact(
         tmp = cur1_by_tier[this_tier];
         cur1_by_tier[this_tier] = next1_by_tier[this_tier];
         next1_by_tier[this_tier] = tmp;
+        if (capture_dspark_hidden) {
+            g->cur_hc_by_tier[this_tier] = cur1_by_tier[this_tier];
+            ok = metal_graph_dspark_capture_decode_layer(g, il);
+        }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
@@ -34426,7 +34481,51 @@ static bool metal_graph_verify_decode2_exact(
         ds4_gpu_tensor_free(cur1_by_tier[t]);
         ds4_gpu_tensor_free(cur0_by_tier[t]);
     }
+    if (!ok && capture_dspark_hidden) {
+        metal_graph_dspark_capture_invalidate(g);
+    }
     return ok;
+}
+
+/* Decode-equivalent verifier for the DSpark block. Pairing keeps the exact
+ * one-token kernels and cache order while amortizing command submission. */
+static bool metal_graph_verify_decode_exact_rows(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const int         *tokens,
+        uint32_t           n_tokens,
+        uint32_t           start,
+        float             *row_logits,
+        bool               capture_dspark_hidden) {
+    if (!g || !model || !weights || !tokens || !row_logits ||
+        n_tokens == 0 || n_tokens > DS4_DSPARK_MAX_BLOCK_SIZE) {
+        return false;
+    }
+    uint32_t i = 0;
+    while (i + 1u < n_tokens) {
+        int top0 = -1;
+        int top1 = -1;
+        const bool capture = capture_dspark_hidden && i + 2u == n_tokens;
+        if (!metal_graph_verify_decode2_exact(
+                g, model, weights,
+                tokens[i], tokens[i + 1u], start + i,
+                &top0, &top1,
+                row_logits + (uint64_t)i * DS4_N_VOCAB,
+                row_logits + (uint64_t)(i + 1u) * DS4_N_VOCAB,
+                capture)) {
+            return false;
+        }
+        i += 2u;
+    }
+    if (i < n_tokens) {
+        if (!metal_graph_eval_token_raw_swa(
+                g, model, weights, tokens[i], start + i,
+                row_logits + (uint64_t)i * DS4_N_VOCAB)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* Pick a raw SWA cache size for Metal.  During batched prefill it must cover
@@ -37183,6 +37282,256 @@ static int sample_top_p_min_p(
     return ids[filtered - 1];
 }
 
+int ds4_sampling_distribution(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        temperature,
+        int          top_k,
+        float        top_p,
+        float        min_p,
+        float       *probabilities) {
+    if (!logits || !probabilities || n_vocab == 0) return 1;
+    memset(probabilities, 0, (size_t)n_vocab * sizeof(probabilities[0]));
+
+    const int best = sample_argmax(logits, n_vocab);
+    if (temperature <= 0.0f) {
+        probabilities[best] = 1.0f;
+        return 0;
+    }
+    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
+    if (min_p < 0.0f) min_p = 0.0f;
+    if (min_p > 1.0f) {
+        probabilities[best] = 1.0f;
+        return 0;
+    }
+
+    /* Think Max defaults to top_p=1 and no top-k. In that common case the
+     * filtered distribution is independent of rank order: min-p is simply a
+     * weight threshold relative to the maximum. Preserve token-id sampling
+     * order and avoid sorting the 128K vocabulary for every draft row. */
+    if (top_k <= 0 && top_p >= 1.0f) {
+        float max_logit = DS4_NEG_INF;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            if (isfinite(logits[i]) && logits[i] > max_logit) {
+                max_logit = logits[i];
+            }
+        }
+        if (!isfinite(max_logit)) {
+            probabilities[best] = 1.0f;
+            return 0;
+        }
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            const float weight = expf((v - max_logit) / temperature);
+            if (!isfinite(weight) || weight < min_p) continue;
+            probabilities[i] = weight;
+            sum += weight;
+        }
+        if (!(sum > 0.0f) || !isfinite(sum)) {
+            memset(probabilities, 0,
+                   (size_t)n_vocab * sizeof(probabilities[0]));
+            probabilities[best] = 1.0f;
+            return 0;
+        }
+        const float inv_sum = 1.0f / sum;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            probabilities[i] *= inv_sum;
+        }
+        return 0;
+    }
+
+    sample_candidate *cand =
+        xmalloc((size_t)n_vocab * sizeof(cand[0]));
+    uint32_t n = 0;
+    float max_logit = DS4_NEG_INF;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        if (!isfinite(logits[i])) continue;
+        if (logits[i] > max_logit) max_logit = logits[i];
+    }
+    if (!isfinite(max_logit)) {
+        free(cand);
+        probabilities[best] = 1.0f;
+        return 0;
+    }
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        const float weight = expf((v - max_logit) / temperature);
+        if (!isfinite(weight) || weight < 0.0f) continue;
+        cand[n++] = (sample_candidate){
+            .id = (int)i,
+            .logit = v,
+            .prob = weight,
+        };
+    }
+    if (n == 0) {
+        free(cand);
+        probabilities[best] = 1.0f;
+        return 0;
+    }
+
+    qsort(cand, n, sizeof(cand[0]), sample_candidate_cmp_desc);
+    uint32_t limit = n;
+    if (top_k > 0) {
+        if (top_k > 1024) top_k = 1024;
+        if ((uint32_t)top_k < limit) limit = (uint32_t)top_k;
+    }
+    float total = 0.0f;
+    for (uint32_t i = 0; i < limit; i++) total += cand[i].prob;
+    if (!(total > 0.0f) || !isfinite(total)) {
+        free(cand);
+        probabilities[best] = 1.0f;
+        return 0;
+    }
+
+    const float min_weight = cand[0].prob * min_p;
+    float kept_sum = 0.0f;
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < limit; i++) {
+        if (i > 0 && cand[i].prob < min_weight) break;
+        kept_sum += cand[i].prob;
+        kept++;
+        if (kept_sum / total >= top_p) break;
+    }
+    if (kept == 0 || !(kept_sum > 0.0f) || !isfinite(kept_sum)) {
+        free(cand);
+        probabilities[best] = 1.0f;
+        return 0;
+    }
+    const float inv_sum = 1.0f / kept_sum;
+    for (uint32_t i = 0; i < kept; i++) {
+        probabilities[cand[i].id] = cand[i].prob * inv_sum;
+    }
+    free(cand);
+    return 0;
+}
+
+static float ds4_unit_interval(float u, float fallback) {
+    if (!isfinite(u)) return fallback;
+    if (u <= 0.0f) return 0.0f;
+    if (u >= 1.0f) return nextafterf(1.0f, 0.0f);
+    return u;
+}
+
+int ds4_speculative_rejection_step(
+        const float *target_probabilities,
+        const float *draft_probabilities,
+        uint32_t     n_vocab,
+        int          draft_token,
+        float        accept_uniform,
+        float        residual_uniform,
+        bool        *accepted) {
+    if (accepted) *accepted = false;
+    if (!target_probabilities || !draft_probabilities || n_vocab == 0 ||
+        draft_token < 0 || (uint32_t)draft_token >= n_vocab) {
+        return -1;
+    }
+
+    const float raw_p = target_probabilities[draft_token];
+    const float raw_q = draft_probabilities[draft_token];
+    const float p = isfinite(raw_p) && raw_p > 0.0f ? raw_p : 0.0f;
+    const float q = isfinite(raw_q) && raw_q > 0.0f ? raw_q : 0.0f;
+    const float ratio = q > 0.0f ? fminf(1.0f, p / q) : (p > 0.0f ? 1.0f : 0.0f);
+    if (ds4_unit_interval(accept_uniform, 1.0f) < ratio) {
+        if (accepted) *accepted = true;
+        return draft_token;
+    }
+
+    float residual_sum = 0.0f;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float pi = isfinite(target_probabilities[i]) &&
+                         target_probabilities[i] > 0.0f ?
+                         target_probabilities[i] : 0.0f;
+        const float qi = isfinite(draft_probabilities[i]) &&
+                         draft_probabilities[i] > 0.0f ?
+                         draft_probabilities[i] : 0.0f;
+        const float r = pi > qi ? pi - qi : 0.0f;
+        residual_sum += r;
+    }
+
+    const bool use_target = !(residual_sum > 0.0f) || !isfinite(residual_sum);
+    float total = residual_sum;
+    if (use_target) {
+        total = 0.0f;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float pi = target_probabilities[i];
+            if (isfinite(pi) && pi > 0.0f) total += pi;
+        }
+    }
+    if (!(total > 0.0f) || !isfinite(total)) return draft_token;
+
+    float draw = ds4_unit_interval(residual_uniform, 0.5f) * total;
+    int last = draft_token;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float pi = isfinite(target_probabilities[i]) &&
+                         target_probabilities[i] > 0.0f ?
+                         target_probabilities[i] : 0.0f;
+        float weight = pi;
+        if (!use_target) {
+            const float qi = isfinite(draft_probabilities[i]) &&
+                             draft_probabilities[i] > 0.0f ?
+                             draft_probabilities[i] : 0.0f;
+            weight = pi > qi ? pi - qi : 0.0f;
+        }
+        if (!(weight > 0.0f)) continue;
+        last = (int)i;
+        draw -= weight;
+        if (draw <= 0.0f) return (int)i;
+    }
+    return last;
+}
+
+static int ds4_sample_normalized_probabilities(
+        const float *probabilities,
+        uint32_t     n_vocab,
+        float        uniform) {
+    if (!probabilities || n_vocab == 0) return -1;
+    float total = 0.0f;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float p = probabilities[i];
+        if (isfinite(p) && p > 0.0f) total += p;
+    }
+    if (!(total > 0.0f) || !isfinite(total)) return -1;
+    float draw = ds4_unit_interval(uniform, 0.5f) * total;
+    int last = -1;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float p = probabilities[i];
+        if (!isfinite(p) || !(p > 0.0f)) continue;
+        last = (int)i;
+        draw -= p;
+        if (draw <= 0.0f) return (int)i;
+    }
+    return last;
+}
+
+static uint64_t ds4_splitmix64(uint64_t *state) {
+    uint64_t z = (*state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+void ds4_speculative_rng_init(uint64_t seed,
+                              uint64_t *target_rng,
+                              uint64_t *draft_rng,
+                              uint64_t *accept_rng) {
+    uint64_t state = seed ^ 0xd1b54a32d192ed03ULL;
+    uint64_t target = ds4_splitmix64(&state);
+    uint64_t draft = ds4_splitmix64(&state);
+    uint64_t accept = ds4_splitmix64(&state);
+    if (target == 0) target = 0xbf58476d1ce4e5b9ULL;
+    if (draft == 0) draft = 0x94d049bb133111ebULL;
+    if (draft == target) draft ^= 0x94d049bb133111ebULL;
+    if (accept == 0 || accept == draft || accept == target) {
+        accept ^= 0x9e3779b97f4a7c15ULL;
+    }
+    if (target_rng) *target_rng = target;
+    if (draft_rng) *draft_rng = draft;
+    if (accept_rng) *accept_rng = accept;
+}
+
 #ifdef DS4_TEST_HOOKS
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
@@ -37345,6 +37694,8 @@ static int generate_raw_swa_cpu(
 }
 
 #ifndef DS4_NO_GPU
+enum { DS4_DSPARK_CONFIDENCE_BINS = 10 };
+
 typedef struct {
     uint32_t ctx_size;
     uint32_t ctx_cap;
@@ -47688,6 +48039,16 @@ typedef struct ds4_dspark_spec_stats {
     uint64_t tail_skips;
     uint64_t verifier_unavailable;
     uint64_t verifier_errors;
+    uint64_t verifier_fallbacks;
+    uint64_t verifier_exact;
+    uint64_t sampled_accepts;
+    uint64_t sampled_rejections;
+    uint64_t sampled_corrections;
+    uint64_t rejection_pos_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
+    uint64_t position_attempted[DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint64_t position_accepted[DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint64_t length_calls[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
+    uint64_t length_accepted[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
     double target_ms;
     double saved_ms;
     double propose_ms;
@@ -47708,6 +48069,8 @@ typedef struct ds4_dspark_spec_stats {
     double verify_read_ms;
     uint64_t verifier_fused_head;
     double replay_ms;
+    double verify_ms_by_len[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
+    double replay_ms_by_len[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
     double total_ms;
 } ds4_dspark_spec_stats;
 
@@ -47743,7 +48106,10 @@ struct ds4_session {
     float *spec_row_logits;
     float *dspark_markov_bias;
     float *dspark_conf_features;
+    float *dspark_draft_probs;
+    float *dspark_verify_logits;
     size_t dspark_conf_features_cap;
+    size_t dspark_probability_rows;
 #endif
     int mtp_draft_token;
 #ifndef DS4_NO_GPU
@@ -47760,8 +48126,25 @@ struct ds4_session {
     double dspark_sched_saved_ms;
     double dspark_last_target_eval_ms;
     double dspark_last_propose_ms;
+    double dspark_target_ewma_ms;
+    double dspark_propose_ewma_ms;
+    double dspark_verify_ewma_ms[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
+    double dspark_replay_ewma_ms[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
+    double dspark_accept_ewma[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
+    uint64_t dspark_length_calls[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
+    uint64_t dspark_position_attempted[DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint64_t dspark_position_accepted[DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint64_t dspark_confidence_attempted[DS4_DSPARK_CONFIDENCE_BINS];
+    uint64_t dspark_confidence_accepted[DS4_DSPARK_CONFIDENCE_BINS];
+    uint64_t dspark_policy_cycles;
     float dspark_last_confidence0;
+    float dspark_draft_confidence[DS4_DSPARK_MAX_BLOCK_SIZE];
+    ds4_sampling_options dspark_sampling;
+    uint64_t dspark_sampling_rng;
     bool dspark_draft_valid;
+    bool dspark_draft_probs_valid;
+    bool dspark_sampling_active;
+    bool dspark_sampled_mode;
     bool dspark_sched_skipped_cycle;
     bool dspark_sched_long_accept_seen;
     bool dspark_last_confidence0_valid;
@@ -47800,6 +48183,157 @@ static uint32_t ds4_dspark_env_u32(const char *name, uint32_t fallback) {
     unsigned long v = strtoul(env, &end, 10);
     if (end == env || errno != 0 || v > UINT32_MAX) return fallback;
     return (uint32_t)v;
+}
+
+static double ds4_dspark_ewma(double previous, double sample) {
+    if (!(sample >= 0.0) || !isfinite(sample)) return previous;
+    if (!(previous > 0.0) || !isfinite(previous)) return sample;
+    return previous * 0.8 + sample * 0.2;
+}
+
+static uint32_t ds4_dspark_confidence_bin(float confidence) {
+    if (!isfinite(confidence) || confidence <= 0.0f) return 0;
+    if (confidence >= 1.0f) return DS4_DSPARK_CONFIDENCE_BINS - 1u;
+    uint32_t bin = (uint32_t)(confidence * DS4_DSPARK_CONFIDENCE_BINS);
+    if (bin >= DS4_DSPARK_CONFIDENCE_BINS) {
+        bin = DS4_DSPARK_CONFIDENCE_BINS - 1u;
+    }
+    return bin;
+}
+
+/* The support confidence is only a cold-start prior. Each confidence bucket
+ * is calibrated online with a Beta posterior; once observations accumulate,
+ * the device's measured accept/reject behavior dominates the raw score. */
+static double ds4_session_dspark_conditional_accept(
+        const ds4_session *s,
+        uint32_t           position) {
+    if (!s || position >= DS4_DSPARK_MAX_BLOCK_SIZE) return 0.0;
+    double confidence = s->dspark_draft_confidence[position];
+    if (!isfinite(confidence)) confidence = 0.5;
+    if (confidence < 0.001) confidence = 0.001;
+    if (confidence > 0.999) confidence = 0.999;
+    const uint32_t bin = ds4_dspark_confidence_bin((float)confidence);
+    const double prior_strength = 16.0;
+    const double alpha = 0.5 + prior_strength * confidence +
+        (double)s->dspark_confidence_accepted[bin];
+    const double rejected =
+        (double)(s->dspark_confidence_attempted[bin] -
+                 s->dspark_confidence_accepted[bin]);
+    const double beta = 0.5 + prior_strength * (1.0 - confidence) + rejected;
+    return alpha / (alpha + beta);
+}
+
+/* Select a profitable prefix using cumulative survival, not independent
+ * confidence thresholds. Length one is intentionally closed: on the measured
+ * Metal path its verifier costs at least one ordinary target decode. */
+static uint32_t ds4_session_dspark_choose_sampled_len(
+        ds4_session *s,
+        uint32_t     available) {
+    if (!s || available < 2u) return 0;
+    if (available > DS4_DSPARK_MAX_BLOCK_SIZE) {
+        available = DS4_DSPARK_MAX_BLOCK_SIZE;
+    }
+
+    for (uint32_t len = 2; len <= available; len++) {
+        if (s->dspark_length_calls[len] == 0) return len;
+    }
+
+    /* Every 32 target cycles, permit one bounded exploration of the least
+     * sampled available length so changing thermals do not lock the request
+     * into a stale local choice. */
+    if (s->dspark_policy_cycles != 0 &&
+        (s->dspark_policy_cycles % 32u) == 0) {
+        uint32_t explore = 2;
+        for (uint32_t len = 3; len <= available; len++) {
+            if (s->dspark_length_calls[len] <
+                s->dspark_length_calls[explore]) {
+                explore = len;
+            }
+        }
+        return explore;
+    }
+
+    const double target_ms = s->dspark_target_ewma_ms;
+    const double proposal_ms = s->dspark_propose_ewma_ms;
+    if (!(target_ms > 0.0) || !isfinite(target_ms)) return 0;
+
+    double survival = 1.0;
+    double expected_accepts = 0.0;
+    double best_rate = 1.0 / target_ms;
+    uint32_t best_len = 0;
+    for (uint32_t len = 1; len <= available; len++) {
+        survival *= ds4_session_dspark_conditional_accept(s, len - 1u);
+        expected_accepts += survival;
+        if (len < 2u || s->dspark_length_calls[len] == 0) continue;
+        const double verify_ms = s->dspark_verify_ewma_ms[len];
+        const double replay_ms = s->dspark_replay_ewma_ms[len];
+        if (!(verify_ms > 0.0) || !isfinite(verify_ms)) continue;
+        const double extra_ms = proposal_ms + verify_ms + replay_ms;
+        const double saved_ms = expected_accepts * target_ms;
+        if (!(saved_ms > extra_ms)) continue;
+        const double rate = (1.0 + expected_accepts) /
+            (target_ms + extra_ms);
+        if (rate > best_rate) {
+            best_rate = rate;
+            best_len = len;
+        }
+    }
+    if (best_len == 0) {
+        uint32_t until_explore =
+            32u - (uint32_t)(s->dspark_policy_cycles % 32u);
+        if (until_explore == 0) until_explore = 32u;
+        const uint32_t skip = until_explore - 1u;
+        if (s->dspark_sched_skip < skip) s->dspark_sched_skip = skip;
+    }
+    return best_len;
+}
+
+static void ds4_session_dspark_policy_note_proposal(
+        ds4_session *s,
+        double       proposal_ms) {
+    if (!s || !(proposal_ms >= 0.0) || !isfinite(proposal_ms)) return;
+    s->dspark_propose_ewma_ms =
+        ds4_dspark_ewma(s->dspark_propose_ewma_ms, proposal_ms);
+}
+
+static void ds4_session_dspark_policy_note_verify(
+        ds4_session *s,
+        uint32_t     proposed,
+        uint32_t     accepted,
+        double       verify_ms,
+        double       replay_ms) {
+    if (!s || proposed == 0 || proposed > DS4_DSPARK_MAX_BLOCK_SIZE) return;
+    if (accepted > proposed) accepted = proposed;
+    s->dspark_length_calls[proposed]++;
+    s->dspark_verify_ewma_ms[proposed] =
+        ds4_dspark_ewma(s->dspark_verify_ewma_ms[proposed], verify_ms);
+    s->dspark_replay_ewma_ms[proposed] =
+        ds4_dspark_ewma(s->dspark_replay_ewma_ms[proposed], replay_ms);
+    s->dspark_accept_ewma[proposed] =
+        ds4_dspark_ewma(s->dspark_accept_ewma[proposed], (double)accepted);
+
+    const uint32_t attempted = accepted < proposed ? accepted + 1u : proposed;
+    for (uint32_t pos = 0; pos < attempted; pos++) {
+        const bool accepted_here = pos < accepted;
+        const uint32_t bin =
+            ds4_dspark_confidence_bin(s->dspark_draft_confidence[pos]);
+        s->dspark_position_attempted[pos]++;
+        s->dspark_confidence_attempted[bin]++;
+        if (accepted_here) {
+            s->dspark_position_accepted[pos]++;
+            s->dspark_confidence_accepted[bin]++;
+        }
+        if (ds4_dspark_stats_enabled()) {
+            s->dspark_stats.position_attempted[pos]++;
+            if (accepted_here) s->dspark_stats.position_accepted[pos]++;
+        }
+    }
+    if (ds4_dspark_stats_enabled()) {
+        s->dspark_stats.length_calls[proposed]++;
+        s->dspark_stats.length_accepted[proposed] += accepted;
+        s->dspark_stats.verify_ms_by_len[proposed] += verify_ms;
+        s->dspark_stats.replay_ms_by_len[proposed] += replay_ms;
+    }
 }
 
 static bool ds4_dspark_scheduler_enabled(void) {
@@ -47885,7 +48419,9 @@ static void ds4_session_dspark_scheduler_note(
         uint32_t     accepted_drafts,
         bool         no_draft,
         double       extra_ms) {
-    if (!s || !ds4_dspark_scheduler_enabled()) return;
+    if (!s) return;
+    const bool scheduler_enabled = ds4_dspark_scheduler_enabled();
+    if (!scheduler_enabled && !ds4_dspark_stats_enabled()) return;
     if (s->dspark_sched_skipped_cycle) {
         s->dspark_sched_skipped_cycle = false;
         return;
@@ -47918,10 +48454,11 @@ static void ds4_session_dspark_scheduler_note(
             s->dspark_stats.saved_ms += saved_ms;
         }
     }
+    if (!scheduler_enabled) return;
 
     const uint32_t no_draft_skip =
         ds4_dspark_scheduler_no_draft_skip_cycles();
-    if (no_draft && no_draft_skip != 0) {
+    if (!s->dspark_sampled_mode && no_draft && no_draft_skip != 0) {
         uint32_t skip = no_draft_skip;
         if (s->dspark_sched_lifetime_accepted != 0 &&
             !s->dspark_sched_long_accept_seen) {
@@ -47951,7 +48488,8 @@ static void ds4_session_dspark_scheduler_note(
         }
     }
 
-    const uint32_t window = ds4_dspark_scheduler_window();
+    const uint32_t window = s->dspark_sampled_mode ?
+        8u : ds4_dspark_scheduler_window();
     const uint32_t break_even_window =
         ds4_dspark_scheduler_break_even_window();
 
@@ -47984,6 +48522,15 @@ static void ds4_session_dspark_scheduler_note(
     }
 
     if (s->dspark_sched_cycles < window) return;
+
+    /* Sampled speculation is judged by realized milliseconds, not greedy
+     * acceptance-count heuristics. The per-length policy owns sampled pauses,
+     * warm-up, and exploration; this legacy window only maintains aggregate
+     * diagnostics for the greedy path. */
+    if (s->dspark_sampled_mode) {
+        ds4_session_dspark_scheduler_reset(s);
+        return;
+    }
 
     const uint64_t avg_milli =
         ((uint64_t)s->dspark_sched_accepted * 1000ull) /
@@ -48508,6 +49055,7 @@ static void ds4_session_dspark_capture_invalidate(ds4_session *s) {
     if (!s) return;
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
+    s->dspark_draft_probs_valid = false;
     if (ds4_session_is_cpu(s)) return;
     metal_graph_dspark_capture_invalidate(&s->graph);
 #else
@@ -49404,18 +49952,25 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
            e->mtp_ready;
 }
 
+bool ds4_engine_has_dspark(ds4_engine *e) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    return false;
+#else
+    return e && e->backend != DS4_BACKEND_CPU &&
+           e->distributed.role == DS4_DISTRIBUTED_NONE &&
+           e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+           e->dspark_weights.block_size > 1;
+#endif
+}
+
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
     }
     if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
 #ifndef DS4_NO_GPU
-    if (e &&
-        e->backend != DS4_BACKEND_CPU &&
-        e->distributed.role == DS4_DISTRIBUTED_NONE &&
-        e->support_kind == DS4_SUPPORT_DSPARK &&
-        e->dspark &&
-        e->dspark_weights.block_size > 1) {
+    if (ds4_engine_has_dspark(e)) {
         return (int)e->dspark_weights.block_size;
     }
 #endif
@@ -50893,7 +51448,8 @@ static bool ds4_session_greedy_splitkv_replay_exact(
                                                            &top0,
                                                            &top1,
                                                            NULL,
-                                                           NULL);
+                                                           NULL,
+                                                           false);
                 if (!ok) {
                     snprintf(err, errlen, "%s split-kv paired exact replay failed",
                              ds4_backend_name(e->backend));
@@ -51393,7 +51949,8 @@ static int ds4_session_eval_splitkv_spec_after_first(
                                                &row0_top,
                                                NULL,
                                                row0_logits,
-                                               row1_logits);
+                                               row1_logits,
+                                               false);
     const double t_verify = timing ? now_sec() : 0.0;
     if (!ok) {
         (void)spec_frontier_restore(&frontier, s);
@@ -56735,14 +57292,94 @@ static void ds4_format_len_hist(
     }
 }
 
+static void ds4_format_dspark_position_stats(
+        char                 *buf,
+        size_t                buflen,
+        const uint64_t       *attempted,
+        const uint64_t       *accepted) {
+    if (!buf || buflen == 0 || !attempted || !accepted) return;
+    size_t off = 0;
+    buf[0] = '\0';
+    for (uint32_t i = 0; i < DS4_DSPARK_MAX_BLOCK_SIZE; i++) {
+        if (attempted[i] == 0) continue;
+        const int n = snprintf(buf + off, buflen - off,
+                               "%s%u:%llu/%llu",
+                               off ? "," : "", i + 1u,
+                               (unsigned long long)accepted[i],
+                               (unsigned long long)attempted[i]);
+        if (n < 0 || (size_t)n >= buflen - off) break;
+        off += (size_t)n;
+    }
+    if (off == 0) snprintf(buf, buflen, "none");
+}
+
+static void ds4_format_dspark_length_stats(
+        char                       *buf,
+        size_t                      buflen,
+        const ds4_dspark_spec_stats *st) {
+    if (!buf || buflen == 0 || !st) return;
+    size_t off = 0;
+    buf[0] = '\0';
+    for (uint32_t len = 1; len <= DS4_DSPARK_MAX_BLOCK_SIZE; len++) {
+        const uint64_t calls = st->length_calls[len];
+        if (calls == 0) continue;
+        const double avg_accept =
+            (double)st->length_accepted[len] / (double)calls;
+        const double avg_verify = st->verify_ms_by_len[len] / (double)calls;
+        const double avg_replay = st->replay_ms_by_len[len] / (double)calls;
+        const int n = snprintf(buf + off, buflen - off,
+                               "%s%u:%llu/%.2f/%.2f/%.2f",
+                               off ? "," : "", len,
+                               (unsigned long long)calls,
+                               avg_accept, avg_verify, avg_replay);
+        if (n < 0 || (size_t)n >= buflen - off) break;
+        off += (size_t)n;
+    }
+    if (off == 0) snprintf(buf, buflen, "none");
+}
+
+static void ds4_format_dspark_confidence_stats(
+        char           *buf,
+        size_t          buflen,
+        const uint64_t *attempted,
+        const uint64_t *accepted) {
+    if (!buf || buflen == 0 || !attempted || !accepted) return;
+    size_t off = 0;
+    buf[0] = '\0';
+    for (uint32_t bin = 0; bin < DS4_DSPARK_CONFIDENCE_BINS; bin++) {
+        if (attempted[bin] == 0) continue;
+        const int n = snprintf(buf + off, buflen - off,
+                               "%s%u:%llu/%llu",
+                               off ? "," : "", bin,
+                               (unsigned long long)accepted[bin],
+                               (unsigned long long)attempted[bin]);
+        if (n < 0 || (size_t)n >= buflen - off) break;
+        off += (size_t)n;
+    }
+    if (off == 0) snprintf(buf, buflen, "none");
+}
+
 static void ds4_session_print_dspark_stats(const ds4_session *s) {
     if (!s || !ds4_dspark_stats_enabled()) return;
     const ds4_dspark_spec_stats *st = &s->dspark_stats;
     if (st->cycles == 0 && st->propose_ms == 0.0) return;
     char draft_hist[192];
     char accept_hist[192];
+    char rejection_hist[192];
+    char position_stats[192];
+    char length_stats[256];
+    char confidence_stats[256];
     ds4_format_len_hist(draft_hist, sizeof(draft_hist), st->draft_len_hist);
     ds4_format_len_hist(accept_hist, sizeof(accept_hist), st->accepted_len_hist);
+    ds4_format_len_hist(rejection_hist, sizeof(rejection_hist),
+                        st->rejection_pos_hist);
+    ds4_format_dspark_position_stats(position_stats, sizeof(position_stats),
+                                     st->position_attempted,
+                                     st->position_accepted);
+    ds4_format_dspark_length_stats(length_stats, sizeof(length_stats), st);
+    ds4_format_dspark_confidence_stats(
+        confidence_stats, sizeof(confidence_stats),
+        s->dspark_confidence_attempted, s->dspark_confidence_accepted);
     const double accept_rate =
         st->proposed_tokens ?
             (100.0 * (double)st->accepted_draft_tokens /
@@ -56750,14 +57387,25 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
     const double avg_accept =
         st->cycles ?
             (double)st->accepted_draft_tokens / (double)st->cycles : 0.0;
+    const uint64_t generated = st->first_tokens +
+        st->accepted_draft_tokens + st->sampled_corrections;
+    const double proposal_coverage = generated ?
+        100.0 * (double)st->accepted_draft_tokens / (double)generated : 0.0;
+    const uint64_t verified_blocks = st->full_accepts + st->partial_accepts;
+    const double accepted_per_verify = verified_blocks ?
+        (double)st->accepted_draft_tokens / (double)verified_blocks : 0.0;
     const double extra_ms = st->propose_ms + st->total_ms;
     const double net_saved_ms = st->saved_ms - extra_ms;
     fprintf(stderr,
             "ds4: DSpark stats cycles=%llu first_tokens=%llu proposed=%llu "
             "accepted_draft=%llu accept_rate=%.2f%% avg_accept=%.3f "
+            "proposal_coverage=%.2f%% accepted_per_verify=%.3f "
             "full=%llu partial=%llu miss_first=%llu no_draft=%llu "
             "no_room=%llu invalid=%llu scheduler_skips=%llu "
-            "tail_skips=%llu verifier_unavailable=%llu errors=%llu time_ms propose=%.3f "
+            "tail_skips=%llu verifier_unavailable=%llu errors=%llu "
+            "fallbacks=%llu "
+            "verifier_exact=%llu sampled_accepts=%llu sampled_rejections=%llu "
+            "sampled_corrections=%llu time_ms propose=%.3f "
             "prop_stage0=%.3f prop_setup=%.3f prop_cache=%.3f "
             "prop_chain=%.3f prop_hidden=%.3f prop_conf0=%.3f "
             "prop_logits=%.3f prop_markov=%.3f prop_confidence=%.3f "
@@ -56765,13 +57413,16 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             "verify_layer=%.3f verify_head=%.3f verify_read=%.3f "
             "verify_fused_head=%llu replay=%.3f spec_total=%.3f "
             "target=%.3f saved=%.3f net_saved=%.3f "
-            "draft_len_hist=%s accepted_len_hist=%s\n",
+            "draft_len_hist=%s accepted_len_hist=%s rejection_pos_hist=%s "
+            "position_accept=%s confidence_accept=%s length_stats=%s\n",
             (unsigned long long)st->cycles,
             (unsigned long long)st->first_tokens,
             (unsigned long long)st->proposed_tokens,
             (unsigned long long)st->accepted_draft_tokens,
             accept_rate,
             avg_accept,
+            proposal_coverage,
+            accepted_per_verify,
             (unsigned long long)st->full_accepts,
             (unsigned long long)st->partial_accepts,
             (unsigned long long)st->first_misses,
@@ -56782,6 +57433,11 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             (unsigned long long)st->tail_skips,
             (unsigned long long)st->verifier_unavailable,
             (unsigned long long)st->verifier_errors,
+            (unsigned long long)st->verifier_fallbacks,
+            (unsigned long long)st->verifier_exact,
+            (unsigned long long)st->sampled_accepts,
+            (unsigned long long)st->sampled_rejections,
+            (unsigned long long)st->sampled_corrections,
             st->propose_ms,
             st->propose_stage0_ms,
             st->propose_setup_ms,
@@ -56805,7 +57461,11 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             st->saved_ms,
             net_saved_ms,
             draft_hist,
-            accept_hist);
+            accept_hist,
+            rejection_hist,
+            position_stats,
+            confidence_stats,
+            length_stats);
 }
 #endif
 
@@ -57089,6 +57749,18 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                         sizeof(s->dspark_conf_features[0]));
             s->dspark_conf_features_cap = (size_t)dspark_feature_count;
         }
+        const uint64_t probability_rows = e->dspark_weights.block_size;
+        const uint64_t probability_count =
+            probability_rows * (uint64_t)DS4_N_VOCAB;
+        if (probability_rows != 0 &&
+            probability_rows <= DS4_DSPARK_MAX_BLOCK_SIZE &&
+            probability_count <= (uint64_t)SIZE_MAX / sizeof(float)) {
+            s->dspark_draft_probs =
+                xmalloc((size_t)probability_count * sizeof(float));
+            s->dspark_verify_logits =
+                xmalloc((size_t)probability_count * sizeof(float));
+            s->dspark_probability_rows = (size_t)probability_rows;
+        }
     }
     if (e->mtp_ready) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
@@ -57113,6 +57785,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s->spec_row_logits);
             free(s->dspark_markov_bias);
             free(s->dspark_conf_features);
+            free(s->dspark_draft_probs);
+            free(s->dspark_verify_logits);
             free(s);
             return 1;
         }
@@ -57170,6 +57844,8 @@ void ds4_session_free(ds4_session *s) {
     free(s->spec_row_logits);
     free(s->dspark_markov_bias);
     free(s->dspark_conf_features);
+    free(s->dspark_draft_probs);
+    free(s->dspark_verify_logits);
 #endif
     free(s);
 }
@@ -59461,7 +60137,10 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
     const bool fake_argmax_enabled =
         enabled &&
         fake_argmax && fake_argmax[0] && strcmp(fake_argmax, "0") != 0;
-    const float confidence_threshold = s->engine->dspark_confidence_threshold;
+    const float raw_confidence_threshold =
+        s->engine->dspark_confidence_threshold;
+    const float confidence_threshold = s->dspark_sampling_active ? 0.0f :
+        raw_confidence_threshold;
     const bool stats_enabled = ds4_dspark_stats_enabled();
     const bool scheduler_enabled = ds4_dspark_scheduler_enabled();
     const bool time_enabled = stats_enabled || scheduler_enabled;
@@ -59474,8 +60153,12 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
     } while (0)
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
+    s->dspark_draft_probs_valid = false;
     s->dspark_last_confidence0 = 0.0f;
     s->dspark_last_confidence0_valid = false;
+    memset(s->dspark_draft_confidence, 0,
+           sizeof(s->dspark_draft_confidence));
+    if (enabled && s->dspark_sampling_active) s->dspark_policy_cycles++;
     if (scheduler_enabled) s->dspark_last_propose_ms = 0.0;
     if (enabled && !fake_argmax_enabled &&
         ds4_session_dspark_scheduler_should_skip(s)) {
@@ -59685,7 +60368,8 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
         const bool markov_ready =
             base_logits_ok && dspark_markov_probe_ready(dw);
         const bool lazy_runtime_confidence =
-            markov_ready && !probe_log && confidence_threshold > 0.0f;
+            markov_ready && !probe_log &&
+            (confidence_threshold > 0.0f || s->dspark_sampling_active);
         if (lazy_runtime_confidence) {
             const double markov_t0 = DS4_DSPARK_PROP_T0();
             markov_ok =
@@ -59695,6 +60379,10 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                         dw,
                         token,
                         confidence_threshold,
+                        s->dspark_sampling_active ? &s->dspark_sampling : NULL,
+                        s->dspark_sampling_active ? &s->dspark_sampling_rng : NULL,
+                        s->dspark_sampling_active ? s->dspark_draft_probs : NULL,
+                        s->dspark_probability_rows,
                         s->spec_row_logits,
                         s->dspark_markov_bias,
                         s->dspark_conf_features,
@@ -59704,9 +60392,23 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                         &confidence_len,
                         &confidence_prefix_len,
                         reuse_confidence0_markov,
-                        &confidence0);
+                        &confidence0,
+                        s->dspark_sampling_active ?
+                            s->dspark_draft_confidence : NULL);
             DS4_DSPARK_PROP_ADD(propose_markov_ms, markov_t0);
             confidence_ok = markov_ok;
+            if (markov_ok && s->dspark_sampling_active) {
+                confidence_prefix_len = markov_proposal_len;
+                if (raw_confidence_threshold > 0.0f) {
+                    for (uint32_t i = 0; i < markov_proposal_len; i++) {
+                        if (s->dspark_draft_confidence[i] <
+                            raw_confidence_threshold) {
+                            confidence_prefix_len = i;
+                            break;
+                        }
+                    }
+                }
+            }
         } else if (markov_ready) {
             const uint64_t logits_count =
                 (uint64_t)dw->block_size * (uint64_t)DS4_N_VOCAB;
@@ -59799,7 +60501,10 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
         }
         if (markov_ok && markov_proposal_len != 0) {
             uint32_t proposal_len = markov_proposal_len;
-            if (confidence_threshold > 0.0f) {
+            if (s->dspark_sampling_active) {
+                proposal_len = ds4_session_dspark_choose_sampled_len(
+                        s, markov_proposal_len);
+            } else if (confidence_threshold > 0.0f) {
                 proposal_len = confidence_ok ? confidence_prefix_len : 0;
             }
             s->dspark_draft_len = proposal_len;
@@ -59810,6 +60515,8 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                 s->dspark_draft_tokens[i] = markov_proposal[i];
             }
             s->dspark_draft_valid = s->dspark_draft_len != 0;
+            s->dspark_draft_probs_valid =
+                s->dspark_draft_valid && s->dspark_sampling_active;
         }
         if (confidence_ok && confidence_len != 0) {
             s->dspark_last_confidence0 = confidence0;
@@ -59938,6 +60645,9 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
     if (time_enabled) {
         const double propose_ms = (now_sec() - stats_t0) * 1000.0;
         if (scheduler_enabled) s->dspark_last_propose_ms = propose_ms;
+        if (s->dspark_sampling_active && enabled) {
+            ds4_session_dspark_policy_note_proposal(s, propose_ms);
+        }
         if (stats_enabled) s->dspark_stats.propose_ms += propose_ms;
     }
 #undef DS4_DSPARK_PROP_ADD
@@ -60134,6 +60844,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     if (dspark_target_timing) {
         const double target_ms = (now_sec() - target_t0) * 1000.0;
         s->dspark_last_target_eval_ms = target_ms;
+        s->dspark_target_ewma_ms =
+            ds4_dspark_ewma(s->dspark_target_ewma_ms, target_ms);
         if (ds4_dspark_stats_enabled()) {
             s->dspark_stats.target_ms += target_ms;
         }
@@ -61254,18 +61966,42 @@ static int ds4_session_eval_dspark_speculative_argmax(
         for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
         verifier_may_have_mutated = true;
         ds4_verify_suffix_timing verify_timing;
-        const double verify_t0 = stats_enabled ? now_sec() : 0.0;
-        ok = metal_graph_verify_suffix_tops(&s->graph,
-                                            &e->model,
-                                            &e->weights,
-                                            &s->checkpoint,
-                                            (uint32_t)start,
-                                            (uint32_t)draft_n,
-                                            false,
-                                            true,
-                                            row_tops,
-                                            NULL,
-                                            stats_enabled ? &verify_timing : NULL);
+        memset(&verify_timing, 0, sizeof(verify_timing));
+        const double verify_t0 = now_sec();
+        const bool exact_verify = !e->tp.active && s->dspark_verify_logits;
+        if (exact_verify) {
+            ok = metal_graph_verify_decode_exact_rows(
+                    &s->graph,
+                    &e->model,
+                    &e->weights,
+                    drafts,
+                    (uint32_t)draft_n,
+                    (uint32_t)start,
+                    s->dspark_verify_logits,
+                    true);
+            verify_timing.layer_ms = (now_sec() - verify_t0) * 1000.0;
+            if (ok && row_tops) {
+                for (int i = 0; i + 1 < draft_n; i++) {
+                    row_tops[i] = sample_argmax(
+                        s->dspark_verify_logits +
+                            (uint64_t)i * DS4_N_VOCAB,
+                        DS4_N_VOCAB);
+                }
+            }
+            if (stats_enabled && ok) s->dspark_stats.verifier_exact++;
+        } else {
+            ok = metal_graph_verify_suffix_tops(&s->graph,
+                                                &e->model,
+                                                &e->weights,
+                                                &s->checkpoint,
+                                                (uint32_t)start,
+                                                (uint32_t)draft_n,
+                                                false,
+                                                true,
+                                                row_tops,
+                                                NULL,
+                                                stats_enabled ? &verify_timing : NULL);
+        }
         if (stats_enabled) {
             s->dspark_stats.verify_ms += (now_sec() - verify_t0) * 1000.0;
             s->dspark_stats.verify_upload_ms += verify_timing.upload_ms;
@@ -61290,10 +62026,18 @@ static int ds4_session_eval_dspark_speculative_argmax(
     bool final_logits_ok = false;
     if (ok && commit_drafts == draft_n) {
         const double read_t0 = stats_enabled ? now_sec() : 0.0;
-        final_logits_ok =
-            metal_graph_read_spec_logits_row(&s->graph,
-                                             (uint32_t)(draft_n - 1),
-                                             row_logits);
+        if (!e->tp.active && s->dspark_verify_logits) {
+            memcpy(row_logits,
+                   s->dspark_verify_logits +
+                       (uint64_t)(draft_n - 1) * DS4_N_VOCAB,
+                   (size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+            final_logits_ok = true;
+        } else {
+            final_logits_ok =
+                metal_graph_read_spec_logits_row(&s->graph,
+                                                 (uint32_t)(draft_n - 1),
+                                                 row_logits);
+        }
         if (stats_enabled) {
             s->dspark_stats.verify_read_ms += (now_sec() - read_t0) * 1000.0;
         }
@@ -61469,6 +62213,322 @@ static int ds4_session_eval_dspark_speculative_argmax(
     DS4_DSPARK_STATS_FINISH();
 #undef DS4_DSPARK_SCHED_EXTRA_MS
 #undef DS4_DSPARK_STATS_FINISH
+    return n_accept;
+}
+
+static int ds4_session_eval_dspark_speculative_sample(
+        ds4_session               *s,
+        int                        n_accept,
+        int                        max_tokens,
+        int                        eos_token,
+        const ds4_sampling_options *sampling,
+        uint64_t                  *accept_rng,
+        int                       *accepted,
+        int                        accepted_cap,
+        char                      *err,
+        size_t                     errlen) {
+    const bool stats_enabled = s && ds4_dspark_stats_enabled();
+    const bool scheduler_enabled = s && ds4_dspark_scheduler_enabled();
+    const double stats_t0 =
+        (stats_enabled || scheduler_enabled) ? now_sec() : 0.0;
+#define DS4_DSPARK_SAMPLE_FINISH() do {                                    \
+        if (stats_enabled) {                                                \
+            s->dspark_stats.total_ms += (now_sec() - stats_t0) * 1000.0;    \
+        }                                                                   \
+    } while (0)
+#define DS4_DSPARK_SAMPLE_EXTRA_MS()                                        \
+    ((scheduler_enabled && stats_t0 != 0.0) ?                               \
+     s->dspark_last_propose_ms + (now_sec() - stats_t0) * 1000.0 : 0.0)
+
+    if (stats_enabled) {
+        s->dspark_stats.cycles++;
+        if (n_accept > 0) s->dspark_stats.first_tokens++;
+    }
+    if (!s || !sampling || !accept_rng || !accepted ||
+        !s->dspark_draft_valid || !s->dspark_draft_probs_valid ||
+        s->dspark_draft_len == 0 || !s->dspark_draft_probs ||
+        !s->dspark_verify_logits) {
+        if (s) {
+            s->dspark_draft_valid = false;
+            s->dspark_draft_probs_valid = false;
+            s->dspark_draft_len = 0;
+            if (stats_enabled) {
+                s->dspark_stats.no_draft++;
+                ds4_dspark_stats_note_len(
+                    s->dspark_stats.accepted_len_hist, 0);
+            }
+            ds4_session_dspark_scheduler_note(
+                s, 0, true, DS4_DSPARK_SAMPLE_EXTRA_MS());
+        }
+        DS4_DSPARK_SAMPLE_FINISH();
+        return n_accept;
+    }
+
+    int draft_n = (int)s->dspark_draft_len;
+    if (draft_n > max_tokens - n_accept) draft_n = max_tokens - n_accept;
+    if (draft_n > accepted_cap - n_accept) draft_n = accepted_cap - n_accept;
+    int room = s->ctx_size - s->checkpoint.len;
+    if (draft_n > room - 1) draft_n = room - 1;
+    int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
+    for (int i = 0; i < draft_n; i++) {
+        drafts[i] = s->dspark_draft_tokens[i];
+        if (drafts[i] < 0 || drafts[i] >= (int)DS4_N_VOCAB) {
+            draft_n = 0;
+            break;
+        }
+        if (drafts[i] == eos_token) {
+            draft_n = i + 1;
+            break;
+        }
+    }
+    s->dspark_draft_valid = false;
+    s->dspark_draft_probs_valid = false;
+    s->dspark_draft_len = 0;
+    if (draft_n <= 0) {
+        if (stats_enabled) {
+            s->dspark_stats.invalid_draft++;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+        }
+        DS4_DSPARK_SAMPLE_FINISH();
+        return n_accept;
+    }
+    if (stats_enabled) {
+        s->dspark_stats.proposed_tokens += (uint64_t)draft_n;
+        ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist,
+                                  (uint32_t)draft_n);
+    }
+
+    ds4_engine *e = s->engine;
+    ds4_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    const int start = s->checkpoint.len;
+    const double snapshot_t0 = stats_enabled ? now_sec() : 0.0;
+    const bool have_frontier = spec_frontier_snapshot(&frontier, s);
+    if (stats_enabled) {
+        s->dspark_stats.snapshot_ms += (now_sec() - snapshot_t0) * 1000.0;
+    }
+    int row_tops[DS4_DSPARK_MAX_BLOCK_SIZE];
+    double verify_elapsed_ms = 0.0;
+    bool ok = have_frontier;
+    if (ok) {
+        for (int i = 0; i < draft_n; i++) {
+            token_vec_push(&s->checkpoint, drafts[i]);
+        }
+        ds4_verify_suffix_timing timing;
+        memset(&timing, 0, sizeof(timing));
+        const double verify_t0 = stats_enabled ? now_sec() : 0.0;
+        /* Production sampling uses decode-equivalent kernels and cache order.
+         * The older layer-major prefill verifier remains an explicit
+         * diagnostic for measuring its speed/numeric drift only. */
+        const bool exact_sampled_verify =
+            !e->tp.active &&
+            getenv("DS4_DSPARK_SAMPLED_BATCH_VERIFY") == NULL;
+        if (exact_sampled_verify) {
+            ok = metal_graph_verify_decode_exact_rows(
+                    &s->graph,
+                    &e->model,
+                    &e->weights,
+                    drafts,
+                    (uint32_t)draft_n,
+                    (uint32_t)start,
+                    s->dspark_verify_logits,
+                    true);
+            timing.layer_ms = (now_sec() - verify_t0) * 1000.0;
+            if (stats_enabled && ok) s->dspark_stats.verifier_exact++;
+        } else {
+            ok = metal_graph_verify_suffix_tops(
+                    &s->graph,
+                    &e->model,
+                    &e->weights,
+                    &s->checkpoint,
+                    (uint32_t)start,
+                    (uint32_t)draft_n,
+                    draft_n == 2,
+                    true,
+                    draft_n > 1 ? row_tops : NULL,
+                    s->dspark_verify_logits,
+                    stats_enabled ? &timing : NULL);
+        }
+        verify_elapsed_ms = (now_sec() - verify_t0) * 1000.0;
+        if (stats_enabled) {
+            s->dspark_stats.verify_ms += verify_elapsed_ms;
+            s->dspark_stats.verify_upload_ms += timing.upload_ms;
+            s->dspark_stats.verify_layer_ms += timing.layer_ms;
+            s->dspark_stats.verify_head_ms += timing.head_ms;
+            s->dspark_stats.verify_read_ms += timing.read_ms;
+            if (timing.fused_head) s->dspark_stats.verifier_fused_head++;
+        }
+    }
+    if (!ok) {
+        s->checkpoint.len = start;
+        ds4_session_dspark_capture_invalidate(s);
+        const bool restored = have_frontier && spec_frontier_restore(&frontier, s);
+        if (stats_enabled) {
+            s->dspark_stats.verifier_unavailable++;
+            if (restored) s->dspark_stats.verifier_fallbacks++;
+            if (!restored) s->dspark_stats.verifier_errors++;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+        }
+        if (!restored) {
+            snprintf(err, errlen, "DSpark sampled verifier rollback failed");
+            s->checkpoint_valid = false;
+            spec_frontier_free(&frontier);
+            DS4_DSPARK_SAMPLE_FINISH();
+            return -1;
+        }
+        spec_frontier_free(&frontier);
+        ds4_session_dspark_scheduler_note(
+            s, 0, false, DS4_DSPARK_SAMPLE_EXTRA_MS());
+        DS4_DSPARK_SAMPLE_FINISH();
+        return n_accept;
+    }
+
+    int accepted_drafts = 0;
+    int correction = -1;
+    int rejection_pos = -1;
+    for (int i = 0; i < draft_n; i++) {
+        const float *target_logits = i == 0 ? s->logits :
+            s->dspark_verify_logits +
+                (uint64_t)(i - 1) * DS4_N_VOCAB;
+        const float *q = s->dspark_draft_probs +
+            (uint64_t)i * DS4_N_VOCAB;
+        if (ds4_sampling_distribution(
+                target_logits,
+                DS4_N_VOCAB,
+                sampling->temperature,
+                sampling->top_k,
+                sampling->top_p,
+                sampling->min_p,
+                s->sample_probs) != 0) {
+            correction = -1;
+            rejection_pos = i;
+            break;
+        }
+        bool draft_accepted = false;
+        const int decision = ds4_speculative_rejection_step(
+            s->sample_probs,
+            q,
+            DS4_N_VOCAB,
+            drafts[i],
+            sample_rng_f32(accept_rng),
+            sample_rng_f32(accept_rng),
+            &draft_accepted);
+        if (draft_accepted) {
+            accepted_drafts++;
+            if (stats_enabled) s->dspark_stats.sampled_accepts++;
+            continue;
+        }
+        correction = decision;
+        rejection_pos = i;
+        break;
+    }
+
+    if (accepted_drafts == draft_n && correction < 0) {
+        memcpy(s->logits,
+               s->dspark_verify_logits +
+                   (uint64_t)(draft_n - 1) * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        for (int i = 0; i < draft_n; i++) accepted[n_accept++] = drafts[i];
+        s->checkpoint_valid = true;
+        ds4_session_dspark_capture_note_checkpoint(s);
+        if (stats_enabled) {
+            s->dspark_stats.full_accepts++;
+            s->dspark_stats.accepted_draft_tokens += (uint64_t)draft_n;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
+                                      (uint32_t)draft_n);
+        }
+        ds4_session_dspark_policy_note_verify(
+            s, (uint32_t)draft_n, (uint32_t)draft_n,
+            verify_elapsed_ms, 0.0);
+        ds4_session_dspark_scheduler_note(
+            s, (uint32_t)draft_n, false, DS4_DSPARK_SAMPLE_EXTRA_MS());
+        spec_frontier_free(&frontier);
+        DS4_DSPARK_SAMPLE_FINISH();
+        return n_accept;
+    }
+
+    s->checkpoint.len = start;
+    ds4_session_dspark_capture_invalidate(s);
+    bool prefix1_committed = false;
+    if (accepted_drafts == 1 && draft_n == 2) {
+        prefix1_committed = spec_frontier_commit_prefix1(s);
+        if (prefix1_committed) {
+            token_vec_push(&s->checkpoint, drafts[0]);
+            accepted[n_accept++] = drafts[0];
+        }
+    }
+    const bool state_ready = prefix1_committed ||
+        spec_frontier_restore(&frontier, s);
+    if (!state_ready || correction < 0 || correction >= (int)DS4_N_VOCAB) {
+        snprintf(err, errlen, "DSpark sampled correction failed");
+        s->checkpoint_valid = false;
+        if (stats_enabled) s->dspark_stats.verifier_errors++;
+        spec_frontier_free(&frontier);
+        DS4_DSPARK_SAMPLE_FINISH();
+        return -1;
+    }
+
+    const double replay_t0 = now_sec();
+    for (int i = prefix1_committed ? 1 : 0; i < accepted_drafts; i++) {
+        if (!metal_graph_eval_token_raw_swa(&s->graph,
+                                            &e->model,
+                                            &e->weights,
+                                            drafts[i],
+                                            (uint32_t)s->checkpoint.len,
+                                            s->spec_row_logits)) {
+            snprintf(err, errlen, "%s sampled replay failed",
+                     ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            spec_frontier_free(&frontier);
+            DS4_DSPARK_SAMPLE_FINISH();
+            return -1;
+        }
+        token_vec_push(&s->checkpoint, drafts[i]);
+        accepted[n_accept++] = drafts[i];
+    }
+    if (!metal_graph_eval_token_raw_swa(&s->graph,
+                                        &e->model,
+                                        &e->weights,
+                                        correction,
+                                        (uint32_t)s->checkpoint.len,
+                                        s->spec_row_logits)) {
+        snprintf(err, errlen, "%s sampled correction eval failed",
+                 ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        spec_frontier_free(&frontier);
+        DS4_DSPARK_SAMPLE_FINISH();
+        return -1;
+    }
+    token_vec_push(&s->checkpoint, correction);
+    accepted[n_accept++] = correction;
+    memcpy(s->logits, s->spec_row_logits,
+           (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    s->checkpoint_valid = true;
+    ds4_session_dspark_capture_note_checkpoint(s);
+    const double replay_elapsed_ms = (now_sec() - replay_t0) * 1000.0;
+    if (stats_enabled) {
+        s->dspark_stats.replay_ms += replay_elapsed_ms;
+        s->dspark_stats.partial_accepts++;
+        s->dspark_stats.sampled_rejections++;
+        s->dspark_stats.sampled_corrections++;
+        if (rejection_pos >= 0 &&
+            rejection_pos < (int)DS4_DSPARK_MAX_BLOCK_SIZE) {
+            s->dspark_stats.rejection_pos_hist[rejection_pos]++;
+        }
+        s->dspark_stats.accepted_draft_tokens +=
+            (uint64_t)accepted_drafts;
+        ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
+                                  (uint32_t)accepted_drafts);
+    }
+    ds4_session_dspark_policy_note_verify(
+        s, (uint32_t)draft_n, (uint32_t)accepted_drafts,
+        verify_elapsed_ms, replay_elapsed_ms);
+    ds4_session_dspark_scheduler_note(
+        s, (uint32_t)accepted_drafts, false, DS4_DSPARK_SAMPLE_EXTRA_MS());
+    spec_frontier_free(&frontier);
+    DS4_DSPARK_SAMPLE_FINISH();
+#undef DS4_DSPARK_SAMPLE_EXTRA_MS
+#undef DS4_DSPARK_SAMPLE_FINISH
     return n_accept;
 }
 #endif
@@ -64401,6 +65461,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+#ifndef DS4_NO_GPU
+    s->dspark_sampled_mode = false;
+#endif
     if (s->distributed) {
         if (!accepted) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
@@ -64697,7 +65760,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                   &row0_top,
                                                   NULL,
                                                   row0_logits,
-                                                  row_logits);
+                                                  row_logits,
+                                                  false);
         }
         const double verify_done = mtp_timing ? now_sec() : 0.0;
         if (ok && row0_top == drafts[1]) {
@@ -65115,6 +66179,75 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         }
     }
     return n_accept;
+#endif
+}
+
+int ds4_session_eval_speculative_sample(
+        ds4_session               *s,
+        int                        first_token,
+        int                        max_tokens,
+        int                        eos_token,
+        const ds4_sampling_options *sampling,
+        uint64_t                  *draft_rng,
+        uint64_t                  *accept_rng,
+        int                       *accepted,
+        int                        accepted_cap,
+        char                      *err,
+        size_t                     errlen) {
+    if (!s || !sampling || !draft_rng || !accept_rng || !accepted ||
+        max_tokens <= 0 || accepted_cap <= 0) {
+        return 0;
+    }
+    if (sampling->temperature <= 0.0f) {
+        return ds4_session_eval_speculative_argmax(
+            s, first_token, max_tokens, eos_token,
+            accepted, accepted_cap, err, errlen);
+    }
+    if (s->distributed || ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    (void)eos_token;
+    snprintf(err, errlen, "GPU support is not compiled in");
+    return -1;
+#else
+    ds4_engine *e = s->engine;
+    const bool usable_dspark =
+        e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        !e->quality && !e->dspark_strict && !e->tp.active;
+    bool prepare = usable_dspark && first_token != eos_token &&
+                   max_tokens > 1 && accepted_cap > 1;
+    bool tail_skip = false;
+    if (prepare && ds4_dspark_scheduler_enabled()) {
+        const uint32_t tail_min = ds4_dspark_scheduler_tail_min_tokens();
+        if (tail_min != 0 && (uint32_t)max_tokens < tail_min) {
+            prepare = false;
+            tail_skip = true;
+            if (ds4_dspark_stats_enabled()) s->dspark_stats.tail_skips++;
+        }
+    }
+
+    s->dspark_sampling = *sampling;
+    s->dspark_sampled_mode = true;
+    s->dspark_sampling_rng = *draft_rng;
+    s->dspark_sampling_active = prepare;
+    const int eval_rc = ds4_session_eval_probe_tp(
+        s, first_token, prepare, err, errlen);
+    s->dspark_sampling_active = false;
+    *draft_rng = s->dspark_sampling_rng;
+    if (eval_rc != 0) return -1;
+
+    int n_accept = 0;
+    accepted[n_accept++] = first_token;
+    if (!prepare || tail_skip || first_token == eos_token ||
+        max_tokens == 1 || n_accept >= accepted_cap) {
+        return n_accept;
+    }
+    return ds4_session_eval_dspark_speculative_sample(
+        s, n_accept, max_tokens, eos_token, sampling, accept_rng,
+        accepted, accepted_cap, err, errlen);
 #endif
 }
 

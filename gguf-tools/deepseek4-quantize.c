@@ -1367,6 +1367,7 @@ typedef struct {
 
 typedef struct {
     char *path;
+    char *architecture;
     uint32_t version;
     uint64_t n_kv;
     uint64_t n_tensors;
@@ -1526,13 +1527,20 @@ static gguf_file load_gguf_metadata(const char *path) {
         if (rec_start < 0 || rec_start < kv_start) die("GGUF ftell failed");
         char *key = read_gguf_string_fp(fp);
         uint32_t type = read_u32_le_fp(fp, "GGUF KV type");
-        if (strcmp(key, "general.alignment") == 0 && type == GGUF_TYPE_UINT32) {
+        if (strcmp(key, "general.architecture") == 0 && type == GGUF_TYPE_STRING) {
+            free(g.architecture);
+            g.architecture = read_gguf_string_fp(fp);
+        } else if (strcmp(key, "general.alignment") == 0 && type == GGUF_TYPE_UINT32) {
             uint32_t a = read_u32_le_fp(fp, "GGUF alignment");
             if (a) g.alignment = a;
-        } else if (strcmp(key, "deepseek4.expert_count") == 0 && type == GGUF_TYPE_UINT32) {
+        } else if ((strcmp(key, "deepseek4.expert_count") == 0 ||
+                    strcmp(key, "dflash.expert_count") == 0) &&
+                   type == GGUF_TYPE_UINT32) {
             uint32_t n = read_u32_le_fp(fp, "GGUF expert count");
             if (n <= (uint32_t)INT_MAX) g.n_experts = (int)n;
-        } else if (strcmp(key, "deepseek4.expert_count") == 0 && type == GGUF_TYPE_UINT64) {
+        } else if ((strcmp(key, "deepseek4.expert_count") == 0 ||
+                    strcmp(key, "dflash.expert_count") == 0) &&
+                   type == GGUF_TYPE_UINT64) {
             uint64_t n = read_u64_le_fp(fp, "GGUF expert count");
             if (n <= (uint64_t)INT_MAX) g.n_experts = (int)n;
         } else {
@@ -1753,6 +1761,7 @@ static void dspark_support_defaults(dspark_support_options *o) {
 typedef struct {
     char *hf_dir;
     char *template_gguf;
+    char *dspark_gguf;
     char *out_gguf;
     char *compare_gguf;
     char *compare_tensor;
@@ -1918,6 +1927,43 @@ static char *map_dspark_hf_name(const char *hf_name, const char **action_out) {
     return NULL;
 }
 
+static char *map_dflash_gguf_name(const char *source_name, int *stage_out) {
+    if (str_starts(source_name, "blk.")) {
+        char *end = NULL;
+        long stage = strtol(source_name + 4, &end, 10);
+        if (end == source_name + 4 || !end || *end != '.' ||
+            stage < 0 || stage > INT_MAX || !end[1]) {
+            return NULL;
+        }
+        if (stage_out) *stage_out = (int)stage;
+        return fmt_stage_name((int)stage, end + 1);
+    }
+
+    typedef struct {
+        const char *source;
+        const char *suffix;
+        int stage;
+    } dflash_name_rule;
+    static const dflash_name_rule rules[] = {
+        {"fc.weight", "main_proj.weight", 0},
+        {"enc.output_norm.weight", "main_norm.weight", 0},
+        {"conf_proj.weight", "confidence_head.proj.weight", 2},
+        {"output_hc_base.weight", "hc_head_base.weight", 2},
+        {"output_hc_fn.weight", "hc_head_fn.weight", 2},
+        {"output_hc_scale.weight", "hc_head_scale.weight", 2},
+        {"markov_w1.weight", "markov_head.markov_w1.weight", 2},
+        {"markov_w2.weight", "markov_head.markov_w2.weight", 2},
+        {"output_norm.weight", "norm.weight", 2},
+    };
+    for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
+        if (strcmp(source_name, rules[i].source) == 0) {
+            if (stage_out) *stage_out = rules[i].stage;
+            return fmt_stage_name(rules[i].stage, rules[i].suffix);
+        }
+    }
+    return NULL;
+}
+
 static void print_dspark_manifest(const char *hf_dir) {
     str_list names = load_index_weight_names(hf_dir);
     uint64_t total = 0;
@@ -1978,6 +2024,7 @@ typedef enum {
 typedef struct {
     tensor_meta meta;
     char *hf_name;
+    int source_index;
     dspark_plan_kind kind;
     dspark_tensor_role role;
     int stage;
@@ -2117,6 +2164,7 @@ static dspark_tensor_plan *dspark_plan_push(dspark_support_plan *p) {
     }
     dspark_tensor_plan *tp = &p->tensors[p->len++];
     memset(tp, 0, sizeof(*tp));
+    tp->source_index = -1;
     return tp;
 }
 
@@ -2337,6 +2385,91 @@ static dspark_support_plan build_dspark_support_plan(st_db *db,
     return plan;
 }
 
+static dspark_support_plan build_dflash_repack_plan(const gguf_file *source,
+                                                    const quant_policy *policy,
+                                                    const dspark_support_options *opt,
+                                                    int requested_n_experts) {
+    dspark_support_plan plan = {0};
+    for (uint64_t i = 0; i < source->n_tensors; i++) {
+        const tensor_meta *src = &source->tensors[i];
+        int stage = -1;
+        char *gguf_name = map_dflash_gguf_name(src->name, &stage);
+        if (!gguf_name) {
+            fprintf(stderr, "error: unknown dflash tensor: %s\n", src->name);
+            exit(1);
+        }
+        if (dspark_plan_find(&plan, gguf_name) >= 0) {
+            fprintf(stderr, "error: duplicate mapped DSpark tensor: %s\n", gguf_name);
+            exit(1);
+        }
+
+        dspark_tensor_plan *tp = dspark_plan_push(&plan);
+        tp->source_index = (int)i;
+        tp->hf_name = xstrdup(src->name);
+        tp->meta.name = gguf_name;
+        tp->meta.n_dims = src->n_dims;
+        memcpy(tp->meta.ne, src->ne, sizeof(tp->meta.ne));
+        tp->stage = stage;
+        tp->role = dspark_tensor_role_for_name(tp->meta.name);
+
+        expert_tensor expert = parse_expert_tensor(tp->meta.name);
+        if (expert.is_expert) {
+            if (src->n_dims != 3 || src->ne[2] <= 0 || src->ne[2] > INT_MAX) {
+                fprintf(stderr, "error: bad packed dflash expert shape: %s\n", src->name);
+                exit(1);
+            }
+            tp->kind = DSPARK_PLAN_EXPERT;
+            tp->expert_part = expert.part;
+            tp->n_experts = (int)src->ne[2];
+            if (requested_n_experts > 0 && requested_n_experts != tp->n_experts) {
+                fprintf(stderr,
+                        "error: --n-experts %d does not match %s experts=%d\n",
+                        requested_n_experts,
+                        src->name,
+                        tp->n_experts);
+                exit(1);
+            }
+        } else {
+            tp->kind = DSPARK_PLAN_REGULAR;
+        }
+        tp->meta.type = dspark_policy_type(policy,
+                                           tp->meta.name,
+                                           &tp->meta,
+                                           tp->role,
+                                           tp->expert_part);
+        dspark_plan_set_size(tp);
+        if (stage + 1 > plan.stages) plan.stages = stage + 1;
+    }
+    if (plan.len == 0) die("no tensors found in dflash GGUF");
+    if ((uint32_t)plan.stages != opt->target_layer_count) {
+        fprintf(stderr,
+                "error: dflash stage count %d does not match target layer count %u\n",
+                plan.stages,
+                opt->target_layer_count);
+        exit(1);
+    }
+
+    static const char *const required[] = {
+        "mtp.0.main_proj.weight",
+        "mtp.0.main_norm.weight",
+        "mtp.2.confidence_head.proj.weight",
+        "mtp.2.hc_head_base.weight",
+        "mtp.2.hc_head_fn.weight",
+        "mtp.2.hc_head_scale.weight",
+        "mtp.2.markov_head.markov_w1.weight",
+        "mtp.2.markov_head.markov_w2.weight",
+        "mtp.2.norm.weight",
+    };
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        if (dspark_plan_find(&plan, required[i]) < 0) {
+            fprintf(stderr, "error: dflash GGUF is missing required tensor %s\n", required[i]);
+            exit(1);
+        }
+    }
+    dspark_plan_finalize(&plan, opt);
+    return plan;
+}
+
 static void print_dspark_support_plan(const dspark_support_plan *plan,
                                       const dspark_support_options *opt) {
     size_t type_counts[DS4Q_TYPE_COUNT] = {0};
@@ -2387,14 +2520,9 @@ static byte_buf generate_dspark_tensor(st_db *db, const dspark_tensor_plan *tp,
                                true);
 }
 
-static void write_dspark_support_gguf(st_db *db,
-                                      const dspark_support_plan *plan,
-                                      const dspark_support_options *opt,
-                                      const char *out_path,
-                                      int n_threads,
-                                      const imatrix_store *imatrix) {
-    FILE *fp = fopen(out_path, "wb");
-    if (!fp) die_errno("open output", out_path);
+static void write_dspark_support_header(FILE *fp,
+                                        const dspark_support_plan *plan,
+                                        const dspark_support_options *opt) {
     if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
     write_u32(fp, 3);
     write_u64(fp, (uint64_t)plan->len);
@@ -2421,6 +2549,17 @@ static void write_dspark_support_gguf(st_db *db,
     if (pos < 0) die("ftell failed");
     if ((size_t)pos > plan->data_offset) die("DSpark GGUF metadata larger than planned");
     write_padding(fp, plan->data_offset - (size_t)pos);
+}
+
+static void write_dspark_support_gguf(st_db *db,
+                                      const dspark_support_plan *plan,
+                                      const dspark_support_options *opt,
+                                      const char *out_path,
+                                      int n_threads,
+                                      const imatrix_store *imatrix) {
+    FILE *fp = fopen(out_path, "wb");
+    if (!fp) die_errno("open output", out_path);
+    write_dspark_support_header(fp, plan, opt);
 
     for (int i = 0; i < plan->len; i++) {
         const dspark_tensor_plan *tp = &plan->tensors[i];
@@ -2447,6 +2586,151 @@ static void write_dspark_support_gguf(st_db *db,
     fclose(fp);
 }
 
+static int64_t gguf_tensor_rows(const tensor_meta *t) {
+    int64_t rows = 1;
+    for (int i = 1; i < t->n_dims; i++) {
+        if (t->ne[i] <= 0 || rows > INT64_MAX / t->ne[i]) die("GGUF tensor row count overflow");
+        rows *= t->ne[i];
+    }
+    return rows;
+}
+
+static void dequantize_dflash_rows(const tensor_meta *src,
+                                   const uint8_t *raw,
+                                   float *dst,
+                                   int64_t nrows) {
+    const int64_t ncols = src->ne[0];
+    const size_t row_size = ds4q_row_size(src->type, ncols);
+    if (!row_size) die("unsupported dflash source row size");
+    for (int64_t row = 0; row < nrows; row++) {
+        const uint8_t *in = raw + (size_t)row * row_size;
+        float *out = dst + (size_t)row * (size_t)ncols;
+        if (src->type == DS4Q_TYPE_F32) {
+            memcpy(out, in, (size_t)ncols * sizeof(float));
+        } else if (src->type == DS4Q_TYPE_F16) {
+            for (int64_t col = 0; col < ncols; col++) {
+                out[col] = ds4q_f16_to_f32(load_u16_le(in + (size_t)col * 2));
+            }
+        } else if (src->type == DS4Q_TYPE_BF16) {
+            for (int64_t col = 0; col < ncols; col++) {
+                out[col] = ds4q_bf16_to_f32(load_u16_le(in + (size_t)col * 2));
+            }
+        } else if (src->type == DS4Q_TYPE_Q8_0) {
+            ds4q_q8_0_to_f32_row(in, out, ncols);
+        } else if (src->type == DS4Q_TYPE_MXFP4) {
+            ds4q_mxfp4_to_f32_row(in, out, ncols);
+        } else {
+            fprintf(stderr,
+                    "error: unsupported dflash source type %s for %s\n",
+                    ds4q_type_name(src->type),
+                    src->name);
+            exit(1);
+        }
+    }
+}
+
+static void copy_exact_bytes(FILE *src_fp, FILE *dst_fp, size_t n, const char *out_path) {
+    const size_t chunk_size = 32u * 1024u * 1024u;
+    uint8_t *buf = xmalloc(chunk_size);
+    size_t remaining = n;
+    while (remaining) {
+        size_t chunk = remaining < chunk_size ? remaining : chunk_size;
+        if (fread(buf, 1, chunk, src_fp) != chunk) die("short dflash tensor read");
+        if (fwrite(buf, 1, chunk, dst_fp) != chunk) die_errno("write tensor", out_path);
+        remaining -= chunk;
+    }
+    free(buf);
+}
+
+static void write_dflash_repack_tensor(FILE *src_fp,
+                                       FILE *dst_fp,
+                                       const tensor_meta *src,
+                                       const tensor_meta *dst,
+                                       const char *out_path) {
+    if (src->type == dst->type) {
+        if (src->size != dst->size) die("dflash copy tensor size mismatch");
+        copy_exact_bytes(src_fp, dst_fp, src->size, out_path);
+        return;
+    }
+
+    const int64_t ncols = src->ne[0];
+    const int64_t total_rows = gguf_tensor_rows(src);
+    const size_t src_row_size = ds4q_row_size(src->type, ncols);
+    const size_t dst_row_size = ds4q_row_size(dst->type, ncols);
+    if (!src_row_size || !dst_row_size) die("bad dflash repack row size");
+    const size_t float_row_size = (size_t)ncols * sizeof(float);
+    const size_t memory_budget = 32u * 1024u * 1024u;
+    size_t per_row = src_row_size + float_row_size + dst_row_size;
+    int64_t rows_per_chunk = per_row < memory_budget
+        ? (int64_t)(memory_budget / per_row)
+        : 1;
+    if (rows_per_chunk > total_rows) rows_per_chunk = total_rows;
+
+    uint8_t *raw = xmalloc((size_t)rows_per_chunk * src_row_size);
+    float *values = xmalloc((size_t)rows_per_chunk * float_row_size);
+    size_t written = 0;
+    ds4q_quantize_init(dst->type);
+    for (int64_t row = 0; row < total_rows; row += rows_per_chunk) {
+        int64_t chunk_rows = total_rows - row;
+        if (chunk_rows > rows_per_chunk) chunk_rows = rows_per_chunk;
+        size_t raw_bytes = (size_t)chunk_rows * src_row_size;
+        if (fread(raw, 1, raw_bytes, src_fp) != raw_bytes) die("short dflash tensor read");
+        dequantize_dflash_rows(src, raw, values, chunk_rows);
+        byte_buf converted = f32_to_type(values,
+                                         chunk_rows * ncols,
+                                         dst->type,
+                                         ncols,
+                                         NULL);
+        size_t expected = (size_t)chunk_rows * dst_row_size;
+        if (converted.size != expected) die("dflash converted chunk size mismatch");
+        if (fwrite(converted.data, 1, converted.size, dst_fp) != converted.size) {
+            die_errno("write tensor", out_path);
+        }
+        written += converted.size;
+        free(converted.data);
+    }
+    free(values);
+    free(raw);
+    if (written != dst->size) die("dflash converted tensor size mismatch");
+}
+
+static void write_dflash_repack_gguf(const gguf_file *source,
+                                     const dspark_support_plan *plan,
+                                     const dspark_support_options *opt,
+                                     const char *out_path) {
+    FILE *src_fp = fopen(source->path, "rb");
+    if (!src_fp) die_errno("open GGUF", source->path);
+    FILE *dst_fp = fopen(out_path, "wb");
+    if (!dst_fp) die_errno("open output", out_path);
+    write_dspark_support_header(dst_fp, plan, opt);
+
+    for (int i = 0; i < plan->len; i++) {
+        const dspark_tensor_plan *tp = &plan->tensors[i];
+        if (tp->source_index < 0 || (uint64_t)tp->source_index >= source->n_tensors) {
+            die("bad dflash source tensor index");
+        }
+        const tensor_meta *src = &source->tensors[tp->source_index];
+        fprintf(stderr,
+                "[%4d/%4d] %s (%s) -> %s (%s)\n",
+                i + 1,
+                plan->len,
+                src->name,
+                ds4q_type_name(src->type),
+                tp->meta.name,
+                ds4q_type_name(tp->meta.type));
+        if (fseeko(src_fp,
+                   (off_t)(source->data_offset + src->old_offset),
+                   SEEK_SET) != 0) {
+            die_errno("seek GGUF", source->path);
+        }
+        write_dflash_repack_tensor(src_fp, dst_fp, src, &tp->meta, out_path);
+        size_t padded = ds4q_pad(tp->meta.size, plan->alignment);
+        write_padding(dst_fp, padded - tp->meta.size);
+    }
+    if (fclose(dst_fp) != 0) die_errno("close output", out_path);
+    fclose(src_fp);
+}
+
 static void free_dspark_support_plan(dspark_support_plan *plan) {
     for (int i = 0; i < plan->len; i++) {
         free(plan->tensors[i].meta.name);
@@ -2458,10 +2742,12 @@ static void free_dspark_support_plan(dspark_support_plan *plan) {
 
 static void usage(const char *argv0) {
     printf("usage: %s --hf DIR --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
+    printf("       %s --dspark-gguf DFLASH.gguf --out SUPPORT.gguf [options]\n", argv0);
     printf("\nDeepSeek V4 Flash/Pro safetensors -> GGUF quantizer in plain C.\n\n");
     printf("options:\n");
     printf("  --hf DIR               Hugging Face model directory with model.safetensors.index.json\n");
     printf("  --template FILE        existing DS4 GGUF used for metadata, tensor order, shapes\n");
+    printf("  --dspark-gguf FILE     repack a dflash DSpark GGUF as a DS4 support GGUF\n");
     printf("  --out FILE             output GGUF path\n");
     printf("  --compare-gguf FILE    reference GGUF for --compare-tensor; normal mode defaults to template\n");
     printf("  --compare-tensor NAME  regenerate one tensor, checksum, optionally byte-compare, and exit\n");
@@ -2560,6 +2846,8 @@ static params parse_args(int argc, char **argv) {
             p.hf_dir = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--template") == 0) {
             p.template_gguf = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--dspark-gguf") == 0) {
+            p.dspark_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--out") == 0) {
             p.out_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--compare-gguf") == 0) {
@@ -2623,8 +2911,22 @@ static params parse_args(int argc, char **argv) {
             exit(1);
         }
     }
-    if (!p.hf_dir) die("--hf is required");
     if (p.dspark_manifest && p.dspark_support) die("--dspark-manifest and --dspark-support are mutually exclusive");
+    if (p.dspark_gguf) {
+        if (p.hf_dir || p.template_gguf || p.dspark_manifest || p.dspark_support || p.compare_tensor) {
+            die("--dspark-gguf is mutually exclusive with HF/template/compare modes");
+        }
+        if (!p.dry_run && !p.out_gguf) die("--out is required unless --dry-run is used");
+        if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) {
+            die("output exists; use --overwrite");
+        }
+        if (p.imatrix_file) die("--imatrix is not supported with --dspark-gguf");
+        if (p.policy.routed_w1 == DS4Q_TYPE_COUNT) p.policy.routed_w1 = DS4Q_TYPE_Q4_K;
+        if (p.policy.routed_w2 == DS4Q_TYPE_COUNT) p.policy.routed_w2 = DS4Q_TYPE_Q4_K;
+        if (p.policy.routed_w3 == DS4Q_TYPE_COUNT) p.policy.routed_w3 = DS4Q_TYPE_Q4_K;
+        return p;
+    }
+    if (!p.hf_dir) die("--hf is required");
     if (p.dspark_manifest) return p;
     if (p.dspark_support) {
         if (!p.dry_run && !p.compare_tensor && !p.out_gguf) {
@@ -2644,6 +2946,7 @@ static params parse_args(int argc, char **argv) {
 
 static void free_gguf_file(gguf_file *g) {
     free(g->path);
+    free(g->architecture);
     free(g->kv_raw);
     for (uint64_t i = 0; i < g->n_tensors; i++) free(g->tensors[i].name);
     free(g->tensors);
@@ -2747,6 +3050,29 @@ int main(int argc, char **argv) {
     params p = parse_args(argc, argv);
     if (p.dspark_manifest) {
         print_dspark_manifest(p.hf_dir);
+        for (int i = 0; i < p.policy.n_overrides; i++) free(p.policy.overrides[i].prefix);
+        free(p.policy.overrides);
+        return 0;
+    }
+
+    if (p.dspark_gguf) {
+        gguf_file source = load_gguf_metadata(p.dspark_gguf);
+        if (!source.architecture || strcmp(source.architecture, "dflash") != 0) {
+            fprintf(stderr,
+                    "error: --dspark-gguf expects general.architecture=dflash, got %s\n",
+                    source.architecture ? source.architecture : "<missing>");
+            exit(1);
+        }
+        if (source.n_tensors > INT_MAX) die("too many dflash tensors");
+        dspark_support_plan plan =
+            build_dflash_repack_plan(&source, &p.policy, &p.dspark, p.n_experts);
+        print_dspark_support_plan(&plan, &p.dspark);
+        if (!p.dry_run) {
+            write_dflash_repack_gguf(&source, &plan, &p.dspark, p.out_gguf);
+            fprintf(stderr, "wrote %s\n", p.out_gguf);
+        }
+        free_dspark_support_plan(&plan);
+        free_gguf_file(&source);
         for (int i = 0; i < p.policy.n_overrides; i++) free(p.policy.overrides[i].prefix);
         free(p.policy.overrides);
         return 0;

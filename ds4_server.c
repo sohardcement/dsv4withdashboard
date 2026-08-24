@@ -12587,9 +12587,13 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     }
 
     bool dsml_recovery_attempted = false;
-    uint64_t rng = j->req.seed ? j->req.seed :
+    const uint64_t request_seed = j->req.seed ? j->req.seed :
         (((uint64_t)time(NULL) << 32) ^ (response_seq << 1) ^
          (uint64_t)(uintptr_t)j);
+    uint64_t rng = 0;
+    uint64_t draft_rng = 0;
+    uint64_t accept_rng = 0;
+    ds4_speculative_rng_init(request_seed, &rng, &draft_rng, &accept_rng);
 decode_again:
     ;
     buf text = {0};
@@ -12684,7 +12688,38 @@ decode_again:
 						"client disconnected during decode");
 				} else {
 					finish = "error";
-				}
+                }
+                break;
+            }
+        } else if (!s->batched_mode && temperature > 0.0f &&
+                   ds4_engine_has_dspark(s->engine) &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            const ds4_sampling_options sampling = {
+                .temperature = temperature,
+                .top_k = top_k,
+                .top_p = top_p,
+                .min_p = min_p,
+            };
+            ntok = ds4_session_eval_speculative_sample(
+                slot->session,
+                token,
+                max_tokens - completion,
+                ds4_token_eos(s->engine),
+                &sampling,
+                &draft_rng,
+                &accept_rng,
+                toks,
+                (int)(sizeof(toks) / sizeof(toks[0])),
+                err,
+                sizeof(err));
+            if (ntok < 0) {
+                if (server_job_client_disconnected(j)) {
+                    finish = "cancelled";
+                    snprintf(err, sizeof(err),
+                             "client disconnected during decode");
+                } else {
+                    finish = "error";
+                }
                 break;
             }
         } else {
@@ -16818,7 +16853,7 @@ static void test_start_server_context_precedence(void) {
 	TEST_ASSERT(strstr(out, "--ctx 262144") != NULL); free(out);
 	TEST_ASSERT(unlink(file) == 0);
 	out = test_start_server_dry_run();
-	TEST_ASSERT(strstr(out, "--ctx 51200") != NULL); free(out);
+	TEST_ASSERT(strstr(out, "--ctx 110592") != NULL); free(out);
 	rmdir(ds4dir); rmdir(root);
 cleanup:
 	test_env_restore(&dry_run);
@@ -16853,24 +16888,29 @@ static void test_start_server_performance_profiles(void) {
 	TEST_ASSERT(unsetenv("DS4_MTP_PATH") == 0);
 
 	char *out = test_start_server_dry_run();
-	TEST_ASSERT(strstr(out, "--ctx 51200") != NULL);
+	TEST_ASSERT(strstr(out, "--ctx 110592") != NULL);
 	TEST_ASSERT(strstr(out, "--prefill-chunk 5120") != NULL);
 	TEST_ASSERT(strstr(out, "--mtp") == NULL);
+	TEST_ASSERT(strstr(out, "--dspark") == NULL);
 	free(out);
 
 	TEST_ASSERT(setenv("DS4_PROFILE", "greedy", 1) == 0);
 	out = test_start_server_dry_run();
-	TEST_ASSERT(strstr(out, "--ctx 51200") != NULL);
+	TEST_ASSERT(strstr(out, "--ctx 110592") != NULL);
 	TEST_ASSERT(strstr(out, "--prefill-chunk 5120") != NULL);
-	const char *default_mtp = "gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf";
-	if (access(default_mtp, F_OK) == 0) {
-		TEST_ASSERT(strstr(out, "--mtp gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf") != NULL);
-		TEST_ASSERT(strstr(out, "--mtp-draft 2") != NULL);
-	} else {
-		TEST_ASSERT(strstr(out, "--mtp") == NULL);
-	}
+	TEST_ASSERT(strstr(out, "--mtp") == NULL);
+	TEST_ASSERT(strstr(out, "--dspark") == NULL);
 	free(out);
 
+	TEST_ASSERT(setenv("DS4_PROFILE", "conservative", 1) == 0);
+	out = test_start_server_dry_run();
+	TEST_ASSERT(strstr(out, "--ctx 110592") != NULL);
+	TEST_ASSERT(strstr(out, "--prefill-chunk 5120") != NULL);
+	TEST_ASSERT(strstr(out, "--mtp") == NULL);
+	TEST_ASSERT(strstr(out, "--dspark") == NULL);
+	free(out);
+
+	TEST_ASSERT(setenv("DS4_PROFILE", "greedy", 1) == 0);
 	TEST_ASSERT(setenv("DS4_MTP_PATH", "Makefile", 1) == 0);
 	out = test_start_server_dry_run();
 	TEST_ASSERT(strstr(out, "--mtp Makefile") != NULL);

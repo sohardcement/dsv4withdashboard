@@ -36,12 +36,19 @@ endif
 CFLAGS ?= -O3 -Wall -Wextra -std=c11 $(NATIVE_CPU_FLAG)
 CPPFLAGS ?= -D_GNU_SOURCE
 
-.PHONY: all clean quality-score quality-llama-score
+.PHONY: all clean test quality-score quality-llama-score
 
 all: deepseek4-quantize
 
 deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
+
+../tests/dspark_mxfp4_test: ../tests/dspark_mxfp4_test.c quants.c quants.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -o $@ ../tests/dspark_mxfp4_test.c quants.c -lm
+
+test: deepseek4-quantize ../tests/dspark_mxfp4_test
+	../tests/dspark_mxfp4_test
+	python3 ../tests/dspark_repack_test.py ./deepseek4-quantize
 
 quality-score:
 	$(MAKE) -C .. $(QUALITY_TARGETS)
@@ -51,4 +58,4 @@ quality-llama-score:
 	$(CXX) $(LLAMA_CPP_CXXFLAGS) -o quality-testing/score_llama quality-testing/score_llama.cpp $(LLAMA_CPP_LDLIBS)
 
 clean:
-	rm -f deepseek4-quantize quality-testing/score_official quality-testing/score_llama
+	rm -f deepseek4-quantize ../tests/dspark_mxfp4_test quality-testing/score_official quality-testing/score_llama

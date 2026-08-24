@@ -367,6 +367,25 @@ int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
+/* Materialize the exact normalized distribution used by ds4_sample_logits.
+ * The output has n_vocab entries and is always finite on success. */
+int ds4_sampling_distribution(const float *logits, uint32_t n_vocab,
+                              float temperature, int top_k,
+                              float top_p, float min_p,
+                              float *probabilities);
+/* One lossless speculative-sampling decision over normalized target/draft
+ * distributions. Returns the accepted draft token or a residual correction. */
+int ds4_speculative_rejection_step(const float *target_probabilities,
+                                   const float *draft_probabilities,
+                                   uint32_t n_vocab,
+                                   int draft_token,
+                                   float accept_uniform,
+                                   float residual_uniform,
+                                   bool *accepted);
+void ds4_speculative_rng_init(uint64_t seed,
+                              uint64_t *target_rng,
+                              uint64_t *draft_rng,
+                              uint64_t *accept_rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 #ifdef DS4_TEST_HOOKS
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
@@ -383,6 +402,13 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
  * used by the TP worker right after session create (no-op on CPU/GLM). */
 void ds4_session_gpu_warmup(ds4_session *s);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+
+typedef struct {
+    float temperature;
+    int top_k;
+    float top_p;
+    float min_p;
+} ds4_sampling_options;
 
 typedef struct {
     ds4_session *session;
@@ -405,6 +431,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+int ds4_session_eval_speculative_sample(ds4_session *s, int first_token,
+                                        int max_tokens, int eos_token,
+                                        const ds4_sampling_options *sampling,
+                                        uint64_t *draft_rng,
+                                        uint64_t *accept_rng,
+                                        int *accepted, int accepted_cap,
+                                        char *err, size_t errlen);
 /* TP worker side of a mirrored speculative-verify block: run its half of the
  * batch verify for KV side effects, then obey the leader's commit frame
  * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */
@@ -418,6 +451,7 @@ int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
+bool ds4_engine_has_dspark(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 

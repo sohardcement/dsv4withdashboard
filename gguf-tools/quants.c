@@ -1154,6 +1154,42 @@ float ds4q_bf16_to_f32(uint16_t bits) {
     return ds4q_f32_from_bits((uint32_t)bits << 16);
 }
 
+void ds4q_q8_0_to_f32_row(const uint8_t *src, float *dst, int64_t n) {
+    assert(n % 32 == 0);
+    for (int64_t block = 0; block < n / 32; block++) {
+        const uint8_t *b = src + (size_t)block * 34;
+        const uint16_t d_bits = (uint16_t)b[0] | (uint16_t)((uint16_t)b[1] << 8);
+        const float d = ds4q_f16_to_f32(d_bits);
+        for (int j = 0; j < 32; j++) {
+            dst[block * 32 + j] = d * (float)(int8_t)b[2 + j];
+        }
+    }
+}
+
+static float ds4q_e8m0_to_f32_half(uint8_t exponent) {
+    const uint32_t bits = exponent < 2
+        ? UINT32_C(0x00200000) << exponent
+        : (uint32_t)(exponent - 1) << 23;
+    return ds4q_f32_from_bits(bits);
+}
+
+void ds4q_mxfp4_to_f32_row(const uint8_t *src, float *dst, int64_t n) {
+    static const int8_t e2m1_twice[16] = {
+        0, 1, 2, 3, 4, 6, 8, 12,
+        0, -1, -2, -3, -4, -6, -8, -12,
+    };
+    assert(n % 32 == 0);
+    for (int64_t block = 0; block < n / 32; block++) {
+        const uint8_t *b = src + (size_t)block * 17;
+        const float d = ds4q_e8m0_to_f32_half(b[0]);
+        float *out = dst + block * 32;
+        for (int j = 0; j < 16; j++) {
+            out[j] = d * (float)e2m1_twice[b[1 + j] & 0x0f];
+            out[j + 16] = d * (float)e2m1_twice[b[1 + j] >> 4];
+        }
+    }
+}
+
 void ds4q_f32_to_f16_row(const float *src, uint16_t *dst, int64_t n) {
     for (int64_t i = 0; i < n; i++) dst[i] = ds4q_f32_to_f16(src[i]);
 }

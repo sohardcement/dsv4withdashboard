@@ -572,8 +572,12 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
 
-    uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
+    const uint64_t request_seed = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    uint64_t rng = 0;
+    uint64_t draft_rng = 0;
+    uint64_t accept_rng = 0;
+    ds4_speculative_rng_init(request_seed, &rng, &draft_rng, &accept_rng);
     int generated = 0;
     const bool speculative_argmax = cfg->gen.temperature <= 0.0f &&
         ((ds4_engine_mtp_draft_tokens(engine) > 1 &&
@@ -608,6 +612,28 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
                                                        sizeof(err));
+            cli_dist_busy_set(cfg, false);
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
+        } else if (cfg->gen.temperature > 0.0f &&
+                   ds4_engine_has_dspark(engine) &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            const ds4_sampling_options sampling = {
+                .temperature = cfg->gen.temperature,
+                .top_k = 0,
+                .top_p = cfg->gen.top_p,
+                .min_p = cfg->gen.min_p,
+            };
+            cli_dist_busy_set(cfg, true);
+            ntok = ds4_session_eval_speculative_sample(
+                session, token, max_tokens - generated,
+                ds4_token_eos(engine), &sampling,
+                &draft_rng, &accept_rng,
+                toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                err, sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
@@ -1476,8 +1502,12 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
 
-    uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
+    const uint64_t request_seed = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    uint64_t rng = 0;
+    uint64_t draft_rng = 0;
+    uint64_t accept_rng = 0;
+    ds4_speculative_rng_init(request_seed, &rng, &draft_rng, &accept_rng);
     int generated = 0;
     const bool speculative_argmax = cfg->gen.temperature <= 0.0f &&
         ((ds4_engine_mtp_draft_tokens(engine) > 1 &&
@@ -1516,6 +1546,27 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
                                                        sizeof(err));
+            cli_dist_busy_set(cfg, false);
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                return 1;
+            }
+        } else if (cfg->gen.temperature > 0.0f &&
+                   ds4_engine_has_dspark(engine) &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            const ds4_sampling_options sampling = {
+                .temperature = cfg->gen.temperature,
+                .top_k = 0,
+                .top_p = cfg->gen.top_p,
+                .min_p = cfg->gen.min_p,
+            };
+            cli_dist_busy_set(cfg, true);
+            ntok = ds4_session_eval_speculative_sample(
+                chat->session, token, max_tokens - generated,
+                ds4_token_eos(engine), &sampling,
+                &draft_rng, &accept_rng,
+                toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                err, sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
