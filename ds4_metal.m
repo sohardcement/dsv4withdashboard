@@ -50,6 +50,118 @@ static id<MTLDevice> g_device;
 static id<MTLCommandQueue> g_queue;
 static id<MTLLibrary> g_library;
 static id<MTLCommandBuffer> g_batch_cb;
+
+/* --- dispatch-count tracing (DS4_METAL_DISPATCH_COUNT_TRACE=1) ------------
+ * Swizzles the compute encoder's dispatch methods at runtime so every encoded
+ * dispatch is counted and attributed to the current pipeline.  CPU-side
+ * encode-order data only (no GPU timestamps): the point is an exact per-token
+ * dispatch count and kernel-name histogram for fusion planning. */
+#import <objc/runtime.h>
+
+static int g_dispatch_count_enabled;
+static int g_dispatch_count_installed;
+static uint64_t g_dispatch_count_total;
+static char g_dispatch_cur_pipeline[128];
+static char g_dispatch_names[512][128];
+static uint64_t g_dispatch_name_counts[512];
+static int g_dispatch_name_n;
+
+static void (*g_orig_dispatch_threadgroups)(id, SEL, MTLSize, MTLSize);
+static void (*g_orig_dispatch_threads)(id, SEL, MTLSize, MTLSize);
+static void (*g_orig_set_pipeline)(id, SEL, id);
+
+static void ds4_dispatch_count_note(void) {
+    g_dispatch_count_total++;
+    const char *name = g_dispatch_cur_pipeline[0] ? g_dispatch_cur_pipeline : "?";
+    for (int i = 0; i < g_dispatch_name_n; i++) {
+        if (strcmp(g_dispatch_names[i], name) == 0) {
+            g_dispatch_name_counts[i]++;
+            return;
+        }
+    }
+    if (g_dispatch_name_n < 512) {
+        snprintf(g_dispatch_names[g_dispatch_name_n], 128, "%s", name);
+        g_dispatch_name_counts[g_dispatch_name_n] = 1;
+        g_dispatch_name_n++;
+    }
+}
+
+static void ds4_hook_dispatch_threadgroups(id self, SEL cmd, MTLSize tg, MTLSize tptg) {
+    ds4_dispatch_count_note();
+    g_orig_dispatch_threadgroups(self, cmd, tg, tptg);
+}
+
+static void ds4_hook_dispatch_threads(id self, SEL cmd, MTLSize tg, MTLSize tptg) {
+    ds4_dispatch_count_note();
+    g_orig_dispatch_threads(self, cmd, tg, tptg);
+}
+
+static void ds4_hook_set_pipeline(id self, SEL cmd, id pipeline) {
+    if (g_dispatch_count_enabled && pipeline) {
+        NSString *n = [(id)pipeline label];
+        snprintf(g_dispatch_cur_pipeline, sizeof(g_dispatch_cur_pipeline), "%s",
+                 n && n.length ? n.UTF8String : "?");
+    }
+    g_orig_set_pipeline(self, cmd, pipeline);
+}
+
+static id (*g_orig_new_pipeline_fn)(id, SEL, id, NSError **);
+
+static id ds4_hook_new_pipeline_fn(id self, SEL cmd, id fn, NSError **error) {
+    id pipeline = g_orig_new_pipeline_fn(self, cmd, fn, error);
+    if (pipeline && fn && [fn respondsToSelector:@selector(name)]) {
+        [(id)pipeline performSelector:@selector(setLabel:)
+                           withObject:[fn performSelector:@selector(name)]];
+    }
+    return pipeline;
+}
+
+static void ds4_dispatch_count_install_hook(id encoder) {
+    Class cls = object_getClass(encoder);
+    if (!cls) return;
+    int hooked = 0;
+    Method m = class_getInstanceMethod(cls, @selector(dispatchThreadgroups:threadsPerThreadgroup:));
+    if (m) {
+        g_orig_dispatch_threadgroups = (void (*)(id, SEL, MTLSize, MTLSize))method_getImplementation(m);
+        method_setImplementation(m, (IMP)ds4_hook_dispatch_threadgroups);
+        hooked |= 1;
+    }
+    m = class_getInstanceMethod(cls, @selector(dispatchThreads:threadsPerThreadgroup:));
+    if (m) {
+        g_orig_dispatch_threads = (void (*)(id, SEL, MTLSize, MTLSize))method_getImplementation(m);
+        method_setImplementation(m, (IMP)ds4_hook_dispatch_threads);
+        hooked |= 2;
+    }
+    m = class_getInstanceMethod(cls, @selector(setComputePipelineState:));
+    if (m) {
+        g_orig_set_pipeline = (void (*)(id, SEL, id))method_getImplementation(m);
+        method_setImplementation(m, (IMP)ds4_hook_set_pipeline);
+        hooked |= 4;
+    }
+    g_dispatch_count_installed = 1;
+    fprintf(stderr, "ds4: dispatch count trace installed on %s hooked=%d(tg=%d,threads=%d,pipeline=%d)\n",
+            class_getName(cls), hooked,
+            (hooked & 1) != 0, (hooked & 2) != 0, (hooked & 4) != 0);
+}
+
+static void ds4_dispatch_count_report(void) {
+    static uint64_t last_report_total;
+    static uint64_t last_dump_counts[512];
+    static uint64_t reports;
+    fprintf(stderr, "ds4: dispatch_count token dispatches=%llu\n",
+            (unsigned long long)(g_dispatch_count_total - last_report_total));
+    last_report_total = g_dispatch_count_total;
+    if ((++reports % 32) != 0) return;
+    for (int i = 0; i < g_dispatch_name_n; i++) {
+        const uint64_t delta =
+            g_dispatch_name_counts[i] - last_dump_counts[i];
+        if (delta == 0) continue;
+        fprintf(stderr, "ds4: dispatch_count kernel=%s count=%llu\n",
+                g_dispatch_names[i],
+                (unsigned long long)delta);
+        last_dump_counts[i] = g_dispatch_name_counts[i];
+    }
+}
 static id<MTLComputeCommandEncoder> g_batch_enc;
 static BOOL g_batch_has_work;
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
@@ -889,7 +1001,18 @@ static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
-        if (!g_batch_enc) g_batch_enc = [cb computeCommandEncoder];
+        if (!g_batch_enc) {
+            g_batch_enc = [cb computeCommandEncoder];
+            if (g_batch_enc && !g_dispatch_count_installed) {
+                const char *env = getenv("DS4_METAL_DISPATCH_COUNT_TRACE");
+                if (env && env[0] && strcmp(env, "0") != 0) {
+                    g_dispatch_count_enabled = 1;
+                    ds4_dispatch_count_install_hook(g_batch_enc);
+                } else {
+                    g_dispatch_count_installed = 1;
+                }
+            }
+        }
         return g_batch_enc;
     }
     return [cb computeCommandEncoder];
@@ -5704,6 +5827,20 @@ int ds4_gpu_init(void) {
             fprintf(stderr, "ds4: Metal device not available\n");
             return 0;
         }
+        {
+            /* Install before any pipeline is created so every pipeline gets a
+             * label carrying its function name for dispatch tracing. */
+            const char *env = getenv("DS4_METAL_DISPATCH_COUNT_TRACE");
+            if (env && env[0] && strcmp(env, "0") != 0) {
+                g_dispatch_count_enabled = 1;
+                Method m = class_getInstanceMethod(object_getClass(g_device),
+                        @selector(newComputePipelineStateWithFunction:error:));
+                if (m) {
+                    g_orig_new_pipeline_fn = (id (*)(id, SEL, id, NSError **))method_getImplementation(m);
+                    method_setImplementation(m, (IMP)ds4_hook_new_pipeline_fn);
+                }
+            }
+        }
         ds4_gpu_print_device_summary();
         ds4_gpu_detect_metal4_features();
 
@@ -8931,7 +9068,9 @@ int ds4_gpu_end_commands(void) {
     g_batch_has_work = NO;
     g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
     g_stream_expert_cache_batch_seq = 0;
-    return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    const int ok = ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    if (g_dispatch_count_enabled) ds4_dispatch_count_report();
+    return ok;
 }
 
 static int ds4_gpu_flash_attn_stage_profile_boundary(
