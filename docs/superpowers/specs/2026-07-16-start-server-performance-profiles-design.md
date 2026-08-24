@@ -6,19 +6,16 @@
 the locally downloaded Huihui DeepSeek V4 Flash abliterated Q2 GGUF. That model
 path is part of the machine configuration and must remain the default.
 
-Two launcher defaults currently leave performance on the table:
+The launcher profile decisions are based on two measured results:
 
-- the explicit 4096-token prefill chunk bypasses the 5120-token M3 Max setting
-  that won the matched long-prefill comparison; and
-- the agent profile always maps the 3.8 GB MTP support GGUF even though the
-  server uses speculative decoding only for temperature-zero generation.
+- the 5120-token M3 Max prefill chunk won the matched long-prefill comparison;
+  and
+- both the preview MTP path and the later exact 0731 DSpark path failed the
+  user-visible speed gate, so speculative support weights must stay opt-in.
 
-`DEFAULT_CTX=51200` remains the selected default. A same-process allocation
-check held prefill at 2048 tokens, decode at 128 tokens, and the prefill chunk at
-5120 while alternating 51200 and 200000 contexts. The paired throughput deltas
-were within run noise, while context buffers grew from 1355.75 MiB to 3975.90
-MiB. The 51200 choice therefore preserves memory headroom without being
-presented as a direct short-prompt throughput optimization.
+Normal reasoning now uses a 110592-token allocation, which covers the measured
+100k frontier without paying the 393216-token Think Max footprint. Think Max is
+kept as an explicit context override rather than a launcher default.
 
 ## Selected Design
 
@@ -26,18 +23,19 @@ Keep three explicit profiles:
 
 | Profile | Context | Prefill chunk | MTP | Intended workload |
 | --- | ---: | ---: | --- | --- |
-| `agent` | 51200 | 5120 | off | normal sampled coding-agent traffic |
-| `greedy` | 51200 | 5120 | draft 2 | deterministic temperature-zero generation |
-| `conservative` | 100000 | automatic | off | occasional API use with smaller disk cache |
+| `agent` | 110592 | 5120 | off | normal sampled coding-agent traffic |
+| `greedy` | 110592 | 5120 | off | compatibility alias for temperature-zero clients |
+| `conservative` | 110592 | 5120 | off | occasional API use with smaller disk cache |
 
-The `agent` and `greedy` profiles share all cache and host settings. Only the
-default MTP path differs. Explicit environment overrides retain precedence:
+The `agent` and `greedy` profiles share all cache and host settings. No normal
+profile maps speculative support weights. Explicit environment overrides retain
+precedence:
 
 - `DS4_MODEL` can select another local GGUF;
 - `DS4_CTX` and the saved context file retain their existing precedence;
 - `DS4_PREFILL_CHUNK` can restore 4096 or select another measured chunk; and
-- `DS4_MTP_PATH` can explicitly enable MTP for `agent` or disable it for
-  `greedy` by setting an empty value.
+- `DS4_MTP_PATH` or explicit `--mtp ... --dspark` arguments remain available
+  for diagnostic speculation runs.
 
 No automatic model download, process restart, memory reclamation, or live
 server mutation is part of this change.

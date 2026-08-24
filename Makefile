@@ -12,6 +12,7 @@ endif
 DEBUG_FLAGS ?= -g
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
+STATUSBAR_OBJCFLAGS = $(OBJCFLAGS) -mmacosx-version-min=13.0
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 
 LDLIBS ?= -lm -pthread
@@ -47,15 +48,17 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-statusbar test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch ds4-statusbar-app dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
+STATUSBAR_TEST_TARGET := test-statusbar
+all: ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-statusbar
 
 help:
 	@echo "DS4 build targets:"
-	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
-	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo "  make              Build Metal binaries and ./ds4-statusbar"
+	@echo "  make ds4-statusbar-app  Package ./DS4Status.app"
+	@echo "  make cpu          Build CPU-only inference binaries and ./ds4-statusbar"
 	@echo "  make test         Build and run tests"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
@@ -76,6 +79,18 @@ ds4-eval: ds4_eval.o ds4_help.o $(CORE_OBJS)
 ds4-agent: ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
 
+ds4-statusbar: ds4_statusbar.o
+	$(CC) $(STATUSBAR_OBJCFLAGS) -o $@ $^ -framework AppKit -framework Foundation
+
+ds4-statusbar-app: ds4-statusbar macos/DS4Status-Info.plist
+	mkdir -p DS4Status.app/Contents/MacOS
+	cp ds4-statusbar DS4Status.app/Contents/MacOS/ds4-statusbar
+	cp macos/DS4Status-Info.plist DS4Status.app/Contents/Info.plist
+	codesign --force --sign - --timestamp=none DS4Status.app
+
+test-statusbar: ds4-statusbar
+	bash tests/ds4_statusbar_test.sh
+
 gguf-tools/quality-testing/score_official: gguf-tools/quality-testing/score_official.c ds4.h $(CORE_OBJS) rax.o
 	$(CC) $(QUALITY_CFLAGS) -I. -o $@ gguf-tools/quality-testing/score_official.c $(CORE_OBJS) rax.o $(METAL_LDLIBS)
 
@@ -88,7 +103,7 @@ tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_call_history.o ds4_token_history.o ds4_host_metrics.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_call_history.o ds4_token_history.o ds4_host_metrics.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) ds4-statusbar
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_call_history.o ds4_token_history.o ds4_host_metrics.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -98,6 +113,7 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 cuda-regression:
 	@echo "cuda-regression requires a CUDA build"
 else
+STATUSBAR_TEST_TARGET :=
 all: help
 
 help:
@@ -112,6 +128,10 @@ help:
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth    Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean               Remove build outputs"
+
+ds4-statusbar ds4-statusbar-app test-statusbar:
+	@echo "error: $@ is available only on macOS" >&2
+	@exit 2
 
 cuda-spark:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
@@ -252,6 +272,9 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kv
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
+ds4_statusbar.o: ds4_statusbar.m
+	$(CC) $(STATUSBAR_OBJCFLAGS) -c -o $@ ds4_statusbar.m
+
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
@@ -373,7 +396,7 @@ endif
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_token_history \
-	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent $(STATUSBAR_TEST_TARGET)
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -416,4 +439,5 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-statusbar ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -rf DS4Status.app

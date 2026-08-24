@@ -6,8 +6,11 @@ cd "$(dirname "$0")"
 # Profiles:
 #   agent        Default for Claude Code / Codex / Hermes-style clients with
 #                sampled generation, large prompts, tools, and long sessions.
-#   greedy       Agent settings plus MTP for temperature-zero generation.
-#   conservative Smaller cache footprint for occasional API use.
+#   greedy       Compatibility alias for temperature-zero clients; target-only.
+#   conservative Same target runtime with a smaller disk-cache footprint.
+#
+# These profiles cover non-thinking and normal thinking (low through xhigh).
+# Think Max remains an explicit experiment and requires DS4_CTX >= 393216.
 PROFILE=${DS4_PROFILE:-agent}
 HOST=${DS4_HOST:-127.0.0.1}
 PORT=${DS4_PORT:-8077}
@@ -23,6 +26,7 @@ CONFIG_SNAPSHOT=${DS4_CONFIG_SNAPSHOT-$DEFAULT_CONFIG_SNAPSHOT}
 TOKEN_HISTORY_FILE=${DS4_TOKEN_HISTORY_FILE-$HOME/.ds4/token-usage.tsv}
 EXTRA_SSD_STREAMING=0
 EXTRA_MTP=0
+EXTRA_DSPARK=0
 
 for arg in "$@"; do
     case "$arg" in
@@ -32,13 +36,16 @@ for arg in "$@"; do
         --mtp)
             EXTRA_MTP=1
             ;;
+        --dspark)
+            EXTRA_DSPARK=1
+            ;;
     esac
 done
 
 case "$PROFILE" in
     agent|greedy)
-        DEFAULT_MODEL="/Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF/Huihui-DeepSeek-V4-Flash-BF16-abliterated-ds4-Q2.gguf"
-        DEFAULT_CTX=51200
+        DEFAULT_MODEL="/Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/DeepSeek-V4-Flash-Q2-0731.gguf"
+        DEFAULT_CTX=110592
         DEFAULT_THREADS=8
         # Matched M3 Max runs at a >16K context allocation favored 5120 over
         # 4096 for long prefill without the short-frontier regression of 6144.
@@ -54,17 +61,14 @@ case "$PROFILE" in
         DEFAULT_BOUNDARY_ALIGN=2048
         DEFAULT_TOOL_MEMORY_MAX=200000
         DEFAULT_MTP_PATH=
-        if [ "$PROFILE" = greedy ]; then
-            DEFAULT_MTP_PATH="gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
-        fi
         DEFAULT_MTP_DRAFT=2
         DEFAULT_MTP_MARGIN=3.0
         ;;
     conservative)
-        DEFAULT_MODEL="/Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF/Huihui-DeepSeek-V4-Flash-BF16-abliterated-ds4-Q2.gguf"
-        DEFAULT_CTX=100000
+        DEFAULT_MODEL="/Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/DeepSeek-V4-Flash-Q2-0731.gguf"
+        DEFAULT_CTX=110592
         DEFAULT_THREADS=8
-        DEFAULT_PREFILL_CHUNK=0
+        DEFAULT_PREFILL_CHUNK=5120
         DEFAULT_KV_DIR="$HOME/.ds4/server-kv"
         DEFAULT_KV_SPACE=8192
         DEFAULT_COLD_MAX=50000
@@ -305,6 +309,7 @@ if [ -n "$CONFIG_SNAPSHOT" ]; then
         printf 'gpu_devices=%s\n' "$GPU_DEVICES"
         printf 'cuda_tensor_parallel=%s\n' "$CUDA_TENSOR_PARALLEL"
         printf 'mtp_path=%s\n' "$MTP_PATH"
+        printf 'dspark=%s\n' "$EXTRA_DSPARK"
         printf 'mtp_draft=%s\n' "$MTP_DRAFT"
         printf 'mtp_margin=%s\n' "$MTP_MARGIN"
         printf 'mtp_metrics=%s\n' "$MTP_METRICS"

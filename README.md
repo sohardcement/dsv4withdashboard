@@ -191,8 +191,12 @@ select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 DSpark is an auxiliary draft model released by DeepSeek for DeepSeek V4 Flash.
 It reads hidden states from the main model and proposes up to five future
 tokens. DwarfStar checks those proposals with the main Flash model and commits
-only the accepted prefix. The main model remains authoritative; a rejected or
-low-confidence suffix falls back to ordinary target decoding.
+only the accepted prefix. For sampled decoding it uses standard rejection
+sampling: each draft token is accepted with `min(1, p/q)`, and the first
+rejection is replaced from the normalized `max(p-q, 0)` residual. Target,
+draft, and accept random streams are independent and reproducible. The main
+model therefore remains authoritative without changing its sampling
+distribution.
 
 The possible gain is faster generation: when several proposed tokens are
 accepted, one target verification pass advances the stream by several tokens.
@@ -201,8 +205,9 @@ free. Predictable continuations, especially code, tend to benefit most;
 low-yield prompts can be no faster or even slower. DSpark is therefore still
 experimental and explicitly opt-in.
 
-The released DSpark checkpoint is packaged here as a separate support GGUF of
-about 5.6 GiB. It is not a standalone model. Download it once:
+The Huihui 0731 DSpark checkpoint is packaged here as a separate support GGUF
+of about 10.6 GiB (11.4 GB decimal). It is not a standalone model. Download it
+once:
 
 ```sh
 ./download_model.sh dspark-support
@@ -225,10 +230,33 @@ Run it with greedy decoding:
 
 `--mtp` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
 The default confidence threshold is `0.9`; it prunes suffixes that are unlikely
-to repay their verification cost. `--dspark-confidence 0` forces fixed
-five-token blocks and is intended for diagnostics. Sampled decoding does not
-use DSpark proposals. `--quality` and `--dspark-strict` also keep target-only
-decoding, which is useful for comparisons and correctness checks.
+to repay their verification cost on the greedy path. Sampled decoding reads
+all five confidence values and uses device-local Beta calibration, cumulative
+prefix survival, per-length latency EWMA, bounded warm-up, and low-frequency
+exploration to select lengths 2–5. Length one is disabled because its verifier
+cost is no lower than an ordinary target decode. `--quality` and
+`--dspark-strict` keep target-only decoding for comparisons and correctness
+checks.
+
+DeepSeek V4 Flash 0731 Think Max requires a server context of at least
+`393216`. A sampled Think Max request should set `reasoning_effort=max` and can
+omit sampling fields to use the server defaults (`temperature=1`, `top_p=1`,
+`min_p=0.05`). All normal launcher profiles deliberately leave DSpark off until
+the local performance gate passes; opt in explicitly with the 0731 support GGUF
+and `--dspark`.
+
+Run the reproducible Think Max gate with:
+
+```sh
+python3 speed-bench/dspark_long_context_bench.py \
+  --workload thinking-max-sampled \
+  --artifact-dir .gstack/benchmark-reports/dspark-think-max
+```
+
+The benchmark refuses `--ctx` below `393216`, alternates baseline/DSpark in
+AB/BA order, monitors memory pressure and swap, and writes `results.json`,
+`runs.csv`, and a Chinese `report.md`. Use `thinking-max-greedy` for exact
+baseline/DSpark output-hash checks.
 
 ## Speed
 
@@ -1058,6 +1086,39 @@ configuration or data. Ambient light is low contrast, while timeline and
 rainbow status motion run only for live data. Continuous motion stops on narrow
 screens, while stale data is shown, and when the browser requests reduced
 motion.
+
+#### macOS menu bar status
+
+On macOS, `ds4-statusbar` shows the same live prefill and decode rates without
+keeping the dashboard open. Build the standalone binary or package it as an
+agent-style app with no Dock icon:
+
+```sh
+make ds4-statusbar
+./ds4-statusbar
+
+make ds4-statusbar-app
+open DS4Status.app
+```
+
+The status item polls `http://127.0.0.1:8077/ds4/status` once per second. During
+decode it shows both rates, for example `D 15.3 · P 118`; during prefill it
+shows only the active prefill rate. Idle and unreachable servers are labeled
+explicitly so retained metrics are not presented as live measurements. Click
+the item to see full-precision rates and progress, refresh immediately, open
+the dashboard, or quit.
+
+Override the endpoint for another local port or an HTTPS server with
+`DS4_STATUS_URL` or `--url`:
+
+```sh
+DS4_STATUS_URL=http://127.0.0.1:9000/ds4/status ./ds4-statusbar
+open DS4Status.app --args --url https://ds4.example.test/ds4/status
+```
+
+The status endpoint has no authentication. Keep plain HTTP on loopback; for a
+remote DS4 server, prefer HTTPS or an SSH tunnel rather than exposing the
+dashboard directly to an untrusted network.
 
 Disk-KV runtime changes first use an inline dry-run review that shows the old and
 new limits and any required eviction before explicit confirmation. Persisting a

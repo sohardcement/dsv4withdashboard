@@ -17,8 +17,8 @@ Use `./start-server.sh` with the default `DS4_PROFILE=agent`:
 Important defaults:
 
 ```text
---model /Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF/Huihui-DeepSeek-V4-Flash-BF16-abliterated-ds4-Q2.gguf
---ctx 51200
+--model /Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/DeepSeek-V4-Flash-Q2-0731.gguf
+--ctx 110592
 --kv-disk-dir ~/.ds4/server-kv
 --kv-disk-space-mb 163840
 --kv-cache-cold-max-tokens 98304
@@ -42,13 +42,14 @@ controls disabled unless they are explicitly configured. Use
 resolved values are included in the launch configuration snapshot. Command-line
 arguments remain available for one-off overrides.
 
-The 51200 context default is a capacity and memory-headroom choice, not a claim
-that a smaller allocation makes short prompts compute faster. In a same-process
-M3 Max check with 2048 fixed prefill tokens, 128 fixed decode tokens, and a 5120
-prefill chunk, 51200 and 200000 allocations had no consistent throughput
-difference beyond run-to-run noise. Their context buffers were 1355.75 MiB and
-3975.90 MiB respectively, so the larger allocation reserved about 2.56 GiB more
-before any benefit from the extra capacity was needed.
+The 110592 context default covers the measured 30k-100k normal-thinking
+frontiers while leaving substantially more memory headroom than Think Max's
+393216-token allocation. It is a capacity choice, not a claim that allocation
+alone makes short prompts compute faster. In a same-process M3 Max check with
+2048 fixed prefill tokens, 128 fixed decode tokens, and a 5120 prefill chunk,
+51200 and 200000 allocations had no consistent throughput difference beyond
+run-to-run noise. The actual prompt length remains the important decode-cost
+input.
 
 ## Dashboard Capacity Controls
 
@@ -137,23 +138,39 @@ The launcher intentionally defaults to the locally downloaded Huihui
 abliterated Q2 model on this machine:
 
 ```text
-/Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF/Huihui-DeepSeek-V4-Flash-BF16-abliterated-ds4-Q2.gguf
+/Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/DeepSeek-V4-Flash-Q2-0731.gguf
 ```
 
-It uses the DS4-specific mixed Q2 layout derived from the
-[`antirez/deepseek-v4-gguf`](https://huggingface.co/antirez/deepseek-v4-gguf)
-template. The repository model remains available through `ds4flash.gguf` for
-reference benchmarks. The optional
-`DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` support model used by the `greedy`
-profile is stored under `gguf/`.
+This is the abliterated Q2 quant of the official 0731 release. It retains the
+DS4-supported mixed layout (`IQ2_XXS` routed gate/up, `Q2_K` routed down, and
+`Q8_0` attention/shared/output tensors). The repository model remains available
+through `ds4flash.gguf` for reference benchmarks.
 
-[`deepseek-ai/DeepSeek-V4-Flash-DSpark`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark)
-is not a drop-in GGUF replacement for `ds4-server`; its files are safetensors
-checkpoint shards plus an additional speculative decoding module. The upstream
-README also describes it as the same checkpoint with speculative decoding
-attached, not a new base model. In this repo, the practical speed question is
-therefore whether the local MTP GGUF improves decode on real agent workloads,
-not whether pointing `DS4_MODEL` at the DSpark Hugging Face repo will work.
+The optional
+`gguf/DeepSeek-V4-Flash-0731-DSpark-abliterated-Q4K-support.gguf` was repacked
+from the Huihui abliterated 0731 DSpark Q8 mirror. No normal launcher profile
+loads it automatically: the measured exact verifier costs more time than it
+saves. The older
+`DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` and
+`DeepSeek-V4-Flash-DSpark-support.gguf` files came from preview checkpoints and
+remain available only for explicit compatibility tests; they are not
+version-matched draft weights for 0731.
+
+The mirrored source is pinned to Hugging Face revision
+`a8dfba9c1e43bdf324ee2c7787ed01c70975ffb4`. Its Q8 file is 10,896,057,440
+bytes with SHA-256
+`6575853d1c3736c160101bc7cd117c8edd39ca847cfdf2273d9a344108edfaf8`.
+`gguf-tools/deepseek4-quantize --dspark-gguf` maps the `dflash` tensor names to
+DS4's `mtp.*` layout, preserves Q8 tensors, and converts the nine MXFP4 routed
+expert tensors to Q4_K. The resulting support GGUF is 11,424,932,256 bytes with
+SHA-256
+`95f1b9e46b702e956f4033ea3a99e66d14bd2f4a7793fe0af3980288e0b571ae`.
+
+[`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
+is not a drop-in GGUF replacement for `ds4-server`; the official repository is
+a sharded safetensors checkpoint. The local main GGUF remains `DS4_MODEL`, while
+the converted `mtp.0` through `mtp.2` weights are supplied separately through
+`--mtp ... --dspark`.
 
 Use `DS4_MODEL=/path/to/local.gguf ./start-server.sh` only for local GGUF files.
 The start script fails early if the path does not exist, because an invalid model
@@ -172,32 +189,45 @@ prefill boundaries can coalesce actual checkpoint writes, so re-evaluate the
 frontier list after representative traffic rather than assuming every interval
 becomes a file.
 
-The default `agent` profile does not load MTP: server speculation is used only
-for temperature-zero generation, while normal agent traffic is predominantly
-sampled. Use the `greedy` profile for deterministic generation:
+The `agent`, `greedy`, and `conservative` profiles all use target-only decoding.
+The `greedy` name remains a compatibility alias for clients that already send
+`temperature=0`; it does not force request sampling parameters. Use it with:
 
 ```sh
 DS4_PROFILE=greedy ./start-server.sh
 ```
 
-This adds `--mtp ... --mtp-draft 2 --mtp-margin 3.0` when the local support GGUF
-exists. `DS4_MTP_PATH` remains authoritative: set it explicitly to enable MTP
-for another profile, or set it empty to disable MTP for `greedy`.
-
-For short measurement runs, enable MTP stderr metrics and capture the server log:
+This resolves to the same 0731 Q2, 110592-token context, 5120-token prefill
+chunk, and disabled speculative runtime as the normal agent profile. DSpark is
+kept available only as an explicit experiment:
 
 ```sh
-DS4_PROFILE=greedy DS4_MTP_METRICS=1 \
-  DS4_SERVER_LOG=/tmp/ds4-server.log ./start-server.sh
+./start-server.sh \
+  --mtp gguf/DeepSeek-V4-Flash-0731-DSpark-abliterated-Q4K-support.gguf \
+  --dspark
 ```
 
-This exports `DS4_MTP_TIMING=1` and `DS4_MTP_CONF_LOG=1` for the server process
-unless those variables are already set. `trace-cache-summary.py --server-log`
-parses the resulting `ds4: mtp timing ...` lines and reports draft attempts,
-drafted/committed tokens, acceptance rate, full/partial accepts, and average
-draft/verify/snapshot/replay timings. Keep it off for normal long-running agent
-service unless you are actively measuring; it logs per speculative decode
-attempt.
+For short DSpark measurement runs, enable aggregate stats and capture the
+server log:
+
+```sh
+DS4_DSPARK_STATS=1 DS4_SERVER_LOG=/tmp/ds4-server.log \
+  ./start-server.sh \
+  --mtp gguf/DeepSeek-V4-Flash-0731-DSpark-abliterated-Q4K-support.gguf \
+  --dspark
+```
+
+The server prints `ds4: DSpark stats ...` on shutdown, including proposals,
+accepted drafts, acceptance rate, scheduler skips, errors, and
+propose/verify/replay timing. Keep it off for normal long-running service unless
+you are actively measuring.
+
+The 30k-100k Huihui support benchmark is recorded in
+[`dspark-huihui-long-context-benchmark.md`](dspark-huihui-long-context-benchmark.md).
+The later exact Think Max gate eliminated verifier errors and greedy output
+drift, but DSpark still reduced sampled decode throughput by 9%-14%. Therefore
+no normal profile enables it; a high acceptance rate is not sufficient when
+proposal, verification, and replay cost more than the target steps they save.
 
 `--ssd-streaming` is currently incompatible with `--mtp` in the engine. The
 start script therefore drops the default MTP option when `--ssd-streaming` is
