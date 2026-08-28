@@ -230,6 +230,13 @@ static bool json_u16(const char **p, uint32_t *out) {
 }
 
 static bool json_string(const char **p, char **out) {
+    /* Always define *out. Every failure path below returns false without
+     * producing a string, and several callers reparse in place with
+     * `free(x); json_string(&p, &x)` (e.g. duplicate JSON keys, the "model"
+     * field). Without this, a non-string or malformed value leaves *out
+     * holding the just-freed pointer, which a later cleanup frees again --
+     * a double-free. Nulling on entry closes that whole class at the root. */
+    *out = NULL;
     json_ws(p);
     if (**p != '"') return false;
     (*p)++;
@@ -292,7 +299,11 @@ static bool json_number(const char **p, double *out) {
 static bool json_int(const char **p, int *out) {
     double v = 0.0;
     if (!json_number(p, &v)) return false;
-    if (v < 0) v = 0;
+    /* json_number() uses strtod(), which accepts "NaN"/"Infinity". NaN fails
+     * every comparison, so a plain `v < 0` clamp would let it through to the
+     * (int) cast, which is undefined for NaN; `!(v >= 0)` folds NaN (and
+     * negatives) to 0. +/-Infinity are handled by the two clamps. */
+    if (!(v >= 0)) v = 0;
     if (v > INT_MAX) v = INT_MAX;
     *out = (int)v;
     return true;
@@ -494,6 +505,30 @@ static bool json_content(const char **p, char **out) {
 fail:
     buf_free(&b);
     return false;
+}
+
+static bool json_string_replace(const char **p, char **dst) {
+    char *tmp = NULL;
+    if (!json_string(p, &tmp)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
+}
+
+static bool json_raw_value_replace(const char **p, char **dst) {
+    char *tmp = NULL;
+    if (!json_raw_value(p, &tmp)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
+}
+
+static bool json_content_replace(const char **p, char **dst) {
+    char *tmp = NULL;
+    if (!json_content(p, &tmp)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
 }
 
 typedef enum {
@@ -1128,20 +1163,18 @@ static bool parse_function_call(const char **p, tool_call *tc) {
         }
         (*p)++;
         if (!strcmp(key, "name")) {
-            free(tc->name);
-            if (!json_string(p, &tc->name)) {
+            if (!json_string_replace(p, &tc->name)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "arguments")) {
-            free(tc->arguments);
             json_ws(p);
             if (**p == '"') {
-                if (!json_string(p, &tc->arguments)) {
+                if (!json_string_replace(p, &tc->arguments)) {
                     free(key);
                     goto bad;
                 }
-            } else if (!json_raw_value(p, &tc->arguments)) {
+            } else if (!json_raw_value_replace(p, &tc->arguments)) {
                 free(key);
                 goto bad;
             }
@@ -1182,8 +1215,7 @@ static bool parse_tool_calls_value(const char **p, tool_calls *calls) {
             }
             (*p)++;
             if (!strcmp(key, "id")) {
-                free(tc.id);
-                if (!json_string(p, &tc.id)) {
+                if (!json_string_replace(p, &tc.id)) {
                     free(key);
                     goto bad;
                 }
@@ -1281,20 +1313,17 @@ static char *responses_special_schema_from_tool(const char *raw) {
         }
         p++;
         if (!strcmp(key, "type")) {
-            free(type);
-            if (!json_string(&p, &type)) {
+            if (!json_string_replace(&p, &type)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "description")) {
-            free(description);
-            if (!json_string(&p, &description)) {
+            if (!json_string_replace(&p, &description)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "parameters")) {
-            free(parameters);
-            if (!json_raw_value(&p, &parameters)) {
+            if (!json_raw_value_replace(&p, &parameters)) {
                 free(key);
                 goto done;
             }
@@ -1351,26 +1380,22 @@ static char *responses_namespace_function_schema_from_tool(const char *raw,
         }
         p++;
         if (!strcmp(key, "type")) {
-            free(type);
-            if (!json_string(&p, &type)) {
+            if (!json_string_replace(&p, &type)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "name")) {
-            free(name);
-            if (!json_string(&p, &name)) {
+            if (!json_string_replace(&p, &name)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "description")) {
-            free(description);
-            if (!json_string(&p, &description)) {
+            if (!json_string_replace(&p, &description)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "parameters") || !strcmp(key, "input_schema")) {
-            free(parameters);
-            if (!json_raw_value(&p, &parameters)) {
+            if (!json_raw_value_replace(&p, &parameters)) {
                 free(key);
                 goto done;
             }
@@ -1482,8 +1507,7 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
         }
         p++;
         if (!strcmp(key, "name")) {
-            free(order.name);
-            if (!json_string(&p, &order.name)) {
+            if (!json_string_replace(&p, &order.name)) {
                 free(key);
                 goto done;
             }
@@ -1543,20 +1567,17 @@ static bool append_responses_namespace_tool_schemas(buf *schemas,
         }
         p++;
         if (!strcmp(key, "type")) {
-            free(type);
-            if (!json_string(&p, &type)) {
+            if (!json_string_replace(&p, &type)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "name")) {
-            free(name);
-            if (!json_string(&p, &name)) {
+            if (!json_string_replace(&p, &name)) {
                 free(key);
                 goto done;
             }
         } else if (!strcmp(key, "tools")) {
-            free(tools);
-            if (!json_raw_value(&p, &tools)) {
+            if (!json_raw_value_replace(&p, &tools)) {
                 free(key);
                 goto done;
             }
@@ -1675,20 +1696,17 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
             }
             (*p)++;
             if (!strcmp(key, "role")) {
-                free(msg.role);
-                if (!json_string(p, &msg.role)) {
+                if (!json_string_replace(p, &msg.role)) {
                     free(key);
                     goto fail;
                 }
             } else if (!strcmp(key, "content")) {
-                free(msg.content);
-                if (!json_content(p, &msg.content)) {
+                if (!json_content_replace(p, &msg.content)) {
                     free(key);
                     goto fail;
                 }
             } else if (!strcmp(key, "reasoning_content")) {
-                free(msg.reasoning);
-                if (!json_content(p, &msg.reasoning)) {
+                if (!json_content_replace(p, &msg.reasoning)) {
                     free(key);
                     goto fail;
                 }
@@ -1769,44 +1787,37 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         }
         (*p)++;
         if (!strcmp(key, "type")) {
-            free(type);
-            if (!json_string(p, &type)) {
+            if (!json_string_replace(p, &type)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "text")) {
-            free(text);
-            if (!json_content(p, &text)) {
+            if (!json_content_replace(p, &text)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            free(thinking);
-            if (!json_content(p, &thinking)) {
+            if (!json_content_replace(p, &thinking)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "id") || !strcmp(key, "tool_use_id")) {
-            free(id);
-            if (!json_string(p, &id)) {
+            if (!json_string_replace(p, &id)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "name")) {
-            free(name);
-            if (!json_string(p, &name)) {
+            if (!json_string_replace(p, &name)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "input")) {
-            free(input);
-            if (!json_raw_value(p, &input)) {
+            if (!json_raw_value_replace(p, &input)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "content")) {
-            free(tool_result);
-            if (!json_content(p, &tool_result)) {
+            if (!json_content_replace(p, &tool_result)) {
                 free(key);
                 goto bad;
             }
@@ -1934,8 +1945,7 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
             }
             (*p)++;
             if (!strcmp(key, "role")) {
-                free(msg.role);
-                if (!json_string(p, &msg.role)) {
+                if (!json_string_replace(p, &msg.role)) {
                     free(key);
                     goto fail;
                 }
@@ -2084,7 +2094,7 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
         "Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. "
         "Only if a string value itself contains the exact closing parameter tag `</｜DSML｜parameter>`, write that tag as `&lt;/｜DSML｜parameter>` inside the value. "
         "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
-        "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
+        "When thinking mode is enabled, finish reasoning with </think> before any tool calls or final response.\n\n"
         "Otherwise, output directly after </think> with tool calls or final response.\n\n"
         "### Available Tool Schemas\n\n");
     buf_puts(b, tool_schemas);
@@ -2741,31 +2751,12 @@ static DS4_SERVER_MAYBE_UNUSED char *render_live_tool_tail(
                                             msgs, start, NULL, think_mode);
 }
 
-static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
-    if (!m || !id || !id[0] || strcmp(m->role, "assistant")) return false;
-    for (int i = 0; i < m->calls.len; i++) {
-        if (m->calls.v[i].id && !strcmp(m->calls.v[i].id, id)) return true;
-    }
-    return false;
-}
-
 static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
     if (!m || !ids) return;
     id_list_push_unique(ids, m->tool_call_id);
     for (int i = 0; i < m->tool_call_ids_len; i++) {
         id_list_push_unique(ids, m->tool_call_ids[i]);
     }
-}
-
-static const chat_msg *responses_find_prior_call_msg(const chat_msgs *msgs,
-                                                     int before,
-                                                     const char *id) {
-    if (!msgs || !id || !id[0]) return NULL;
-    if (before > msgs->len) before = msgs->len;
-    for (int i = before - 1; i >= 0; i--) {
-        if (chat_msg_has_call_id(&msgs->v[i], id)) return &msgs->v[i];
-    }
-    return NULL;
 }
 
 /* Validate Responses tool outputs before rendering.
@@ -2792,8 +2783,25 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
     if (requires_live_tool_state) *requires_live_tool_state = false;
     if (requires_live_reasoning) *requires_live_reasoning = false;
     const bool needs_reasoning = ds4_think_mode_enabled(think_mode);
-    for (int i = 0; i < msgs->len; i++) {
+
+    /* Map call_id -> the nearest preceding assistant message that declares it,
+     * built as we scan forward. This replaces a per-id backward rescan
+     * (responses_find_prior_call_msg) that made the whole pass O(n^2) over an
+     * attacker-supplied, uncapped message array. Only assistant messages declare
+     * call ids (via their calls[] array), so registering them as we pass and
+     * looking up on tool messages reproduces the nearest-preceding result. */
+    rax *by_call_id = raxNew();
+    bool ok = true;
+    for (int i = 0; i < msgs->len && ok; i++) {
         const chat_msg *m = &msgs->v[i];
+        if (!strcmp(m->role, "assistant")) {
+            for (int k = 0; k < m->calls.len; k++) {
+                const char *cid = m->calls.v[k].id;
+                if (cid && cid[0])
+                    raxInsert(by_call_id, (unsigned char *)cid, strlen(cid), (void *)m, NULL);
+            }
+            continue;
+        }
         if (strcmp(m->role, "tool") && strcmp(m->role, "function")) continue;
 
         stop_list ids = {0};
@@ -2801,13 +2809,15 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
         for (int j = 0; j < ids.len; j++) {
             const char *id = ids.v[j];
             const bool live_known = responses_live_has_call_id(s, id);
-            const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
+            void *found = id && id[0]
+                ? raxFind(by_call_id, (unsigned char *)id, strlen(id)) : raxNotFound;
+            const chat_msg *prior = found == raxNotFound ? NULL : (const chat_msg *)found;
             if (!live_known && !prior) {
                 snprintf(err, errlen,
                          "Responses continuation state is not available for call_id %s; retry by replaying the full input history",
                          id);
-                id_list_free(&ids);
-                return false;
+                ok = false;
+                break;
             }
             if (!prior) {
                 if (requires_live_tool_state) *requires_live_tool_state = true;
@@ -2821,7 +2831,8 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
         }
         id_list_free(&ids);
     }
-    return true;
+    raxFree(by_call_id);
+    return ok;
 }
 
 /* Record the call ids and suffix candidate for a live Responses continuation.
@@ -2883,8 +2894,21 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
                                             char *err, size_t errlen) {
     if (requires_live_tool_state) *requires_live_tool_state = false;
     if (!msgs) return true;
-    for (int i = 0; i < msgs->len; i++) {
+
+    /* Same O(1) call_id -> prior assistant message map as
+     * responses_validate_tool_outputs, replacing the O(n^2) backward rescan. */
+    rax *by_call_id = raxNew();
+    bool ok = true;
+    for (int i = 0; i < msgs->len && ok; i++) {
         const chat_msg *m = &msgs->v[i];
+        if (!strcmp(m->role, "assistant")) {
+            for (int k = 0; k < m->calls.len; k++) {
+                const char *cid = m->calls.v[k].id;
+                if (cid && cid[0])
+                    raxInsert(by_call_id, (unsigned char *)cid, strlen(cid), (void *)m, NULL);
+            }
+            continue;
+        }
         if (!anthropic_msg_is_tool_result_tail(m)) continue;
 
         stop_list ids = {0};
@@ -2892,13 +2916,15 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
         for (int j = 0; j < ids.len; j++) {
             const char *id = ids.v[j];
             const bool live_known = anthropic_live_has_call_id(s, id);
-            const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
+            void *found = id && id[0]
+                ? raxFind(by_call_id, (unsigned char *)id, strlen(id)) : raxNotFound;
+            const chat_msg *prior = found == raxNotFound ? NULL : (const chat_msg *)found;
             if (!live_known && !prior) {
                 snprintf(err, errlen,
                          "Anthropic continuation state is not available for tool_use_id %s; retry by replaying the full messages history",
                          id);
-                id_list_free(&ids);
-                return false;
+                ok = false;
+                break;
             }
             if (!prior && requires_live_tool_state) {
                 *requires_live_tool_state = true;
@@ -2906,7 +2932,8 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
         }
         id_list_free(&ids);
     }
-    return true;
+    raxFree(by_call_id);
+    return ok;
 }
 
 /* Prepare the Anthropic live-tool fast path.
@@ -3001,8 +3028,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
         } else if (!strcmp(key, "model")) {
-            free(r->model);
-            if (!json_string(&p, &r->model)) {
+            if (!json_string_replace(&p, &r->model)) {
                 free(key);
                 goto bad;
             }
@@ -3159,11 +3185,13 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
             got_messages = true;
         } else if (!strcmp(key, "system")) {
-            free(system);
-            if (!parse_anthropic_system(&p, &system)) {
+            char *tmp = NULL;
+            if (!parse_anthropic_system(&p, &tmp)) {
                 free(key);
                 goto bad;
             }
+            free(system);
+            system = tmp;
         } else if (!strcmp(key, "tools")) {
             free(tool_schemas);
             tool_schemas = NULL;
@@ -3218,8 +3246,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "model")) {
-            free(r->model);
-            if (!json_string(&p, &r->model)) {
+            if (!json_string_replace(&p, &r->model)) {
                 free(key);
                 goto bad;
             }
@@ -3385,23 +3412,24 @@ static bool parse_responses_content_array(const char **p, char **out) {
                 }
                 (*p)++;
                 if (!strcmp(key, "type")) {
-                    free(type);
-                    if (!json_string(p, &type)) {
+                    if (!json_string_replace(p, &type)) {
                         free(key);
+                        free(type);
                         free(text);
                         goto fail;
                     }
                 } else if (!strcmp(key, "text")) {
-                    free(text);
                     /* The text field of a typed content block is a plain JSON
                      * string. Accept null as the empty string for parity with
                      * upstream serializers that emit null for empty blocks. */
                     json_ws(p);
                     if (json_lit(p, "null")) {
+                        free(text);
                         text = xstrdup("");
-                    } else if (!json_string(p, &text)) {
+                    } else if (!json_string_replace(p, &text)) {
                         free(key);
                         free(type);
+                        free(text);
                         goto fail;
                     }
                 } else if (!json_skip_value(p)) {
@@ -3456,6 +3484,14 @@ static bool parse_responses_content_array(const char **p, char **out) {
 fail:
     buf_free(&b);
     return false;
+}
+
+static bool parse_responses_content_array_replace(const char **p, char **dst) {
+    char *tmp = NULL;
+    if (!parse_responses_content_array(p, &tmp)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
 }
 
 /* Codex /v1/responses input items have a `type` discriminator (message,
@@ -3514,115 +3550,101 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
             }
             (*p)++;
             if (!strcmp(key, "type")) {
-                free(type);
-                if (!json_string(p, &type)) {
+                if (!json_string_replace(p, &type)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "role")) {
-                free(role);
-                if (!json_string(p, &role)) {
+                if (!json_string_replace(p, &role)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "content")) {
-                free(content);
-                if (!parse_responses_content_array(p, &content)) {
+                if (!parse_responses_content_array_replace(p, &content)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "name")) {
-                free(name);
-                if (!json_string(p, &name)) {
+                if (!json_string_replace(p, &name)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "namespace")) {
-                free(namespace);
-                if (!json_string(p, &namespace)) {
+                if (!json_string_replace(p, &namespace)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "call_id")) {
-                free(call_id);
-                if (!json_string(p, &call_id)) {
+                if (!json_string_replace(p, &call_id)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "id")) {
-                free(item_id);
-                if (!json_string(p, &item_id)) {
+                if (!json_string_replace(p, &item_id)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "arguments")) {
-                free(arguments);
                 json_ws(p);
                 if (**p == '"') {
-                    if (!json_string(p, &arguments)) {
+                    if (!json_string_replace(p, &arguments)) {
                         free(key);
                         goto item_fail;
                     }
-                } else if (!json_raw_value(p, &arguments)) {
+                } else if (!json_raw_value_replace(p, &arguments)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "output")) {
-                free(output);
                 json_ws(p);
                 if (**p == '[') {
-                    if (!parse_responses_content_array(p, &output)) {
+                    if (!parse_responses_content_array_replace(p, &output)) {
                         free(key);
                         goto item_fail;
                     }
                 } else if (**p == '"') {
-                    if (!json_string(p, &output)) {
+                    if (!json_string_replace(p, &output)) {
                         free(key);
                         goto item_fail;
                     }
-                } else if (!json_raw_value(p, &output)) {
+                } else if (!json_raw_value_replace(p, &output)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "input")) {
-                free(input_str);
                 json_ws(p);
                 if (**p == '"') {
-                    if (!json_string(p, &input_str)) {
+                    if (!json_string_replace(p, &input_str)) {
                         free(key);
                         goto item_fail;
                     }
-                } else if (!json_raw_value(p, &input_str)) {
+                } else if (!json_raw_value_replace(p, &input_str)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "summary")) {
-                free(summary);
-                if (!parse_responses_content_array(p, &summary)) {
+                if (!parse_responses_content_array_replace(p, &summary)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "action")) {
-                free(action);
-                if (!json_raw_value(p, &action)) {
+                if (!json_raw_value_replace(p, &action)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "result")) {
-                free(result);
                 json_ws(p);
                 if (**p == '"') {
-                    if (!json_string(p, &result)) {
+                    if (!json_string_replace(p, &result)) {
                         free(key);
                         goto item_fail;
                     }
-                } else if (!json_raw_value(p, &result)) {
+                } else if (!json_raw_value_replace(p, &result)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "status")) {
-                free(status_str);
-                if (!json_string(p, &status_str)) {
+                if (!json_string_replace(p, &status_str)) {
                     free(key);
                     goto item_fail;
                 }
@@ -3631,8 +3653,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                  * here instead of in `output` / `result`. Keep it separate
                  * from the human-visible result body so malformed tool lists
                  * never get mistaken for normal tool output. */
-                free(tools_json);
-                if (!json_raw_value(p, &tools_json)) {
+                if (!json_raw_value_replace(p, &tools_json)) {
                     free(key);
                     goto item_fail;
                 }
@@ -4125,8 +4146,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "model")) {
-            free(r->model);
-            if (!json_string(&p, &r->model)) {
+            if (!json_string_replace(&p, &r->model)) {
                 free(key);
                 goto bad;
             }
@@ -4341,14 +4361,16 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         }
         p++;
         if (!strcmp(key, "prompt")) {
-            free(prompt);
-            if (!parse_prompt(&p, &prompt)) {
+            char *tmp = NULL;
+            if (!parse_prompt(&p, &tmp)) {
+                free(tmp);
                 free(key);
                 goto bad;
             }
+            free(prompt);
+            prompt = tmp;
         } else if (!strcmp(key, "model")) {
-            free(r->model);
-            if (!json_string(&p, &r->model)) {
+            if (!json_string_replace(&p, &r->model)) {
                 free(key);
                 goto bad;
             }
@@ -4785,6 +4807,44 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
+/* Unterminated reasoning is not an answer.
+ *
+ * When generation hits the token cap before </think> arrives, the old behaviour
+ * routed the whole unterminated buffer into content, so a truncated reasoning
+ * chain reached clients looking exactly like a finished reply.  split_reasoning_
+ * content() cannot tell that case apart from a legitimate non-thinking answer
+ * (neither carries a </think>, and the buffer does not retain the opening tag),
+ * so the discrimination has to happen here, where require_thinking_closed
+ * already tells us thinking was expected.
+ *
+ * Routing the buffer to reasoning_content and emptying content makes truncation
+ * self-describing on the wire for every consumer, not just ones that check
+ * finish_reason.  content is set to "" rather than NULL deliberately: the JSON
+ * writer guards NULL, but not every path in this file has been audited for it,
+ * and an empty answer is already unmistakably not an answer. */
+static void ds4_local_unterminated_reasoning(const char *text,
+                                             char **content_out,
+                                             char **reasoning_out) {
+    const char *body = text ? text : "";
+    if (!strncmp(body, "<think>", 7)) body += 7;
+    *reasoning_out = xstrdup(body);
+    *content_out = xstrdup("");
+}
+
+static void ds4_unterminated_reasoning_before_tool(const char *text,
+                                                   size_t prefix_len,
+                                                   char **content_out,
+                                                   char **reasoning_out) {
+    const char *body = text ? text : "";
+    if (prefix_len > strlen(body)) prefix_len = strlen(body);
+    if (prefix_len >= 7 && !strncmp(body, "<think>", 7)) {
+        body += 7;
+        prefix_len -= 7;
+    }
+    *reasoning_out = xstrndup(body, prefix_len);
+    *content_out = xstrdup("");
+}
+
 static bool parse_deepseek_generated_message_ex(const char *text,
                                                 bool require_thinking_closed,
                                                 char **content_out,
@@ -4792,6 +4852,7 @@ static bool parse_deepseek_generated_message_ex(const char *text,
                                                 tool_calls *calls) {
     text = text ? text : "";
     const char *tool_search = text;
+    bool recovered_unclosed_tool = false;
 
     /* When thinking mode is enabled the model is expected to close
      * </think> before it enters the executable assistant surface.  DSML inside
@@ -4803,12 +4864,17 @@ static bool parse_deepseek_generated_message_ex(const char *text,
     if (require_thinking_closed) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
-            /* Model did not close thinking, ignore any DSML in reasoning */
-            fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
-            return true;
+            const char *candidate = find_any_tool_start(text);
+            if (!candidate || !find_any_tool_end(candidate)) {
+                fprintf(stderr, "ds4-server: thinking not closed, ignoring incomplete DSML in reasoning\n");
+                ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
+                return true;
+            }
+            tool_search = candidate;
+            recovered_unclosed_tool = true;
+        } else {
+            tool_search = think_end + 8;
         }
-        tool_search = think_end + 8;
     }
 
     const char *start = strstr(tool_search, "\n\n" DS4_TOOL_CALLS_START);
@@ -4869,7 +4935,12 @@ static bool parse_deepseek_generated_message_ex(const char *text,
             const char *raw_block_end = p + strlen(tool_calls_end);
             free(calls->raw_tool_text);
             calls->raw_tool_text = xstrndup(raw_block_start, (size_t)(raw_block_end - raw_block_start));
-            split_reasoning_content(text, content_len, content_out, reasoning_out);
+            if (recovered_unclosed_tool) {
+                ds4_unterminated_reasoning_before_tool(text, content_len,
+                                                       content_out, reasoning_out);
+            } else {
+                split_reasoning_content(text, content_len, content_out, reasoning_out);
+            }
             return true;
         }
         if (strncmp(p, invoke_start, strlen(invoke_start)) != 0) return false;
@@ -4986,14 +5057,21 @@ static bool parse_glm_generated_message_ex(const char *text,
 
     text = text ? text : "";
     const char *tool_search = text;
+    bool recovered_unclosed_tool = false;
     if (require_thinking_closed) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
-            fprintf(stderr, "ds4-server: thinking not closed, ignoring GLM tool calls in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
-            return true;
+            const char *candidate = strstr(text, tool_start);
+            if (!candidate || !strstr(candidate, tool_end)) {
+                fprintf(stderr, "ds4-server: thinking not closed, ignoring incomplete GLM tool calls in reasoning\n");
+                ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
+                return true;
+            }
+            tool_search = candidate;
+            recovered_unclosed_tool = true;
+        } else {
+            tool_search = think_end + 8;
         }
-        tool_search = think_end + 8;
     }
 
     const char *start = strstr(tool_search, tool_start);
@@ -5098,7 +5176,12 @@ static bool parse_glm_generated_message_ex(const char *text,
     if (calls->len == 0) return false;
     free(calls->raw_tool_text);
     calls->raw_tool_text = xstrndup(raw_block_start, (size_t)(p - raw_block_start));
-    split_reasoning_content(text, content_len, content_out, reasoning_out);
+    if (recovered_unclosed_tool) {
+        ds4_unterminated_reasoning_before_tool(text, content_len,
+                                               content_out, reasoning_out);
+    } else {
+        split_reasoning_content(text, content_len, content_out, reasoning_out);
+    }
     return true;
 }
 
@@ -5603,6 +5686,7 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
+    bool guard_second_reasoning;
     bool sent_reasoning;
     bool sent_content;
     openai_tool_stream tool;
@@ -5612,6 +5696,8 @@ static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
+    st->guard_second_reasoning =
+        ds4_think_mode_enabled(r->think_mode) && r->has_tools;
 }
 
 static void openai_tool_stream_free(openai_tool_stream *ts) {
@@ -6407,8 +6493,16 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *tool = r->has_tools ?
+            find_any_tool_start(raw + st->emit_pos) : NULL;
+        const bool tool_before_close = tool && (!close || tool < close);
+        const bool complete_tool =
+            tool_before_close && find_any_tool_end(tool) != NULL;
         size_t limit;
-        if (close) {
+        if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
             limit = raw_len;
@@ -6426,6 +6520,14 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             st->emit_pos = limit;
         }
 
+        if (tool_before_close) {
+            if (complete_tool) {
+                st->emit_pos = (size_t)(tool - raw);
+                st->mode = OPENAI_STREAM_SUPPRESS;
+            }
+            return true;
+        }
+
         if (close) {
             st->emit_pos = (size_t)(close - raw) + strlen("</think>");
             st->mode = OPENAI_STREAM_TEXT;
@@ -6438,6 +6540,26 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
     }
 
     if (st->mode == OPENAI_STREAM_TEXT) {
+        if (st->guard_second_reasoning) {
+            const char *close = strstr(raw + st->emit_pos, "</think>");
+            const char *tool = r->has_tools ?
+                find_any_tool_start(raw + st->emit_pos) : NULL;
+            if (close && (!tool || close < tool)) {
+                const size_t limit = (size_t)(close - raw);
+                if (limit > st->emit_pos &&
+                    !sse_chat_delta_n(fd, r, id, "reasoning_content",
+                                      raw + st->emit_pos,
+                                      limit - st->emit_pos)) return false;
+                if (limit > st->emit_pos) st->sent_reasoning = true;
+                st->emit_pos = limit + strlen("</think>");
+                st->guard_second_reasoning = false;
+            } else if (!tool && !final) {
+                return true;
+            } else {
+                st->guard_second_reasoning = false;
+            }
+        }
+
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
@@ -7104,8 +7226,16 @@ static bool responses_sse_stream_update(int fd, const request *r,
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *tool = r->has_tools ?
+            find_any_tool_start(raw + st->emit_pos) : NULL;
+        const bool tool_before_close = tool && (!close || tool < close);
+        const bool complete_tool =
+            tool_before_close && find_any_tool_end(tool) != NULL;
         size_t limit;
-        if (close) {
+        if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
             limit = raw_len;
@@ -7133,6 +7263,14 @@ static bool responses_sse_stream_update(int fd, const request *r,
                 st->reasoning_emitted_any = true;
             }
             st->emit_pos = limit;
+        }
+
+        if (tool_before_close) {
+            if (complete_tool) {
+                st->emit_pos = (size_t)(tool - raw);
+                st->mode = RESP_STREAM_SUPPRESS;
+            }
+            return true;
         }
 
         if (close) {
@@ -7503,6 +7641,7 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
+    bool guard_second_reasoning;
     bool sent_thinking;
     bool sent_text;
     anthropic_tool_stream tool;
@@ -7528,6 +7667,8 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     memset(st, 0, sizeof(*st));
     st->active = ok;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
+    st->guard_second_reasoning =
+        ds4_think_mode_enabled(r->think_mode) && r->has_tools;
     return ok;
 }
 
@@ -7981,8 +8122,16 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *tool = r->has_tools ?
+            find_any_tool_start(raw + st->emit_pos) : NULL;
+        const bool tool_before_close = tool && (!close || tool < close);
+        const bool complete_tool =
+            tool_before_close && find_any_tool_end(tool) != NULL;
         size_t limit;
-        if (close) {
+        if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
             limit = raw_len;
@@ -8001,6 +8150,15 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
             st->emit_pos = limit;
         }
 
+        if (tool_before_close) {
+            if (complete_tool) {
+                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+                st->emit_pos = (size_t)(tool - raw);
+                st->mode = ANTH_STREAM_SUPPRESS;
+            }
+            return true;
+        }
+
         if (close || final) {
             if (!anthropic_sse_close_block_live(fd, id, st)) return false;
             if (close) {
@@ -8016,6 +8174,29 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
     }
 
     if (st->mode == ANTH_STREAM_TEXT) {
+        if (st->guard_second_reasoning) {
+            const char *close = strstr(raw + st->emit_pos, "</think>");
+            const char *tool = r->has_tools ?
+                find_any_tool_start(raw + st->emit_pos) : NULL;
+            if (close && (!tool || close < tool)) {
+                const size_t limit = (size_t)(close - raw);
+                if (limit > st->emit_pos) {
+                    if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING)) return false;
+                    if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_THINKING,
+                                                  raw + st->emit_pos,
+                                                  limit - st->emit_pos)) return false;
+                    st->sent_thinking = true;
+                }
+                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+                st->emit_pos = limit + strlen("</think>");
+                st->guard_second_reasoning = false;
+            } else if (!tool && !final) {
+                return true;
+            } else {
+                st->guard_second_reasoning = false;
+            }
+        }
+
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
@@ -8303,6 +8484,7 @@ struct server_slot {
     int continued_last_store_tokens;
 
     job *assigned;
+    job *running;
     bool busy;
     bool prefill_waiting;
 
@@ -8362,6 +8544,7 @@ struct server {
     bool model_stopping;
     int decode_pending;
     int active_generations;
+    int mixed_prefill_quantum;
     int last_prefill_slot;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -8520,796 +8703,37 @@ struct job {
 	char client[DS4_CALL_CLIENT_MAX];
 	double received_at;
     bool done;
+    bool cancelled;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
 };
 
-static void server_finish_cancelled_active(server *s, server_slot *slot,
-	job *j,
-	int output_tokens, const char *cache_source, const char *reason);
-
-static bool server_client_disconnected(int fd) {
-	if (fd < 0) return true;
-	struct pollfd pfd = { .fd = fd, .events = POLLIN
-#ifdef POLLRDHUP
-			| POLLRDHUP
-#endif
-	};
-	int rc;
-	do {
-		rc = poll(&pfd, 1, 0);
-	} while (rc < 0 && errno == EINTR);
-	if (rc == 0) return false;
-	if (rc < 0 || (pfd.revents & (POLLERR | POLLNVAL))) return true;
-#ifdef POLLRDHUP
-	if (pfd.revents & POLLRDHUP) return true;
-#endif
-	if (pfd.revents & POLLHUP) return true;
-	if (pfd.revents & POLLIN) {
-		char byte;
-		ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
-		if (n == 0) return true;
-		if (n > 0) return false;
-		return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
-	}
-	return false;
+static bool job_cancelled(void *ud) {
+    job *j = ud;
+    if (!j) return false;
+    pthread_mutex_lock(&j->mu);
+    bool cancelled = j->cancelled;
+    pthread_mutex_unlock(&j->mu);
+    return cancelled;
 }
 
-static bool server_job_client_disconnected(const job *j) {
-	return j && !j->req.stream && server_client_disconnected(j->fd);
+static void job_mark_cancelled(job *j) {
+    if (!j) return;
+    pthread_mutex_lock(&j->mu);
+    j->cancelled = true;
+    pthread_mutex_unlock(&j->mu);
 }
 
-static bool server_job_cancel_cb(void *ud) {
-	return server_job_client_disconnected((const job *)ud);
+static void job_complete(job *j) {
+    pthread_mutex_lock(&j->mu);
+    j->done = true;
+    pthread_cond_signal(&j->cv);
+    pthread_mutex_unlock(&j->mu);
 }
 
-static void server_call_history_update_prompt(server *s, job *j,
-									int prompt_tokens, int cached_tokens,
-									const char *cache_source) {
-	if (!s || !j || !j->call_request_id) return;
-	j->usage_prompt_tokens = prompt_tokens > 0 ? prompt_tokens : 0;
-	j->usage_started = true;
-	pthread_mutex_lock(&s->call_history_mu);
-	ds4_call_history_update_prompt(&s->call_history, j->call_request_id,
-								 prompt_tokens, cached_tokens, cache_source);
-	pthread_mutex_unlock(&s->call_history_mu);
-}
-
-static void server_call_history_finish(server *s, job *j,
-							  ds4_call_status status, int output_tokens,
-							  const char *cache_source, const char *finish,
-							  const char *error) {
-	if (!s || !j || !j->call_request_id) return;
-	pthread_mutex_lock(&s->call_history_mu);
-	ds4_call_history_finish(&s->call_history, j->call_request_id, status,
-							ds4_wall_time_sec(), output_tokens, cache_source, finish, error);
-	pthread_mutex_unlock(&s->call_history_mu);
-	if (j->usage_started && !j->usage_recorded && s->token_history_ready) {
-		j->usage_recorded = true;
-		char history_err[256] = {0};
-		pthread_mutex_lock(&s->token_history_mu);
-		bool persisted = ds4_token_history_record(&s->token_history,
-			(int64_t)ds4_wall_time_sec(),
-			(uint64_t)j->usage_prompt_tokens,
-			(uint64_t)(output_tokens > 0 ? output_tokens : 0),
-			history_err, sizeof(history_err));
-		pthread_mutex_unlock(&s->token_history_mu);
-		if (!persisted) {
-			server_log(DS4_LOG_DEFAULT,
-				"ds4-server: token usage history not persisted: %s",
-				history_err[0] ? history_err : "unknown error");
-		}
-	}
-}
-
-static bool server_drop_disconnected_queued_job(server *s, job *j) {
-	if (!server_job_client_disconnected(j)) return false;
-	server_log(DS4_LOG_GENERATION,
-		"ds4-server: dropping queued request after client disconnected");
-	server_call_history_finish(s, j, DS4_CALL_CANCELLED, 0, "none",
-		"cancelled", "client disconnected while queued");
-	return true;
-}
-
-static void server_finalize_call_history(server *s, job *j,
-								 int output_tokens, const char *cache_source,
-								 const char **final_finish, char *err,
-								 size_t errlen, bool response_ok) {
-	if (!response_ok && server_job_client_disconnected(j)) {
-		if (final_finish) *final_finish = "cancelled";
-		if (err && errlen && !err[0])
-			snprintf(err, errlen, "client disconnected during final response");
-	} else if (!response_ok) {
-		if (final_finish) *final_finish = "error";
-		if (err && errlen && !err[0])
-			snprintf(err, errlen, "client stream write failed");
-	}
-	const char *finish = final_finish && *final_finish ? *final_finish : "error";
-	ds4_call_status status = !strcmp(finish, "error") ? DS4_CALL_FAILED :
-		!strcmp(finish, "cancelled") ? DS4_CALL_CANCELLED : DS4_CALL_COMPLETED;
-	server_call_history_finish(s, j,
-			status,
-			output_tokens, cache_source, finish,
-			(status == DS4_CALL_FAILED || status == DS4_CALL_CANCELLED) &&
-				err && err[0] ? err : "");
-}
-
-static const char *request_api_name(api_style api) {
-    switch (api) {
-    case API_OPENAI: return "openai";
-    case API_ANTHROPIC: return "anthropic";
-    case API_RESPONSES: return "responses";
-    }
-    return "unknown";
-}
-
-static const char *request_kind_name(req_kind kind) {
-    return kind == REQ_CHAT ? "chat" : "completion";
-}
-
-static void status_copy(char *dst, size_t len, const char *src) {
-    if (!dst || !len) return;
-    snprintf(dst, len, "%s", src ? src : "");
-}
-
-static uint64_t status_sat_add(uint64_t value, uint64_t add) {
-    return UINT64_MAX - value < add ? UINT64_MAX : value + add;
-}
-
-static uint64_t status_sat_inc(uint64_t value) {
-    return status_sat_add(value, 1);
-}
-
-static void server_status_init(server *s) {
-    if (!s) return;
-    pthread_mutex_lock(&s->status_mu);
-    memset(&s->status, 0, sizeof(s->status));
-    status_copy(s->status.phase, sizeof(s->status.phase), "idle");
-    s->status.server_started_t = now_sec();
-    s->status.updated_t = s->status.server_started_t;
-    s->status.default_tokens = s->default_tokens;
-    if (s->engine) {
-        status_copy(s->status.model_name, sizeof(s->status.model_name),
-                    ds4_engine_model_name(s->engine));
-    }
-    if (s->session) {
-        s->status.ctx_size = ds4_session_ctx(s->session);
-        s->status.next_ctx_size = s->status.ctx_size;
-        s->status.session_pos = ds4_session_pos(s->session);
-    }
-    pthread_mutex_unlock(&s->status_mu);
-}
-
-static void server_status_set_model(server *s, ds4_backend backend) {
-    if (!s) return;
-    pthread_mutex_lock(&s->status_mu);
-    status_copy(s->status.model_name, sizeof(s->status.model_name),
-                s->engine ? ds4_engine_model_name(s->engine) : "");
-    status_copy(s->status.backend_name, sizeof(s->status.backend_name),
-                ds4_backend_name(backend));
-    s->status.ctx_size = s->session ? ds4_session_ctx(s->session) : 0;
-    s->status.next_ctx_size = s->status.ctx_size;
-    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
-    s->status.default_tokens = s->default_tokens;
-    s->status.updated_t = now_sec();
-    pthread_mutex_unlock(&s->status_mu);
-}
-
-static void server_status_set_clients(server *s, int clients) {
-    if (!s) return;
-    pthread_mutex_lock(&s->status_mu);
-    s->status.clients = clients;
-    s->status.updated_t = now_sec();
-    pthread_mutex_unlock(&s->status_mu);
-}
-
-static void server_status_set_queue(server *s, int queue_depth) {
-    if (!s) return;
-    pthread_mutex_lock(&s->status_mu);
-    s->status.queue_depth = queue_depth;
-    s->status.updated_t = now_sec();
-    pthread_mutex_unlock(&s->status_mu);
-}
-
-static void server_status_begin_request(server *s, const request *r,
-                                        int cached_tokens,
-                                        int prompt_tokens,
-                                        const char *cache_source) {
-    if (!s || !r) return;
-    if (prompt_tokens < 0) prompt_tokens = 0;
-    if (cached_tokens < 0) cached_tokens = 0;
-    if (cached_tokens > prompt_tokens) cached_tokens = prompt_tokens;
-    const double now = now_sec();
-    pthread_mutex_lock(&s->status_mu);
-    s->status.active = true;
-    status_copy(s->status.phase, sizeof(s->status.phase), "prefill");
-    status_copy(s->status.request_kind, sizeof(s->status.request_kind),
-                request_kind_name(r->kind));
-    status_copy(s->status.api, sizeof(s->status.api),
-                request_api_name(r->api));
-    s->status.stream = r->stream;
-    s->status.has_tools = r->has_tools;
-    status_copy(s->status.cache_source, sizeof(s->status.cache_source),
-                cache_source ? cache_source : "none");
-    s->status.finish[0] = '\0';
-    s->status.last_error[0] = '\0';
-    s->status.total_requests = status_sat_inc(s->status.total_requests);
-    s->status.total_prompt_tokens = status_sat_add(
-        s->status.total_prompt_tokens, (uint64_t)prompt_tokens);
-    s->status.total_cached_tokens = status_sat_add(
-        s->status.total_cached_tokens, (uint64_t)cached_tokens);
-    if (prompt_tokens > 0) {
-        s->status.prompt_requests = status_sat_inc(s->status.prompt_requests);
-        if (cached_tokens > 0) {
-            s->status.cache_hit_requests = status_sat_inc(
-                s->status.cache_hit_requests);
-        }
-    }
-    s->status.prompt_tokens = prompt_tokens;
-    s->status.cached_tokens = cached_tokens;
-    s->status.cache_write_tokens = prompt_tokens > cached_tokens ?
-        prompt_tokens - cached_tokens : 0;
-    s->status.request_started_t = now;
-    s->status.phase_started_t = now;
-    int prefill_total = prompt_tokens > cached_tokens ?
-        prompt_tokens - cached_tokens : 0;
-    s->status.prefill_current = 0;
-    s->status.prefill_total = prefill_total;
-    s->status.prefill_elapsed_s = 0.0;
-    s->status.prefill_avg_tps = 0.0;
-    s->status.prefill_chunk_tps = 0.0;
-    s->status.prefill_eta_s = prefill_total > 0 ? -1.0 : 0.0;
-    s->status.prefill_last_current = 0;
-    s->status.prefill_last_t = now;
-    s->status.decode_generated = 0;
-    s->status.decode_max_tokens = 0;
-    s->status.decode_elapsed_s = 0.0;
-    s->status.decode_avg_tps = 0.0;
-    s->status.decode_chunk_tps = 0.0;
-    s->status.decode_last_generated = 0;
-    s->status.decode_last_t = now;
-    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
-    s->status.updated_t = now;
-    pthread_mutex_unlock(&s->status_mu);
-}
-
-static void server_status_update_prefill(server *s, int current, int total,
-                                         int cached_tokens) {
-    if (!s) return;
-    const double now = now_sec();
-    pthread_mutex_lock(&s->status_mu);
-    int display_start = cached_tokens;
-    if (display_start < 0 || display_start > s->status.prompt_tokens)
-        display_start = 0;
-    int display_total = s->status.prompt_tokens - display_start;
-    if (display_total <= 0) {
-        display_start = 0;
-        display_total = total > 0 ? total : s->status.prompt_tokens;
-    }
-    int display_current = current - display_start;
-    if (display_current < 0) display_current = 0;
-    if (display_current > display_total) display_current = display_total;
-    const double elapsed = now - s->status.phase_started_t;
-    const int interval_tokens = display_current - s->status.prefill_last_current;
-    const double interval_s = now - s->status.prefill_last_t;
-    s->status.prefill_current = display_current;
-    s->status.prefill_total = display_total;
-    s->status.prefill_elapsed_s = elapsed > 0.0 ? elapsed : 0.0;
-    s->status.prefill_avg_tps = elapsed > 0.0 ?
-        (double)display_current / elapsed : 0.0;
-    s->status.prefill_chunk_tps = interval_s > 0.0 && interval_tokens > 0 ?
-        (double)interval_tokens / interval_s : 0.0;
-    int remaining = display_total - display_current;
-    s->status.prefill_eta_s =
-        remaining > 0 && s->status.prefill_avg_tps > 0.0 ?
-        (double)remaining / s->status.prefill_avg_tps : 0.0;
-    s->status.prefill_last_current = display_current;
-    s->status.prefill_last_t = now;
-    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
-    s->status.updated_t = now;
-    pthread_mutex_unlock(&s->status_mu);
-}
-
-static void server_status_decode_start(server *s, int max_tokens) {
-    if (!s) return;
-    const double now = now_sec();
-    pthread_mutex_lock(&s->status_mu);
-    status_copy(s->status.phase, sizeof(s->status.phase), "decode");
-    s->status.phase_started_t = now;
-    s->status.decode_generated = 0;
-    s->status.decode_max_tokens = max_tokens;
-    s->status.decode_elapsed_s = 0.0;
-    s->status.decode_avg_tps = 0.0;
-    s->status.decode_chunk_tps = 0.0;
-    s->status.decode_last_generated = 0;
-    s->status.decode_last_t = now;
-    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
-    s->status.updated_t = now;
-    pthread_mutex_unlock(&s->status_mu);
-}
-
-static void server_status_update_decode(server *s, int generated) {
-    if (!s) return;
-    const double now = now_sec();
-    pthread_mutex_lock(&s->status_mu);
-    const double elapsed = now - s->status.phase_started_t;
-    const int interval_tokens = generated - s->status.decode_last_generated;
-    const double interval_s = now - s->status.decode_last_t;
-    s->status.decode_generated = generated;
-    s->status.decode_elapsed_s = elapsed > 0.0 ? elapsed : 0.0;
-    s->status.decode_avg_tps = elapsed > 0.0 ? (double)generated / elapsed : 0.0;
-    s->status.decode_chunk_tps = interval_s > 0.0 && interval_tokens > 0 ?
-        (double)interval_tokens / interval_s : 0.0;
-    s->status.decode_last_generated = generated;
-    s->status.decode_last_t = now;
-    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
-    s->status.updated_t = now;
-    pthread_mutex_unlock(&s->status_mu);
-}
-
-static void server_status_finish_request(server *s, const char *finish,
-                                         const char *err) {
-    if (!s) return;
-    pthread_mutex_lock(&s->status_mu);
-    if (finish && !strcmp(finish, "error")) {
-        s->status.failed_requests = status_sat_inc(s->status.failed_requests);
-	} else if (finish && !strcmp(finish, "cancelled")) {
-		s->status.cancelled_requests = status_sat_inc(
-			s->status.cancelled_requests);
-    } else {
-        s->status.completed_requests = status_sat_inc(
-            s->status.completed_requests);
-    }
-    s->status.active = false;
-    status_copy(s->status.phase, sizeof(s->status.phase), "idle");
-    status_copy(s->status.finish, sizeof(s->status.finish),
-                finish ? finish : "");
-    status_copy(s->status.last_error, sizeof(s->status.last_error),
-                err ? err : "");
-    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
-    s->status.updated_t = now_sec();
-    pthread_mutex_unlock(&s->status_mu);
-}
-
-static int server_queue_depth_locked(const server *s) {
-    int n = 0;
-    for (const job *j = s ? s->head : NULL; j; j = j->next) n++;
-    return n;
-}
-
-static const char dashboard_html[] =
-"<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
-"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-"<title>DwarfStar Inference Console</title><script>(()=>{try{const p=localStorage.getItem('ds4-dashboard-theme'),v=['system','dark','light'].includes(p)?p:'system',d=matchMedia('(prefers-color-scheme: dark)').matches;document.documentElement.dataset.theme=v==='system'?(d?'dark':'light'):v;document.documentElement.dataset.themePreference=v}catch(e){document.documentElement.dataset.theme='light';document.documentElement.dataset.themePreference='system'}})()</script><style>"
-":root{color-scheme:light;--wall:#c8cdd2;--surface:rgba(232,235,238,.58);--surface-strong:rgba(244,246,248,.74);--surface-soft:rgba(221,225,229,.46);--ink:#171c23;--muted:#626b75;--faint:#7f8892;--line:rgba(25,31,39,.12);--edge:rgba(255,255,255,.58);--edge-soft:rgba(255,255,255,.32);--success:#16784a;--danger:#bd3c49;--warning:#9a6421;--accent:#547895;--accent-soft:rgba(84,120,149,.16);--selected:rgba(68,91,111,.11);--shadow:rgba(31,39,47,.16);--shadow-soft:rgba(31,39,47,.08);--focus:#2e6f9e;--control-height:44px;--motion-fast:180ms;--motion-smooth:240ms;--motion-mode:280ms;--radius:18px;--instrument-font:SFMono-Regular,Menlo,Consolas,\"Hiragino Sans GB\",\"PingFang SC\",\"Microsoft YaHei\",\"Arial Unicode MS\",monospace}"
-":root[data-theme=dark]{color-scheme:dark;--wall:#0d1219;--surface:rgba(19,26,35,.66);--surface-strong:rgba(29,38,49,.72);--surface-soft:rgba(16,22,30,.5);--ink:#edf3f8;--muted:#98a4b1;--faint:#707d8a;--line:rgba(224,235,246,.11);--edge:rgba(255,255,255,.12);--edge-soft:rgba(255,255,255,.06);--success:#72d5a2;--danger:#ff8993;--warning:#e8b066;--accent:#84b4d5;--accent-soft:rgba(95,154,194,.18);--selected:rgba(115,166,200,.13);--shadow:rgba(0,0,0,.38);--shadow-soft:rgba(0,0,0,.22);--focus:#8cc8f1}"
-"body{margin:0;min-height:100vh;background:radial-gradient(circle at 8% -10%,rgba(255,255,255,.7),transparent 34%),radial-gradient(circle at 92% 16%,rgba(123,145,162,.18),transparent 30%),linear-gradient(142deg,#d8dbde 0%,#cbd0d4 48%,#bcc2c7 100%);color:var(--ink);overflow-x:hidden;transition:background-color var(--motion-smooth) ease,color var(--motion-smooth) ease}"
-":root[data-theme=dark] body{background:radial-gradient(circle at 12% -8%,rgba(94,132,164,.16),transparent 34%),radial-gradient(circle at 88% 12%,rgba(77,103,128,.11),transparent 30%),linear-gradient(145deg,#121923 0%,#0c1118 52%,#090d13 100%)}"
-".light-field{position:fixed;z-index:-2;width:1100px;height:780px;left:-180px;top:-260px;pointer-events:none;opacity:.48;background:radial-gradient(ellipse at center,rgba(255,255,255,.72) 0%,rgba(255,255,255,.28) 36%,rgba(255,255,255,0) 70%);animation:signal-drift 18s cubic-bezier(.42,0,.58,1) infinite alternate;will-change:transform}"
-".light-shadow{position:fixed;z-index:-2;width:780px;height:620px;right:-150px;bottom:-250px;pointer-events:none;opacity:.62;background:radial-gradient(ellipse at center,rgba(81,102,119,.18),rgba(81,102,119,0) 68%);animation:signal-shadow 26s cubic-bezier(.42,0,.58,1) infinite alternate;will-change:transform}"
-":root[data-theme=dark] .light-field{opacity:.34;background:radial-gradient(ellipse at center,rgba(88,133,169,.3),rgba(50,78,102,.09) 42%,transparent 72%)}:root[data-theme=dark] .light-shadow{opacity:.72;background:radial-gradient(ellipse at center,rgba(0,0,0,.44),transparent 68%)}"
-"@keyframes signal-drift{from{transform:translate3d(-5vw,-1vh,0)}to{transform:translate3d(5vw,2vh,0)}}@keyframes signal-shadow{from{transform:translate3d(3vw,2vh,0)}to{transform:translate3d(-4vw,-2vh,0)}}"
-".glass-column,.instrument-panel{background:linear-gradient(145deg,var(--surface-strong),var(--surface));backdrop-filter:blur(24px) saturate(1.12);-webkit-backdrop-filter:blur(24px) saturate(1.12);border:1px solid var(--edge);border-bottom-color:var(--line);border-radius:var(--radius);box-shadow:inset 0 1px 0 var(--edge-soft),0 24px 64px var(--shadow),0 2px 8px var(--shadow-soft)}"
-".instrument-panel{box-shadow:inset 0 1px 0 var(--edge-soft),0 14px 36px var(--shadow-soft)}"
-"@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){.glass-column,.instrument-panel{background:var(--wall)}}"
-"@media(max-width:760px){.light-field,.light-shadow{animation:none}.light-field{transform:translate3d(2vw,0,0)}.light-shadow{transform:none}.glass-column{backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}}"
-"@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}.light-field{transform:translate3d(2vw,0,0)}.light-shadow{transform:none}}"
-"*{box-sizing:border-box}:focus-visible{outline:2px solid var(--focus);outline-offset:3px}h1,h2,h3,p,dl,dd{margin:0}a{color:inherit}"
-"body{font:15px/1.5 -apple-system,BlinkMacSystemFont,\"Hiragino Sans GB\",\"PingFang SC\",\"Microsoft YaHei\",\"Arial Unicode MS\",\"Helvetica Neue\",Arial,sans-serif}"
-"button,input,select{min-height:var(--control-height);font:inherit;color:inherit;border:1px solid var(--edge);border-bottom-color:var(--line);background:var(--surface-soft);border-radius:11px;box-shadow:inset 0 1px 0 var(--edge-soft)}button{padding:0 16px;cursor:pointer}button.primary{background:var(--ink);border-color:var(--ink);color:var(--wall)}button:disabled{cursor:not-allowed;opacity:.45}input{width:9rem;padding:0 10px;font-family:var(--instrument-font)}select{padding:0 30px 0 10px}"
-"button,input,select,.status-dot,.metric-bar span{transition:transform var(--motion-fast) ease,background-color var(--motion-fast) ease,color var(--motion-fast) ease,border-color var(--motion-fast) ease,box-shadow var(--motion-fast) ease}button:active{transform:translateY(1px);box-shadow:none}"
-".mono{font-family:var(--instrument-font)}.eyebrow{display:block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}.caption{font-size:12px;color:var(--muted)}"
-".page{width:min(100%,1440px);min-height:100vh;margin:0 auto;padding:18px 30px 48px}.topbar{display:grid;grid-template-columns:minmax(280px,1fr) auto auto;align-items:center;gap:22px}"
-".brand{display:flex;align-items:center;gap:13px;font:750 20px/1.1 var(--instrument-font);letter-spacing:-.035em}.brand a{display:inline-flex;align-items:center;min-height:var(--control-height);text-decoration:none}.brand-title{display:grid;gap:3px}.brand-title small{font:500 10px/1.2 var(--instrument-font);letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}.brand .model{font:500 11px/1.4 var(--instrument-font);color:var(--muted);letter-spacing:0}.status-glyph{width:9px;height:9px;border-radius:2px;background:var(--success);box-shadow:0 0 18px var(--success);transform:rotate(45deg);margin-right:3px}"
-".header-telemetry{display:flex;align-items:center;gap:20px}.live-badge{display:flex;align-items:center;gap:7px;font:700 10px/1 var(--instrument-font);letter-spacing:.14em;color:var(--success)}.header-stat{display:grid;gap:3px;min-width:70px}.header-stat span{font:500 9px/1 var(--instrument-font);letter-spacing:.11em;color:var(--muted)}.header-stat strong{font:650 13px/1.1 var(--instrument-font);white-space:nowrap}.header-controls{display:flex;align-items:center;gap:8px}.mode-switch,.theme-switch{display:flex;gap:3px;padding:3px;border:1px solid var(--edge);border-bottom-color:var(--line);border-radius:13px;background:var(--surface-soft);box-shadow:inset 0 1px 0 var(--edge-soft)}.mode-switch button,.theme-switch button{min-height:44px;border:0;border-radius:9px;background:transparent;box-shadow:none;padding:0 12px;font-size:12px;color:var(--muted)}.theme-switch button{min-width:44px;padding:0 8px}.mode-switch button[aria-pressed=true],.theme-switch button[aria-pressed=true]{background:var(--surface-strong);color:var(--ink);box-shadow:0 4px 12px var(--shadow-soft),inset 0 1px 0 var(--edge)}"
-".activity-ribbon{position:relative;height:10px;margin:8px 0 2px;overflow:hidden}.activity-ribbon:before,.activity-ribbon:after{content:\"\";position:absolute;left:0;right:0;top:4px;height:1px}.activity-ribbon:before{background:var(--line)}.activity-ribbon:after{opacity:.18;background:linear-gradient(90deg,#6b7f94,#7c6d94,#a07377,#a68b58,#6c9279,#63899f,#7a6d9b);transform:translateX(-38%)}#dashboard.is-active .activity-ribbon:after{opacity:.72;animation:energy-flow 7s linear infinite}@keyframes energy-flow{to{transform:translateX(38%)}}"
-".console-meta{display:flex;align-items:center;justify-content:space-between;gap:18px;min-height:28px}.state{display:flex;align-items:center;gap:10px;font:11px/1.4 var(--instrument-font);color:var(--muted)}.state strong{font-weight:600;color:var(--ink)}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--success)}#dashboard.stale .status-dot{background:var(--warning)}"
-".mode-layout,.mode-enter{animation:mode-in var(--motion-mode) cubic-bezier(.22,.8,.24,1) both}.mode-enter>.model{animation:mode-subtitle 220ms 40ms ease both}@keyframes mode-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}@keyframes mode-subtitle{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}#dashboard.stale *,#dashboard.stale *:before,#dashboard.stale *:after{animation:none!important;transition:none!important}body.dashboard-stale .light-field,body.dashboard-stale .light-shadow{animation:none!important;transition:none!important}"
-"#dashboard.stale .mode-layout,#dashboard.stale .mode-enter,#dashboard.stale .metric-value-layer,#dashboard.stale .value-changing{animation:none!important}"
-".monitor-title,.management-layout>h1,.usage-layout h1{font-size:18px;font-weight:650;letter-spacing:-.02em;margin:16px 0 2px}.mode-layout>.model{color:var(--muted);font-size:12px;margin-bottom:12px}"
-".num-wall{position:relative}#monitorMetrics{display:grid;grid-template-columns:minmax(260px,1.55fr) repeat(5,minmax(92px,1fr));grid-template-areas:\"decode prefill phase cache context queue\";align-items:stretch;overflow:visible;margin:0;padding:12px}"
-".vital{position:relative;z-index:1;display:flex;flex-direction:column;justify-content:flex-end;min-width:0;padding:12px 16px}.vital+.vital:before{content:\"\";position:absolute;left:0;top:16%;bottom:16%;width:1px;background:linear-gradient(transparent,var(--line),transparent)}.vital-decode{grid-area:decode}.vital-prefill{grid-area:prefill}.vital-phase{grid-area:phase}.vital-cache{grid-area:cache}.vital-context{grid-area:context}.vital-queue{grid-area:queue}.vital strong{display:block;font-size:17px;font-weight:650;white-space:nowrap;margin-top:5px}.vital-decode strong{font-size:46px;line-height:1.05;letter-spacing:-.045em}.vital-phase strong{white-space:normal;overflow-wrap:anywhere}.metric-subvalue,.metric-phase-meta{display:block;font-size:10px;color:var(--muted);font-family:var(--instrument-font);overflow-wrap:anywhere}.metric-bar{height:2px;background:var(--line);margin-top:9px;overflow:hidden}.metric-bar span{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),transparent);box-shadow:0 0 12px var(--accent-soft);transition:width 360ms cubic-bezier(.22,.8,.24,1),background-color var(--motion-fast) ease}.value-changing{animation:value-flash var(--motion-fast) ease}@keyframes value-flash{from{color:var(--muted)}to{color:inherit}}"
-".metric-value-window{display:inline-block;position:relative;overflow:hidden;max-width:100%;height:1.15em;vertical-align:bottom}.metric-value-layer{display:inline-block;white-space:nowrap;line-height:1.15}.metric-value-truncated .metric-value-window{display:block;width:100%}.metric-value-truncated .metric-value-layer{display:block;width:100%;overflow:hidden;text-overflow:ellipsis}.metric-value-layer-out-increase,.metric-value-layer-out-decrease{position:absolute;left:0;right:0;top:0}.metric-value-layer-in-increase{animation:metric-in-up 420ms ease both}.metric-value-layer-out-increase{animation:metric-out-up 420ms ease both}.metric-value-layer-in-decrease{animation:metric-in-down 420ms ease both}.metric-value-layer-out-decrease{animation:metric-out-down 420ms ease both}@keyframes metric-in-up{from{transform:translateY(105%) scale(.96);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}@keyframes metric-out-up{from{transform:translateY(0);opacity:1}to{transform:translateY(-105%);opacity:0}}@keyframes metric-in-down{from{transform:translateY(-105%) scale(1.04);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}@keyframes metric-out-down{from{transform:translateY(0);opacity:1}to{transform:translateY(105%);opacity:0}}"
-".monitor-grid{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:18px 22px;align-items:start;margin-top:18px}.monitor-left{display:grid;gap:16px;align-content:start;min-width:0}.monitor-console{min-width:0;overflow:hidden}.monitor-panel{padding:16px 18px;min-width:0}.inspector h2{font-size:14px;margin-bottom:8px}.inspector dl{display:grid;grid-template-columns:auto minmax(0,1fr) auto minmax(0,1fr);gap:4px 10px;font-size:10px}.inspector dt{color:var(--muted);white-space:nowrap}.inspector dd{font-family:var(--instrument-font);word-break:break-all}.inspector-empty{padding:16px 0 6px}"
-".section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:10px}.section-head h2,.monitor-panel>h2{font-size:14px;font-weight:650}.call-filters{display:grid;grid-template-columns:1.2fr repeat(3,minmax(0,1fr));gap:8px;margin-bottom:10px}.filter-field{display:flex;flex-direction:column;gap:4px;min-width:0}.filter-field input,.filter-field select{width:100%}"
-".timeline-panel{padding:17px 18px 15px}.timeline-track{display:grid;grid-template-columns:.8fr 1fr 1.1fr 1fr 1.25fr .8fr;gap:0;margin-top:15px}.timeline-stage{min-width:0;padding-right:9px}.stage-name,.stage-value{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--instrument-font)}.stage-name{font-size:10px;color:var(--muted);letter-spacing:.04em}.stage-value{font-size:10px;color:var(--faint);margin-top:6px}.stage-line{position:relative;height:8px;margin-top:8px}.stage-line:before,.stage-line:after{content:\"\";position:absolute;left:0;right:0;top:3px;height:1px}.stage-line:before{background:var(--line)}.stage-line:after{background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:0;transform:scaleX(.35);transform-origin:left}.stage-node{position:absolute;z-index:1;left:0;top:0;width:7px;height:7px;border:1px solid var(--line);border-radius:50%;background:var(--surface-strong)}.timeline-stage[data-state=done] .stage-line:after{opacity:.5;transform:scaleX(1)}.timeline-stage[data-state=done] .stage-node{border-color:var(--accent);background:var(--accent)}.timeline-stage[data-state=active] .stage-name{color:var(--ink)}.timeline-stage[data-state=active] .stage-line:after{opacity:.9;animation:timeline-flow 2.8s ease-in-out infinite}.timeline-stage[data-state=active] .stage-node{border-color:var(--accent);box-shadow:0 0 0 4px var(--accent-soft),0 0 16px var(--accent)}@keyframes timeline-flow{0%,100%{transform:translateX(-22%) scaleX(.35);opacity:.32}50%{transform:translateX(38%) scaleX(.58);opacity:.9}}"
-".usage-layout{padding:18px 0 0}.usage-shell{width:min(100%,1120px);margin:0 auto;padding:30px 34px 34px}.usage-hero{text-align:center;padding:4px 0 26px}.usage-emblem{width:68px;height:68px;margin:0 auto 12px;display:grid;place-items:center;border-radius:22px;background:linear-gradient(145deg,var(--accent),var(--accent-bright));box-shadow:0 14px 36px var(--accent-soft);color:white;font:750 22px/1 var(--instrument-font);letter-spacing:-.06em}.usage-layout h1{font-size:26px;margin:0}.usage-hero p{margin-top:5px;color:var(--muted)}.usage-summary{display:grid;grid-template-columns:1.35fr repeat(4,1fr);margin-bottom:28px;border:1px solid var(--line);border-radius:16px;background:rgba(255,255,255,.08);overflow:hidden}.usage-stat{min-width:0;padding:17px 14px;text-align:center}.usage-stat+.usage-stat{border-left:1px solid var(--line)}.usage-stat strong{display:block;font:650 20px/1.2 var(--instrument-font);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.usage-stat span{display:block;margin-top:5px;color:var(--muted);font-size:12px}.usage-section{padding-top:4px}.usage-section-head{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin-bottom:16px}.usage-section-head h2{font-size:16px}.usage-permanent{padding:5px 9px;border:1px solid var(--line);border-radius:999px;color:var(--success);font:650 10px/1 var(--instrument-font);letter-spacing:.05em}.usage-heatmap-scroll{overflow-x:auto;padding:4px 2px 12px}.usage-heatmap{display:grid;grid-template-rows:repeat(7,12px);grid-auto-flow:column;grid-auto-columns:12px;gap:4px;width:max-content;min-width:100%}.usage-heatmap i{display:block;width:12px;height:12px;border-radius:3px;background:var(--surface-soft);box-shadow:inset 0 0 0 1px var(--line)}.usage-heatmap i[data-level=\"1\"]{background:rgba(84,120,149,.24)}.usage-heatmap i[data-level=\"2\"]{background:rgba(84,120,149,.44)}.usage-heatmap i[data-level=\"3\"]{background:rgba(84,120,149,.68)}.usage-heatmap i[data-level=\"4\"]{background:var(--accent);box-shadow:0 0 10px var(--accent-soft)}.usage-heatmap-legend{display:flex;align-items:center;justify-content:flex-end;gap:5px;color:var(--muted);font-size:10px}.usage-heatmap-legend i{width:10px;height:10px;border-radius:2px;background:var(--surface-soft);box-shadow:inset 0 0 0 1px var(--line)}.usage-heatmap-legend i:nth-of-type(2){background:rgba(84,120,149,.24)}.usage-heatmap-legend i:nth-of-type(3){background:rgba(84,120,149,.44)}.usage-heatmap-legend i:nth-of-type(4){background:rgba(84,120,149,.68)}.usage-heatmap-legend i:nth-of-type(5){background:var(--accent)}.usage-insights{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:30px}.usage-insight{padding:20px;border-top:1px solid var(--line)}.usage-insight h2{font-size:15px;margin-bottom:16px}.usage-facts{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:11px 18px}.usage-facts dt{color:var(--muted)}.usage-facts dd{font-family:var(--instrument-font);text-align:right}.usage-composition{height:10px;margin:4px 0 16px;border-radius:999px;overflow:hidden;background:var(--line);display:flex}.usage-composition span:first-child{background:var(--accent)}.usage-composition span:last-child{background:var(--success)}"
-".call-table-wrap{overflow-x:auto;overflow-y:auto;max-height:258px}.monitor-table{width:100%;min-width:700px;border-collapse:collapse;font-size:12px;line-height:1.35}.monitor-table thead tr,.monitor-table tbody tr{display:grid;grid-template-columns:minmax(62px,.65fr) minmax(110px,1.25fr) minmax(110px,1.05fr) minmax(70px,.75fr) 70px 64px;column-gap:10px;align-items:center;padding:0 10px}.monitor-table thead tr{min-height:28px;border-bottom:1px solid var(--line)}.monitor-table thead th:nth-child(7),.monitor-table tbody td:nth-child(7){display:none}.monitor-table tbody tr{min-height:45px;border-bottom:1px solid var(--line);transition:padding-left var(--motion-fast) ease,background-color var(--motion-fast) ease,box-shadow var(--motion-fast) ease}.monitor-table th{font-size:10px;letter-spacing:.06em;color:var(--muted);text-align:left;white-space:nowrap}.monitor-table td{font-family:var(--instrument-font);white-space:nowrap;padding:0;overflow:hidden;text-overflow:ellipsis}.monitor-table tr[aria-selected=true]{background:linear-gradient(90deg,var(--selected),transparent);box-shadow:inset 2px 0 0 var(--accent);padding-left:14px}.request-select{padding:0 10px;font-family:var(--instrument-font)}"
-".result{font-weight:600}.result[data-status=active]{color:var(--success)}.result[data-status=failed]{color:var(--danger)}@media(hover:hover) and (pointer:fine){.mode-switch button:hover,.theme-switch button:hover,.call-filters input:hover,.call-filters select:hover{transform:translateY(-1px);border-color:var(--edge);box-shadow:0 6px 16px var(--shadow-soft)}.monitor-table tbody tr:not([aria-selected=true]):hover{background:linear-gradient(90deg,var(--selected),transparent);box-shadow:inset 2px 0 0 var(--accent);padding-left:12px}}"
-".monitor-host{padding:14px 18px}.host-ruler{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.host-ruler>div{min-width:0}.host-ruler strong{display:block;font-size:14px;margin-top:4px}"
-".runtime-inspector{border-top:1px solid var(--line);padding:8px 18px 16px}.runtime-inspector>h2{font-size:14px;margin:8px 0 4px}.inspector-module{padding:12px 0}.inspector-module+.inspector-module{border-top:1px solid var(--line)}.inspector-module-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px}.inspector-module h3{font:600 10px/1 var(--instrument-font);letter-spacing:.1em;color:var(--muted)}.inspector-module strong{font:650 13px/1.2 var(--instrument-font)}.inspector-module p{margin-top:5px;font:10px/1.45 var(--instrument-font);color:var(--muted)}.inspector-progress{height:2px;background:var(--line);margin-top:10px;overflow:hidden}.inspector-progress span{display:block;width:0;height:100%;background:linear-gradient(90deg,var(--accent),transparent);box-shadow:0 0 10px var(--accent-soft)}.expert-signal{display:grid;grid-template-columns:repeat(8,1fr);gap:4px;margin-top:10px}.expert-signal i{height:2px;background:var(--line)}.expert-signal i:nth-child(3n){background:var(--accent-soft)}"
-".management-grid{display:grid;grid-template-columns:minmax(0,8fr) minmax(360px,4fr);gap:18px 24px;align-items:start;margin-top:14px}.management-wall{display:grid;gap:14px;align-content:start;min-width:0}.management-summary,.management-section{padding:14px 18px;border:1px solid var(--edge);border-bottom-color:var(--line);border-radius:var(--radius);background:linear-gradient(145deg,var(--surface-strong),var(--surface));box-shadow:inset 0 1px 0 var(--edge-soft),0 14px 36px var(--shadow-soft)}"
-".summary-ruler{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.summary-ruler>div{min-width:0}.summary-ruler strong{display:block;font-size:20px;font-family:var(--instrument-font);white-space:nowrap;margin-top:4px}.recent-calls{width:100%;border-collapse:collapse;font-size:13px;line-height:1.35}.recent-calls th{padding:6px 10px;border-bottom:1px solid var(--line);font-size:11px;letter-spacing:.06em;color:var(--muted);text-align:left}.recent-calls td{padding:6px 10px;border-bottom:1px solid var(--line);font-family:var(--instrument-font)}"
-".management-console{display:block}.management-nav{border-bottom:1px solid var(--line);padding:6px 8px}.management-nav nav{display:flex;flex-wrap:wrap}.management-nav a{display:inline-flex;align-items:center;min-height:var(--control-height);padding:0 12px;text-decoration:none;font-size:13px;color:var(--muted)}.management-nav a:hover{color:var(--ink);background:var(--selected)}"
-".settings-grid{display:grid;grid-template-columns:1fr}.setting-block{padding:14px 18px;min-width:0}.setting-block+.setting-block{border-top:1px solid var(--line)}.setting-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:10px}.setting-head h2{font-size:15px}.effect{font-size:11px;color:var(--muted)}"
-".capacity-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:10px}.capacity-stats>div{min-width:0}.capacity-stats strong{display:block;font-size:16px;font-family:var(--instrument-font);margin-top:2px}.progress{height:4px;background:var(--line);margin:8px 0}.progress span{display:block;height:100%;width:0;background:var(--ink)}"
-".editor{display:grid;gap:8px}.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.unit-label{font-size:11px;color:var(--muted)}.target-state{font-family:var(--instrument-font)}.impact-review{border:1px solid var(--line);border-radius:12px;padding:12px;margin-top:8px}.impact-review dl{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;font-size:12px}.impact-review dd{font-family:var(--instrument-font)}.notice{font-size:12px;min-height:18px;color:var(--muted)}.notice.bad{color:var(--danger)}"
-"@media(min-width:981px) and (max-width:1307px){.topbar{grid-template-columns:1fr auto}.header-telemetry{grid-column:1/-1;grid-row:2;justify-content:flex-start}.monitor-grid{grid-template-columns:minmax(0,1fr) 340px}#monitorMetrics{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-areas:\"decode decode prefill\" \"phase cache context\" \"queue queue queue\"}.vital:nth-child(4):before{display:none}}"
-"@media(max-width:980px){.topbar{grid-template-columns:1fr auto}.header-telemetry{grid-column:1/-1;grid-row:2;justify-content:flex-start}.monitor-grid{grid-template-columns:minmax(0,1fr)}#monitorMetrics{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-areas:\"decode decode prefill\" \"phase cache context\" \"queue queue queue\"}.vital:nth-child(4):before{display:none}.management-grid{grid-template-columns:minmax(0,1fr)}.management-nav{display:none}.settings-grid{grid-template-columns:1fr 1fr}.setting-block+.setting-block{border-top:none;border-left:1px solid var(--line)}}"
-"@media(max-width:760px){.page{padding:14px 14px 36px}.topbar{grid-template-columns:1fr;gap:8px;align-items:start}.header-telemetry{grid-column:1;grid-row:auto;gap:14px;width:100%;overflow-x:auto;padding-bottom:4px}.header-controls{flex-wrap:wrap}.console-meta{align-items:flex-start;flex-direction:column;gap:4px}.theme-switch,.mode-switch{max-width:100%}#monitorMetrics{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:\"decode decode\" \"prefill phase\" \"cache context\" \"queue queue\";padding:8px}.vital{padding:10px 11px}.vital:nth-child(2n+1):before{display:none}.vital-decode strong{font-size:40px}.timeline-track{grid-template-columns:1fr 1fr;gap:12px 0}.timeline-stage:nth-child(odd){padding-right:12px}.timeline-stage:nth-child(even){padding-right:0}.call-filters{grid-template-columns:1fr 1fr}.host-ruler{grid-template-columns:1fr}.summary-ruler{grid-template-columns:1fr}.settings-grid{grid-template-columns:1fr}.setting-block+.setting-block{border-left:none;border-top:1px solid var(--line)}.inspector dl{grid-template-columns:auto minmax(0,1fr)}.glass-column,.instrument-panel{border-radius:15px}.monitor-table{min-width:650px}}"
-":root{--wall:#cfd3d4;--surface:rgba(239,241,241,.62);--surface-strong:rgba(250,251,250,.78);--surface-soft:rgba(218,222,223,.48);--ink:#151a20;--muted:#5f6870;--faint:#7b858d;--line:rgba(25,31,37,.13);--edge:rgba(255,255,255,.72);--edge-soft:rgba(255,255,255,.44);--accent:#477c97;--accent-bright:#8bc3da;--accent-soft:rgba(78,129,155,.16);--spectral:rgba(177,210,222,.22);--panel-shadow:rgba(38,46,52,.14);--panel-depth:rgba(38,46,52,.07);--body-font:\"Avenir Next\",\"Hiragino Sans GB\",\"PingFang SC\",\"Microsoft YaHei\",\"Helvetica Neue\",Arial,sans-serif}"
-":root[data-theme=dark]{--wall:#081018;--surface:rgba(15,24,33,.7);--surface-strong:rgba(25,36,47,.78);--surface-soft:rgba(8,16,24,.58);--ink:#e8eef2;--muted:#94a1ab;--faint:#667580;--line:rgba(207,224,234,.12);--edge:rgba(216,235,246,.13);--edge-soft:rgba(255,255,255,.07);--accent:#6aa9c5;--accent-bright:#a9dced;--accent-soft:rgba(80,151,183,.18);--spectral:rgba(94,164,194,.16);--panel-shadow:rgba(0,0,0,.42);--panel-depth:rgba(0,0,0,.25)}"
-"body{font-family:var(--body-font);background:radial-gradient(ellipse at 50% -20%,rgba(255,255,255,.72),transparent 48%),linear-gradient(132deg,#d9dcdd 0%,#cdd1d2 46%,#c2c7c9 100%)}:root[data-theme=dark] body{background:radial-gradient(ellipse at 46% -18%,rgba(58,99,125,.17),transparent 48%),linear-gradient(138deg,#111c27 0%,#09121a 48%,#060c12 100%)}"
-"body:before{content:\"\";position:fixed;inset:0;z-index:-3;pointer-events:none;opacity:.38;background-image:linear-gradient(rgba(255,255,255,.2) 1px,transparent 1px),linear-gradient(90deg,rgba(25,31,37,.035) 1px,transparent 1px);background-size:48px 48px;mask-image:linear-gradient(to bottom,black,transparent 82%)}:root[data-theme=dark] body:before{opacity:.22;background-image:linear-gradient(rgba(219,237,246,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(219,237,246,.035) 1px,transparent 1px)}"
-".light-field{left:12%;top:-390px;width:1180px;height:760px;opacity:.54;background:radial-gradient(ellipse at center,rgba(255,255,255,.82),rgba(227,238,241,.2) 42%,transparent 72%)}.light-shadow{right:-90px;bottom:-330px;width:920px;height:720px;opacity:.45;background:radial-gradient(ellipse at center,rgba(81,105,117,.16),transparent 68%)}:root[data-theme=dark] .light-field{opacity:.3;background:radial-gradient(ellipse at center,rgba(80,141,173,.3),rgba(32,72,95,.08) 42%,transparent 72%)}"
-".instrument-panel,.glass-column,.optical-panel{position:relative;isolation:isolate;background:linear-gradient(152deg,var(--surface-strong) 0%,var(--surface) 56%,rgba(214,220,222,.42) 100%);border:1px solid var(--edge);border-right-color:rgba(65,76,84,.11);border-bottom-color:rgba(45,55,63,.16);box-shadow:inset 0 1px 0 var(--edge-soft),inset 0 -1px 0 rgba(255,255,255,.16),0 22px 50px var(--panel-shadow),0 3px 10px var(--panel-depth);backdrop-filter:blur(30px) saturate(1.05);-webkit-backdrop-filter:blur(30px) saturate(1.05)}:root[data-theme=dark] .instrument-panel,:root[data-theme=dark] .glass-column,:root[data-theme=dark] .optical-panel{background:linear-gradient(148deg,rgba(30,43,55,.8),rgba(14,23,32,.74) 58%,rgba(7,14,21,.68));border-right-color:rgba(0,0,0,.22);border-bottom-color:rgba(0,0,0,.34);box-shadow:inset 0 1px 0 rgba(255,255,255,.08),inset 0 -1px 0 rgba(255,255,255,.025),0 26px 58px rgba(0,0,0,.4),0 4px 12px rgba(0,0,0,.25)}"
-".instrument-panel:before,.glass-column:before,.optical-panel:before{content:\"\";position:absolute;z-index:-1;pointer-events:none;inset:0;border-radius:inherit;background:linear-gradient(115deg,rgba(255,255,255,.16),transparent 28%,transparent 70%,var(--spectral));opacity:.68}.instrument-panel,.optical-panel{border-radius:14px}.glass-column{border-radius:20px}"
-".page{width:min(100%,1480px);padding:18px 28px 40px}.topbar{min-height:52px;padding:0 2px}.brand{font-size:19px}.brand-title small{font-size:9px}.header-stat{min-width:64px}.header-stat strong{font-size:14px;font-variant-numeric:tabular-nums}.header-controls{opacity:.9}.mode-switch,.theme-switch{border-radius:11px;background:rgba(255,255,255,.12);box-shadow:inset 0 1px 0 var(--edge-soft)}.mode-switch button,.theme-switch button{border-radius:8px}.activity-ribbon{height:8px;margin-top:5px}.console-meta{min-height:25px}"
-".monitor-layout{padding-top:8px}.monitor-heading{display:flex;align-items:end;justify-content:space-between;gap:20px;margin:0 2px 11px}.monitor-heading-copy{display:grid;gap:2px}.monitor-title{margin:0;font-size:17px;letter-spacing:-.02em}.monitor-heading .model{margin:0;font-size:11px}.monitor-request-state{display:flex;align-items:center;gap:8px;font:10px/1.2 var(--instrument-font);color:var(--muted)}.monitor-request-state:before{content:\"\";width:6px;height:6px;border-radius:50%;background:var(--success);box-shadow:0 0 10px rgba(64,160,112,.45)}"
-".monitor-grid{grid-template-columns:minmax(0,1fr) 344px;gap:16px;margin-top:0;align-items:stretch}.monitor-left{gap:14px;grid-template-rows:auto auto minmax(0,1fr) auto}.monitor-console{display:flex;flex-direction:column;min-height:676px;overflow:hidden;position:sticky;top:16px}.monitor-panel{padding:15px 17px}"
-"#monitorMetrics{display:grid;grid-template-columns:minmax(265px,1.36fr) minmax(190px,.95fr) repeat(2,minmax(120px,.7fr));grid-template-areas:\"decode phase prefill cache\" \"decode phase context queue\";min-height:154px;padding:0;overflow:hidden;border-radius:20px}.vital{justify-content:center;padding:16px 18px}.vital+.vital:before{top:18%;bottom:18%;background:linear-gradient(transparent,var(--line),transparent)}.vital-decode{background:linear-gradient(115deg,rgba(255,255,255,.16),transparent 62%)}:root[data-theme=dark] .vital-decode{background:linear-gradient(115deg,rgba(77,140,169,.1),transparent 66%)}.vital-decode strong{font-size:54px;line-height:.98;font-weight:620;letter-spacing:-.06em;text-shadow:0 1px 0 rgba(255,255,255,.35)}:root[data-theme=dark] .vital-decode strong{text-shadow:0 0 20px rgba(100,181,215,.1)}.vital-decode:after{content:\"TOKENS / SECOND\";font:9px/1 var(--instrument-font);letter-spacing:.13em;color:var(--faint);margin-top:9px}.vital-phase strong{font-size:20px;line-height:1.2;white-space:normal}.vital-prefill,.vital-cache,.vital-context,.vital-queue{padding-top:13px;padding-bottom:13px}.vital-prefill strong,.vital-cache strong,.vital-context strong,.vital-queue strong{font-size:16px}.metric-bar{height:2px;margin-top:10px;border-radius:2px}.metric-bar span{background:linear-gradient(90deg,var(--accent-bright),var(--accent),transparent);box-shadow:0 0 14px var(--accent-soft)}"
-".timeline-panel{min-height:182px;padding:15px 17px 16px;overflow:hidden}.timeline-panel .section-head{margin-bottom:7px}.timeline-axis{display:grid;grid-template-columns:repeat(5,1fr);margin:0 0 8px;padding-left:2px;font:8px/1 var(--instrument-font);letter-spacing:.06em;color:var(--faint)}.timeline-axis span:not(:first-child){text-align:right}.timeline-bed{position:relative;padding:10px 0 3px;background:repeating-linear-gradient(90deg,transparent 0,transparent calc(20% - 1px),var(--line) 20%);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.timeline-track{display:grid;grid-template-columns:.85fr 1fr 1.35fr 1fr 1.7fr .8fr;gap:7px;margin:0}.timeline-stage{position:relative;min-width:0;padding:0}.stage-name{display:flex;align-items:center;gap:6px;font-size:9px;letter-spacing:.08em}.stage-index{font-size:8px;color:var(--faint)}.stage-line{height:25px;margin-top:7px;border-radius:4px;overflow:visible;background:linear-gradient(180deg,rgba(255,255,255,.14),rgba(66,94,109,.035));border-top:1px solid var(--edge-soft);border-bottom:1px solid var(--line)}.stage-line:before{left:6px;right:6px;top:11px;background:var(--line)}.stage-line:after{left:3px;right:3px;top:3px;height:17px;border-radius:3px;background:linear-gradient(90deg,transparent,var(--accent-soft) 18%,rgba(105,169,196,.22) 58%,transparent);transform:none;opacity:.08}.stage-node{left:6px;top:8px;width:7px;height:7px;background:var(--surface-strong)}.stage-value{margin-top:7px;font-size:9px}.timeline-stage[data-state=done] .stage-line:after{opacity:.45;transform:none}.timeline-stage[data-state=active] .stage-line:after{opacity:.88;animation:timeline-flow 2.8s ease-in-out infinite}.timeline-stage[data-state=active] .stage-line{border-color:rgba(100,166,194,.3);box-shadow:inset 0 0 18px var(--accent-soft)}@keyframes timeline-flow{0%,100%{transform:translateX(-18%);opacity:.28}50%{transform:translateX(18%);opacity:.9}}.timeline-foot{display:flex;justify-content:space-between;gap:16px;margin-top:9px;font:9px/1.3 var(--instrument-font);color:var(--muted)}"
-".trace-panel{padding:14px 17px 12px;min-height:270px}.trace-toolbar{display:grid;grid-template-columns:auto minmax(0,1fr);gap:14px;align-items:end;margin-bottom:9px}.trace-toolbar .section-head{display:block;margin:0}.call-filters{grid-template-columns:1.1fr repeat(3,minmax(0,.75fr));margin:0}.filter-field{gap:3px}.filter-field .eyebrow{font-size:8px}.filter-field input,.filter-field select{min-height:44px;background:rgba(255,255,255,.1);border-radius:8px}.call-table-wrap{max-height:248px}.monitor-table{font-size:11px}.monitor-table tbody tr{min-height:44px}.monitor-table thead tr{min-height:25px}.monitor-table tr[aria-selected=true]{background:linear-gradient(90deg,var(--accent-soft),rgba(255,255,255,.03) 55%,transparent);box-shadow:inset 2px 0 0 var(--accent-bright)}.request-select{min-height:44px;border-radius:7px;background:rgba(255,255,255,.08)}"
-".monitor-host{padding:11px 17px}.monitor-host .section-head{margin-bottom:5px}.host-ruler strong{font-size:11px}.host-ruler .eyebrow{font-size:8px}"
-".inspector-rail-head{display:flex;align-items:center;justify-content:space-between;padding:16px 17px 12px;border-bottom:1px solid var(--line)}.inspector-rail-head h2{font-size:14px}.inspector-kicker{font:8px/1 var(--instrument-font);letter-spacing:.12em;color:var(--faint)}.inspector{padding:14px 17px 12px}.inspector>h2{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}.inspector-empty{min-height:170px;display:grid;place-items:center;text-align:center}.request-profile-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.request-identity{min-width:0}.request-identity span{display:block;font:8px/1 var(--instrument-font);letter-spacing:.11em;color:var(--muted)}.request-identity strong{display:block;margin-top:5px;font:650 17px/1.2 var(--instrument-font);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.request-status{flex:0 0 auto;padding:5px 7px;border:1px solid var(--line);border-radius:999px;font:700 8px/1 var(--instrument-font);letter-spacing:.08em}.request-status[data-status=active]{color:var(--success);border-color:rgba(64,154,108,.28)}.request-status[data-status=failed]{color:var(--danger);border-color:rgba(189,60,73,.28)}.request-viz{display:grid;grid-template-columns:96px minmax(0,1fr);gap:14px;align-items:center;margin-bottom:15px;padding:12px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.token-orbit{--cache-angle:0deg;width:88px;height:88px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(var(--accent) var(--cache-angle),var(--line) 0);box-shadow:inset 0 0 0 12px rgba(255,255,255,.22),0 0 24px var(--accent-soft)}:root[data-theme=dark] .token-orbit{box-shadow:inset 0 0 0 12px rgba(7,15,22,.9),0 0 26px var(--accent-soft)}.token-orbit-core{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;text-align:center;background:var(--surface-strong);border:1px solid var(--edge);font:650 12px/1.1 var(--instrument-font)}.token-orbit-core small{display:block;font-size:7px;font-weight:500;color:var(--muted);letter-spacing:.08em}.token-stack{display:grid;gap:8px}.token-stack div{display:flex;align-items:baseline;justify-content:space-between;gap:8px}.token-stack span{font:8px/1 var(--instrument-font);letter-spacing:.08em;color:var(--muted)}.token-stack strong{font:650 12px/1 var(--instrument-font)}.inspector-facts{display:grid!important;grid-template-columns:auto minmax(0,1fr)!important;gap:5px 10px!important;font-size:9px!important}.inspector-facts dt{color:var(--muted)}.inspector-facts dd{text-align:right;word-break:break-word!important}.inspector-error{grid-column:1/-1;margin-top:6px;padding-top:8px;border-top:1px solid var(--line);color:var(--danger)!important;text-align:left!important}"
-".runtime-inspector{margin-top:auto;border-top:1px solid var(--line);padding:8px 17px 14px}.runtime-inspector>h2{font-size:12px;margin:7px 0 3px}.inspector-module{padding:10px 0}.inspector-module-head h3{font-size:8px}.inspector-module strong{font-size:12px}.inspector-module p{font-size:8px;line-height:1.4}.runtime-scale{position:relative;height:18px;margin-top:8px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:repeating-linear-gradient(90deg,transparent 0,transparent calc(12.5% - 1px),var(--line) 12.5%);overflow:hidden}.runtime-scale span{display:block;height:100%;width:0;background:linear-gradient(90deg,rgba(82,138,164,.12),rgba(103,173,201,.32),rgba(103,173,201,.05));box-shadow:0 0 18px var(--accent-soft)}.expert-signal{height:30px;align-items:end;grid-template-columns:repeat(12,1fr);gap:3px}.expert-signal i{height:var(--h,20%);background:linear-gradient(to top,var(--accent-soft),rgba(121,182,207,.42));border-radius:1px 1px 0 0;opacity:.35;transition:opacity var(--motion-smooth) ease,transform var(--motion-smooth) ease}.inspector-module[data-active=true] .expert-signal i{opacity:.78}.expert-signal i:nth-child(3n){background:linear-gradient(to top,var(--accent-soft),var(--accent))}.memory-scale{position:relative}.memory-scale:after{content:\"RSS\";position:absolute;right:5px;top:5px;font:7px/1 var(--instrument-font);color:var(--muted)}"
-"@media(min-width:981px) and (max-width:1307px){.monitor-grid{grid-template-columns:minmax(0,1fr) 326px}#monitorMetrics{grid-template-columns:minmax(230px,1.2fr) repeat(3,minmax(110px,.8fr));grid-template-areas:\"decode phase prefill cache\" \"decode phase context queue\"}.trace-toolbar{grid-template-columns:1fr}.call-filters{grid-template-columns:repeat(4,minmax(0,1fr))}}"
-"@media(max-width:980px){.monitor-grid{grid-template-columns:1fr}.monitor-console{position:relative;top:auto;min-height:0}.monitor-left{grid-template-rows:auto}.trace-toolbar{grid-template-columns:1fr}#monitorMetrics{grid-template-columns:1.3fr 1fr 1fr;grid-template-areas:\"decode decode phase\" \"prefill cache context\" \"queue queue queue\"}.vital-decode{min-height:130px}.request-viz{grid-template-columns:88px minmax(0,1fr)}}"
-"@media(max-width:760px){body:before{background-size:32px 32px}.page{padding:12px 12px 28px}.monitor-heading{align-items:flex-start;flex-direction:column;gap:5px}.monitor-grid{gap:12px}#monitorMetrics{grid-template-columns:1fr 1fr;grid-template-areas:\"decode decode\" \"phase phase\" \"prefill cache\" \"context queue\";border-radius:15px}.vital{padding:13px}.vital-decode strong{font-size:46px}.timeline-panel{overflow-x:auto}.timeline-axis,.timeline-track,.timeline-foot{min-width:680px}.timeline-track{grid-template-columns:.85fr 1fr 1.35fr 1fr 1.7fr .8fr}.usage-shell{padding:22px 16px}.usage-summary{grid-template-columns:1fr 1fr}.usage-stat{padding:15px 9px}.usage-stat+.usage-stat{border-left:0;border-top:1px solid var(--line)}.usage-stat:first-child{grid-column:1/-1}.usage-stat:nth-child(even){border-right:1px solid var(--line)}.usage-insights{grid-template-columns:1fr;gap:8px}.usage-insight{padding:18px 2px}.trace-panel{padding:13px 12px}.call-filters{grid-template-columns:1fr 1fr}.glass-column{backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}.monitor-console{border-radius:15px}.request-viz{grid-template-columns:88px minmax(0,1fr)}.request-select{min-height:44px}#dashboard.is-active .activity-ribbon:after,.timeline-stage[data-state=active] .stage-line:after{animation:none}.monitor-host .section-head{display:block}.host-ruler{grid-template-columns:1fr 1fr}.host-ruler>div:last-child{grid-column:1/-1}.monitor-table{min-width:630px}}"
-"</style></head><body><div class=\"light-field\" aria-hidden=\"true\"></div><div class=\"light-shadow\" aria-hidden=\"true\"></div>"
-"<main class=\"page\" id=\"dashboard\" data-mode=\"monitor\">"
-"<header class=\"topbar\"><div class=\"brand\"><a href=\"#managementSummary\"><span class=\"status-glyph\" aria-hidden=\"true\"></span><span class=\"brand-title\"><span>DwarfStar</span><small>Inference Console</small></span></a></div>"
-"<div class=\"header-telemetry\" aria-label=\"实时推理状态\"><div class=\"live-badge\"><span class=\"status-dot\" aria-hidden=\"true\"></span>LIVE</div><div class=\"header-stat\"><span>TOK / S</span><strong id=\"topTokens\">—</strong></div><div class=\"header-stat\"><span>总 TOKEN</span><strong id=\"topTotalTokens\">—</strong></div><div class=\"header-stat\"><span>MTP ACCEPT</span><strong id=\"topMtp\" title=\"状态接口暂未提供 MTP 采纳率\">—</strong></div><div class=\"header-stat\"><span>UPTIME</span><strong id=\"topUptime\">—</strong></div></div>"
-"<div class=\"header-controls\"><nav class=\"mode-switch\" aria-label=\"Dashboard 模式\"><button type=\"button\" data-mode-choice=\"management\" aria-pressed=\"false\">管理</button><button type=\"button\" data-mode-choice=\"monitor\" aria-pressed=\"true\">监控</button><button type=\"button\" data-mode-choice=\"usage\" aria-pressed=\"false\">用量</button></nav><div class=\"theme-switch\" role=\"group\" aria-label=\"颜色主题\"><button type=\"button\" data-theme-choice=\"system\" aria-pressed=\"true\" title=\"跟随系统\">系统</button><button type=\"button\" data-theme-choice=\"dark\" aria-pressed=\"false\" title=\"深色主题\">深色</button><button type=\"button\" data-theme-choice=\"light\" aria-pressed=\"false\" title=\"浅灰主题\">浅灰</button></div></div></header>"
-"<div class=\"activity-ribbon\" aria-hidden=\"true\"></div><div class=\"console-meta\"><span id=\"model\" class=\"model mono\">正在读取状态</span><div id=\"connectionState\" class=\"state\"><span id=\"connectionPulse\" class=\"status-dot\" aria-hidden=\"true\"></span><strong id=\"health\" aria-label=\"健康\">等待中</strong><strong id=\"updatedAt\" aria-label=\"更新时间\">尚未更新</strong></div></div>"
-"<div id=\"managementLayout\" class=\"mode-layout management-layout\" hidden aria-hidden=\"true\"><h1 id=\"managementTitle\">运行与容量</h1>"
-"<div class=\"management-grid\"><div class=\"management-wall num-wall\">"
-"<section id=\"managementSummary\" class=\"management-summary\" aria-labelledby=\"managementTitle\"><div class=\"summary-ruler\">"
-"<div class=\"summary-cell\"><span class=\"eyebrow\">运行阶段</span><strong id=\"managementPhase\">连接中</strong><p id=\"managementQueue\" class=\"caption mono\">—</p></div>"
-"<div class=\"summary-cell\"><span class=\"eyebrow\">上下文余量</span><strong id=\"managementContext\">—</strong><p id=\"managementContextRatio\" class=\"caption mono\">—</p></div>"
-"<div class=\"summary-cell\"><span class=\"eyebrow\">KV 已用 / 上限</span><strong id=\"managementKv\">—</strong><p id=\"managementKvRatio\" class=\"caption mono\">—</p></div></div></section>"
-"<section id=\"managementRecent\" class=\"management-section\"><div class=\"section-head\"><h2>最近调用</h2><p id=\"managementCallsActive\" class=\"caption\">当前活动请求：—</p></div>"
-"<table class=\"recent-calls\"><thead><tr><th>请求</th><th>服务</th><th>API</th><th>结果</th><th>时长</th></tr></thead><tbody id=\"managementRecentCalls\"></tbody></table></section>"
-"<section id=\"managementHost\" class=\"management-section\"><div class=\"section-head\"><h2>主机资源</h2><p class=\"caption\">系统采样不可用时明确标注。</p></div>"
-"<div class=\"host-ruler\"><div><span class=\"eyebrow\">内存压力 / Swap</span><strong id=\"managementHostPressure\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">物理内存 已用 / 总量 / 可用</span><strong id=\"managementHostPhysical\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">DS4 RSS</span><strong id=\"managementHostRss\" class=\"mono\">不可用</strong></div></div></section></div>"
-"<aside class=\"glass-column management-console\"><aside class=\"management-nav\"><nav aria-label=\"管理章节\"><a href=\"#managementSummary\">运行概览</a><a href=\"#kvCapacity\">KV 容量</a><a href=\"#contextCapacity\">上下文窗口</a><a href=\"#managementRecent\">最近调用</a><a href=\"#managementHost\">主机资源</a></nav></aside>"
-"<div class=\"settings-grid\"><section id=\"kvCapacity\" class=\"setting-block\" tabindex=\"-1\">"
-"<div class=\"setting-head\"><h2>磁盘 KV 容量</h2><span id=\"kvEffect\" class=\"effect\">立即影响运行</span></div>"
-"<div class=\"capacity-stats\"><div><span class=\"eyebrow\">已用</span><strong id=\"kvUsed\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">容量上限</span><strong id=\"kvBudget\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">条目 / 利用率</span><strong id=\"kvEntries\" class=\"mono\">—</strong><small id=\"kvUtilization\" class=\"caption\">—</small></div></div>"
-"<div class=\"progress\" aria-hidden=\"true\"><span id=\"kvBar\"></span></div>"
-"<form class=\"editor\" id=\"kvForm\"><label class=\"eyebrow\" for=\"kvBudgetInput\">容量上限</label>"
-"<div class=\"controls\"><input id=\"kvBudgetInput\" inputmode=\"decimal\" type=\"number\" min=\"0.25\" step=\"0.25\" aria-describedby=\"budgetHelp kvTargetState adminNotice\" aria-invalid=\"false\" disabled><label class=\"unit-label\" for=\"kvBudgetUnit\">单位</label><select id=\"kvBudgetUnit\" aria-describedby=\"budgetHelp kvTargetState adminNotice\" aria-invalid=\"false\" disabled><option value=\"GB\">GB</option><option value=\"MB\">MB</option></select></div>"
-"<p id=\"budgetHelp\" class=\"caption\">最小 256 MB。立即应用会修改运行时状态；保存会写入下次启动上限。</p>"
-"<p id=\"kvTargetState\" class=\"caption target-state\" role=\"status\" aria-live=\"polite\">等待当前运行时容量</p>"
-"<div class=\"controls\"><button id=\"kvApplyNow\" class=\"primary\" type=\"button\" disabled>立即应用</button><button id=\"kvSaveRestart\" type=\"button\" disabled>保存供重启后使用</button></div>"
-"<section id=\"kvReview\" class=\"impact-review\" hidden tabindex=\"-1\" aria-labelledby=\"kvReviewTitle\"><h3 id=\"kvReviewTitle\">审阅运行时影响</h3><dl id=\"kvReviewFacts\"></dl>"
-"<div class=\"controls\"><button id=\"kvConfirmApply\" class=\"primary\" type=\"button\" disabled>确认立即应用</button><button id=\"kvCancelApply\" type=\"button\" disabled>取消</button></div></section>"
-"<div id=\"adminNotice\" class=\"notice\" role=\"status\" aria-live=\"polite\"></div></form></section>"
-"<section id=\"contextCapacity\" class=\"setting-block\">"
-"<div class=\"setting-head\"><h2>上下文窗口</h2><span id=\"contextEffect\" class=\"effect\">重启后生效</span></div>"
-"<div class=\"capacity-stats\"><div><span class=\"eyebrow\">当前 / 上限</span><strong id=\"contextCurrent\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">剩余</span><strong id=\"contextRemaining\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">利用率</span><strong id=\"contextUtilization\" class=\"mono\">—</strong></div></div>"
-"<form class=\"editor\" id=\"contextForm\"><label class=\"eyebrow\" for=\"contextNextInput\">下次启动窗口（token）</label>"
-"<div class=\"controls\"><input id=\"contextNextInput\" type=\"number\" inputmode=\"numeric\" min=\"4096\" step=\"1\" aria-describedby=\"contextEffect contextNotice\" aria-invalid=\"false\" disabled><button id=\"contextSaveRestart\" class=\"primary\" type=\"button\" disabled>保存下次启动设置</button></div>"
-"<div id=\"contextNotice\" class=\"notice\" role=\"status\" aria-live=\"polite\"></div></form></section></div></aside></div></div>"
-"<section id=\"monitorLayout\" class=\"mode-layout monitor-layout\" aria-hidden=\"false\" aria-labelledby=\"monitorTitle\">"
-"<div class=\"monitor-heading\"><div class=\"monitor-heading-copy\"><h1 id=\"monitorTitle\" class=\"monitor-title\">实时推理工作台</h1><p class=\"model\">生命周期信号、请求轨迹与运行时剖面</p></div><p id=\"monitorCallsActive\" class=\"monitor-request-state\">当前活动请求：—</p></div>"
-"<div class=\"monitor-grid\"><div class=\"monitor-left\">"
-"<section id=\"monitorMetrics\" class=\"num-wall metrics-deck optical-panel\" aria-label=\"实时体征\">"
-"<div class=\"vital vital-phase\"><span class=\"eyebrow\">CURRENT PHASE</span><strong id=\"monitorPhase\" class=\"mono\">—</strong><span id=\"monitorPhaseMeta\" class=\"metric-phase-meta\">服务 · —</span></div>"
-"<div class=\"vital vital-prefill\"><span class=\"eyebrow\">PREFILL</span><strong id=\"monitorPrefill\" class=\"mono metric-value\" data-motion-direction=\"none\"><span class=\"metric-value-window\"><span class=\"metric-value-layer\">—</span></span></strong><span id=\"monitorPrefillMeta\" class=\"metric-subvalue\">—</span><div class=\"metric-bar\" aria-hidden=\"true\"><span id=\"monitorPrefillBar\"></span></div></div>"
-"<div class=\"vital vital-decode\"><span class=\"eyebrow\">LIVE DECODE</span><strong id=\"monitorDecode\" class=\"mono metric-value\" data-motion-direction=\"none\"><span class=\"metric-value-window\"><span class=\"metric-value-layer\">—</span></span></strong><span id=\"monitorDecodeMeta\" class=\"metric-subvalue\">—</span><div class=\"metric-bar\" aria-hidden=\"true\"><span id=\"monitorDecodeBar\"></span></div></div>"
-"<div class=\"vital vital-cache\"><span class=\"eyebrow\">REQUEST KV HIT</span><strong id=\"monitorCacheHit\" class=\"mono metric-value\" data-motion-direction=\"none\"><span class=\"metric-value-window\"><span class=\"metric-value-layer\">—</span></span></strong></div>"
-"<div class=\"vital vital-context\"><span class=\"eyebrow\">CONTEXT LOAD</span><strong id=\"monitorContext\" class=\"mono metric-value\" data-motion-direction=\"none\"><span class=\"metric-value-window\"><span class=\"metric-value-layer\">—</span></span></strong></div>"
-"<div class=\"vital vital-queue\"><span class=\"eyebrow\">QUEUE / CLIENTS</span><strong id=\"monitorQueue\" class=\"mono metric-value\" data-motion-direction=\"none\"><span class=\"metric-value-window\"><span class=\"metric-value-layer\">—</span></span></strong></div></section>"
-"<section id=\"inferenceTimeline\" class=\"timeline-panel optical-panel\" aria-labelledby=\"timelineTitle\"><div class=\"section-head\"><h2 id=\"timelineTitle\">Inference Timeline</h2><p id=\"timelineSummary\" class=\"caption\">等待实时请求</p></div>"
-"<div class=\"timeline-axis\" aria-hidden=\"true\"><span>0 ms</span><span>25%</span><span>50%</span><span>75%</span><span>NOW</span></div><div class=\"timeline-bed\"><div class=\"timeline-track\">"
-"<div class=\"timeline-stage\" data-timeline-stage=\"prompt\" data-state=\"idle\"><span class=\"stage-name\"><b class=\"stage-index\">01</b>PROMPT</span><div class=\"stage-line\"><i class=\"stage-node\"></i></div><span id=\"timelinePrompt\" class=\"stage-value\">—</span></div>"
-"<div class=\"timeline-stage\" data-timeline-stage=\"kv\" data-state=\"idle\"><span class=\"stage-name\"><b class=\"stage-index\">02</b>KV LOOKUP</span><div class=\"stage-line\"><i class=\"stage-node\"></i></div><span id=\"timelineKv\" class=\"stage-value\">—</span></div>"
-"<div class=\"timeline-stage\" data-timeline-stage=\"prefill\" data-state=\"idle\"><span class=\"stage-name\"><b class=\"stage-index\">03</b>PREFILL</span><div class=\"stage-line\"><i class=\"stage-node\"></i></div><span id=\"timelinePrefill\" class=\"stage-value\">—</span></div>"
-"<div class=\"timeline-stage\" data-timeline-stage=\"expert\" data-state=\"idle\"><span class=\"stage-name\"><b class=\"stage-index\">04</b>ROUTING</span><div class=\"stage-line\"><i class=\"stage-node\"></i></div><span id=\"timelineExpert\" class=\"stage-value\">遥测未提供</span></div>"
-"<div class=\"timeline-stage\" data-timeline-stage=\"decode\" data-state=\"idle\"><span class=\"stage-name\"><b class=\"stage-index\">05</b>DECODE</span><div class=\"stage-line\"><i class=\"stage-node\"></i></div><span id=\"timelineDecode\" class=\"stage-value\">—</span></div>"
-"<div class=\"timeline-stage\" data-timeline-stage=\"response\" data-state=\"idle\"><span class=\"stage-name\"><b class=\"stage-index\">06</b>RESPONSE</span><div class=\"stage-line\"><i class=\"stage-node\"></i></div><span id=\"timelineResponse\" class=\"stage-value\">—</span></div></div>"
-"<div class=\"timeline-foot\"><span id=\"timelineFootPrompt\">输入 —</span><span id=\"timelineFootOutput\">输出 —</span><span id=\"timelineFootElapsed\">总耗时 —</span></div></div></section>"
-"<section class=\"monitor-panel trace-panel optical-panel\" aria-labelledby=\"monitorCallsTitle\"><div class=\"trace-toolbar\"><div class=\"section-head\"><h2 id=\"monitorCallsTitle\">Request Trace</h2></div>"
-"<div class=\"call-filters\"><input id=\"callFilterCaller\" data-call-filter=\"caller\" aria-label=\"按调用方筛选\" placeholder=\"调用方\"><select id=\"callFilterClient\" data-call-filter=\"client\" aria-label=\"按服务筛选\"><option value=\"\">全部服务</option></select><select id=\"callFilterApi\" data-call-filter=\"api\" aria-label=\"按 API 筛选\"><option value=\"\">全部 API</option></select><select id=\"callFilterStatus\" data-call-filter=\"result\" aria-label=\"按结果筛选\"><option value=\"\">全部结果</option><option value=\"active\">进行中</option><option value=\"completed\">完成</option><option value=\"failed\">失败</option><option value=\"cancelled\">已取消</option></select></div></div>"
-"<div class=\"monitor-table-wrap call-table-wrap\"><table class=\"monitor-table\"><thead><tr><th>请求</th><th>服务</th><th>调用方</th><th>API</th><th>结果</th><th>时长</th><th>错误</th></tr></thead><tbody id=\"monitorCalls\"></tbody></table></div></section>"
-"<section id=\"monitorHost\" class=\"monitor-host host-rail optical-panel\" aria-labelledby=\"monitorHostTitle\"><div class=\"section-head\"><h2 id=\"monitorHostTitle\">Host Signal</h2><p class=\"caption\">来自当前系统采样</p></div>"
-"<div class=\"host-ruler\"><div><span class=\"eyebrow\">PRESSURE / SWAP</span><strong id=\"monitorHostPressure\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">PHYSICAL MEMORY</span><strong id=\"monitorHostPhysical\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">DS4 RSS</span><strong id=\"monitorHostRss\" class=\"mono\">不可用</strong></div></div></section></div>"
-"<aside class=\"glass-column monitor-console\" aria-label=\"请求与运行时检查器\"><header class=\"inspector-rail-head\"><div><span class=\"inspector-kicker\">ANALYSIS RAIL</span><h2>Inspector</h2></div><span class=\"inspector-kicker\">LIVE CONTEXT</span></header>"
-"<aside id=\"requestInspector\" class=\"monitor-panel inspector\" tabindex=\"-1\" aria-labelledby=\"requestInspectorTitle\"><h2 id=\"requestInspectorTitle\">Request Inspector</h2><div id=\"requestInspectorContent\"><p class=\"caption inspector-empty\">从 Request Trace 选择请求以查看剖面</p></div></aside>"
-"<section class=\"runtime-inspector\" aria-labelledby=\"runtimeInspectorTitle\"><h2 id=\"runtimeInspectorTitle\">Runtime Fabric</h2>"
-"<div class=\"inspector-module\"><div class=\"inspector-module-head\"><h3>KV CACHE</h3><strong id=\"inspectorKvUsage\">—</strong></div><p id=\"inspectorKvMeta\">等待容量数据</p><div class=\"runtime-scale\" aria-hidden=\"true\"><span id=\"inspectorKvBar\"></span></div></div>"
-"<div id=\"inspectorExpertModule\" class=\"inspector-module\" data-active=\"false\"><div class=\"inspector-module-head\"><h3>EXPERT ROUTING</h3><strong id=\"inspectorExpertValue\">—</strong></div><p id=\"inspectorExpertMeta\">状态接口未提供 MoE 路由遥测</p><div class=\"expert-signal\" aria-hidden=\"true\"><i style=\"--h:24%\"></i><i style=\"--h:48%\"></i><i style=\"--h:32%\"></i><i style=\"--h:72%\"></i><i style=\"--h:43%\"></i><i style=\"--h:88%\"></i><i style=\"--h:54%\"></i><i style=\"--h:68%\"></i><i style=\"--h:38%\"></i><i style=\"--h:80%\"></i><i style=\"--h:46%\"></i><i style=\"--h:62%\"></i></div></div>"
-"<div class=\"inspector-module\"><div class=\"inspector-module-head\"><h3>MEMORY PRESSURE</h3><strong id=\"inspectorMemoryUsage\">—</strong></div><p id=\"inspectorMemoryMeta\">等待主机采样</p><div class=\"runtime-scale memory-scale\" aria-hidden=\"true\"><span id=\"inspectorMemoryBar\"></span></div></div></section></aside></div></section>"
-"<section id=\"usageLayout\" class=\"mode-layout usage-layout\" hidden aria-hidden=\"true\" aria-labelledby=\"usageTitle\"><div class=\"glass-column usage-shell\">"
-"<header class=\"usage-hero\"><div class=\"usage-emblem\" aria-hidden=\"true\">DS4</div><h1 id=\"usageTitle\">Token 用量</h1><p id=\"usageSince\">正在读取永久历史</p></header>"
-"<section class=\"usage-summary\" aria-label=\"永久用量摘要\"><div class=\"usage-stat\"><strong id=\"usageTotal\">—</strong><span>累计 Token 数</span></div><div class=\"usage-stat\"><strong id=\"usagePeak\">—</strong><span>单日峰值</span></div><div class=\"usage-stat\"><strong id=\"usageRequests\">—</strong><span>请求总数</span></div><div class=\"usage-stat\"><strong id=\"usageCurrentStreak\">—</strong><span>当前连续</span></div><div class=\"usage-stat\"><strong id=\"usageLongestStreak\">—</strong><span>最长连续</span></div></section>"
-"<section class=\"usage-section\" aria-labelledby=\"usageActivityTitle\"><div class=\"usage-section-head\"><div><h2 id=\"usageActivityTitle\">Token 活动</h2><p class=\"caption\">最近 53 周 · 按 UTC 日聚合</p></div><span class=\"usage-permanent\">永久累计</span></div>"
-"<div class=\"usage-heatmap-scroll\"><div id=\"usageHeatmap\" class=\"usage-heatmap\" role=\"img\" aria-label=\"Token 活动热力图\"></div></div><div class=\"usage-heatmap-legend\" aria-hidden=\"true\"><span>少</span><i></i><i></i><i></i><i></i><i></i><span>多</span></div></section>"
-"<div class=\"usage-insights\"><section class=\"usage-insight\"><h2>Token 构成</h2><div class=\"usage-composition\" aria-hidden=\"true\"><span id=\"usagePromptBar\"></span><span id=\"usageOutputBar\"></span></div><dl class=\"usage-facts\"><dt>输入 Token</dt><dd id=\"usagePrompt\">—</dd><dt>输出 Token</dt><dd id=\"usageOutput\">—</dd><dt>输出占比</dt><dd id=\"usageOutputShare\">—</dd></dl></section>"
-"<section class=\"usage-insight\"><h2>活动洞察</h2><dl class=\"usage-facts\"><dt>活跃天数</dt><dd id=\"usageActiveDays\">—</dd><dt>活跃日均 Token</dt><dd id=\"usageDailyAverage\">—</dd><dt>记录方式</dt><dd id=\"usagePersistence\">—</dd><dt>可视窗口</dt><dd>最近 371 天</dd></dl></section></div></div></section>"
-"</main><script>"
-"const $=id=>document.getElementById(id),dash=$('dashboard');let lastSnapshot=null,lastUpdatedAt=0,online=false,adminLocal=true,kvEnabled=false,currentKvBudgetBytes=null,kvState='idle',kvReview=null,kvTrigger=null,pollGeneration=0,pollFailures=0,contextLocal=true,contextBusy=false,kvTargetTouched=false,contextTargetTouched=false,selectedRequestId=null;"
-"const finite=n=>typeof n==='number'&&Number.isFinite(n),nonnegative=n=>finite(n)&&n>=0,num=n=>finite(n)?n:0,ratio=(n,d)=>num(d)>0?num(n)/num(d):null,pct=v=>v==null?'—':(v*100).toFixed(1)+'%',activeId=value=>{const id=value==null?'':String(value);return id&&id!=='0'?id:null};"
-"const bytes=n=>{n=num(n);if(n>=1073741824)return (n/1073741824).toFixed(1)+' GB';if(n>=1048576)return (n/1048576).toFixed(1)+' MB';if(n>=1024)return (n/1024).toFixed(1)+' KB';return Math.round(n)+' B'};"
-"const text=(id,v)=>{const node=$(id),next=String(v);if(node.textContent===next)return;node.textContent=next};"
-"function freshnessLabel(stale){if(!lastUpdatedAt)return '尚未更新';const seconds=Math.max(0,Math.floor((Date.now()-lastUpdatedAt)/1000)),age=seconds<1?'刚刚更新':seconds+' 秒前更新';return stale?'数据已过期 · '+age:age}"
-"let signalRevision=0;const reducedMotion=matchMedia('(prefers-reduced-motion: reduce)');function freshnessNodes(){return [$('connectionPulse'),$('updatedAt')].filter(Boolean)}function clearFreshness(){freshnessNodes().forEach(node=>node.getAnimations().forEach(animation=>animation.cancel()))}function motionAllowed(){return !dash.classList.contains('stale')&&!reducedMotion.matches}function cueFreshness(){if(!motionAllowed())return;const pulse=$('connectionPulse'),stamp=$('updatedAt');if(!pulse||!stamp)return;const revision=String(++signalRevision);pulse.dataset.signalRevision=revision;stamp.dataset.signalRevision=revision;pulse.getAnimations().forEach(animation=>animation.cancel());stamp.getAnimations().forEach(animation=>animation.cancel());pulse.animate([{boxShadow:'0 0 0 0 rgba(27,30,36,.18)'},{boxShadow:'0 0 0 10px rgba(27,30,36,0)',offset:.7},{boxShadow:'0 0 0 10px rgba(27,30,36,0)'}],{duration:620,easing:'cubic-bezier(.22,.8,.24,1)'});stamp.animate([{opacity:.55,transform:'translateY(1px)'},{opacity:1,transform:'none'}],{duration:420,easing:'ease-out'})}const stopReducedSignal=()=>{if(reducedMotion.matches)clearFreshness()};if(reducedMotion.addEventListener)reducedMotion.addEventListener('change',stopReducedSignal);else if(reducedMotion.addListener)reducedMotion.addListener(stopReducedSignal);"
-"function validateSnapshot(s){const object=(value,name)=>{if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('invalid '+name);return value},number=(value,name)=>{if(!nonnegative(value))throw new Error('invalid '+name)},string=(value,name)=>{if(typeof value!=='string')throw new Error('invalid '+name)};object(s,'snapshot');if(typeof s.active!=='boolean')throw new Error('invalid active');string(s.phase,'phase');number(s.queue_depth,'queue_depth');number(s.clients,'clients');const model=object(s.model,'model');string(model.name,'model.name');string(model.backend,'model.backend');number(model.context_length,'model.context_length');const kv=object(s.kv_cache,'kv_cache');if(typeof kv.enabled!=='boolean')throw new Error('invalid kv_cache.enabled');if(kv.enabled){number(kv.used_bytes,'kv_cache.used_bytes');number(kv.budget_bytes,'kv_cache.budget_bytes');number(kv.entries,'kv_cache.entries')}const context=object(s.context,'context');for(const field of ['current_tokens','limit_tokens','next_limit_tokens','remaining'])number(context[field],'context.'+field);if(!finite(context.utilization)||context.utilization<0||context.utilization>1)throw new Error('invalid context.utilization');const request=object(s.request,'request'),prefill=object(s.prefill,'prefill'),decode=object(s.decode,'decode'),calls=object(s.calls,'calls'),usage=object(s.token_usage,'token_usage');if(typeof usage.persistent!=='boolean'||usage.retention!=='unlimited')throw new Error('invalid token_usage persistence');for(const field of ['window_days','prompt_tokens','output_tokens','total_tokens','requests','active_days','peak_tokens','peak_day_start','current_streak','longest_streak','first_day_start','last_day_start'])number(usage[field],'token_usage.'+field);if(!Array.isArray(usage.days)||!usage.days.every(day=>day&&typeof day==='object'&&!Array.isArray(day)&&['day_start','prompt_tokens','output_tokens','total_tokens','requests'].every(field=>nonnegative(day[field]))))throw new Error('invalid token_usage.days');if(s.active){for(const field of ['prompt_tokens','cached_tokens','elapsed_sec'])number(request[field],'request.'+field);if(['prefill','decode'].includes(s.phase))for(const field of ['current','total','avg_tps'])number(prefill[field],'prefill.'+field);if(s.phase==='decode')for(const field of ['generated','max_tokens','avg_tps'])number(decode[field],'decode.'+field)}if(!Array.isArray(calls.records)||!calls.records.every(record=>record&&typeof record==='object'&&!Array.isArray(record)))throw new Error('invalid calls.records')}"
-"function setKvState(state){kvState=state;dash.dataset.kvState=state;const reviewing=state==='review';$('kvReview').hidden=!reviewing;const available=online&&adminLocal&&kvEnabled,locked=['checking','review','applying','saving'].includes(state)||!available;for(const id of ['kvBudgetInput','kvBudgetUnit','kvApplyNow','kvSaveRestart'])$(id).disabled=locked;$('kvConfirmApply').disabled=!reviewing||!available;$('kvCancelApply').disabled=!reviewing}"
-"function contextControls(){const disabled=contextBusy||!online||!contextLocal;$('contextNextInput').disabled=disabled;$('contextSaveRestart').disabled=disabled}"
-"function setKvInvalid(value){for(const id of ['kvBudgetInput','kvBudgetUnit'])$(id).setAttribute('aria-invalid',String(value))}"
-"function callStatus(value){return ({active:'进行中',completed:'完成',failed:'失败',cancelled:'已取消'})[value]||'未知'}"
-"function replaceOptions(id,values,label){const select=$(id),next=[''].concat(values),options=[...select.options],same=options.length===next.length&&options.every((option,i)=>option.value===next[i]&&option.textContent===(next[i]||label));if(same)return;const old=select.value;select.replaceChildren();for(const value of next){const option=document.createElement('option');option.value=value;option.textContent=value||label;select.append(option)}select.value=values.includes(old)?old:''}"
-"function inspectorFact(root,label,value){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value==null||value===''?'—':String(value);root.append(dt,dd)}"
-"function requestDuration(record,request,currentId,snapshotActive){const started=nonnegative(record.started_at)?Number(record.started_at):null,finished=nonnegative(record.finished_at)?Number(record.finished_at):null;if(record.status!=='active')return started!==null&&finished!==null&&finished>=started?(finished-started).toFixed(1)+'s':'—';if(snapshotActive&&currentId&&String(record.request_id)===currentId){if(nonnegative(request&&request.elapsed_sec))return Number(request.elapsed_sec).toFixed(1)+'s';const now=Date.now()/1000;if(started!==null&&started<=now)return (now-started).toFixed(1)+'s'}return '—'}"
-"function paintRequestInspector(record,request,currentId,snapshotActive){const root=$('requestInspectorContent');root.replaceChildren();if(!record){const empty=document.createElement('p');empty.className='caption inspector-empty';empty.textContent='从 Request Trace 选择请求以查看剖面';root.append(empty);return}const make=(tag,className,value)=>{const node=document.createElement(tag);if(className)node.className=className;if(value!=null)node.textContent=String(value);return node},cacheRatio=ratio(record.cached_tokens,record.prompt_tokens),cache=pct(cacheRatio),head=make('div','request-profile-head'),identity=make('div','request-identity'),idLabel=make('span','',`REQUEST #${record.request_id||'—'}`),service=make('strong','',record.client||'未标识服务'),status=make('span','request-status',callStatus(record.status));status.dataset.status=String(record.status||'unknown');identity.append(idLabel,service);head.append(identity,status);const viz=make('div','request-viz'),orbit=make('div','token-orbit'),core=make('div','token-orbit-core'),cacheValue=make('span','',cache),cacheLabel=make('small','','CACHE HIT');core.append(cacheValue,cacheLabel);orbit.style.setProperty('--cache-angle',Math.max(0,Math.min(360,(cacheRatio||0)*360))+'deg');orbit.append(core);const stack=make('div','token-stack'),tokenRows=[['PROMPT',num(record.prompt_tokens).toLocaleString()],['CACHED',num(record.cached_tokens).toLocaleString()],['OUTPUT',num(record.output_tokens).toLocaleString()]];for(const [label,value] of tokenRows){const row=make('div',''),name=make('span','',label),number=make('strong','',value);row.append(name,number);stack.append(row)}viz.append(orbit,stack);const facts=make('dl','inspector-facts'),values=[['调用方',record.caller],['API / 类型',(record.api||'—')+' / '+(record.kind||'—')],['传输',record.stream?'STREAM':'BUFFERED'],['工具调用',record.tools?'是':'否'],['持续时间',requestDuration(record,request,currentId,snapshotActive)],['写入缓存',num(record.cache_write_tokens).toLocaleString()+' token'],['缓存来源',record.cache_source],['结束原因',record.finish]];for(const pair of values)inspectorFact(facts,pair[0],pair[1]);if(record.error){inspectorFact(facts,'错误',record.error);const error=facts.lastElementChild;if(error)error.className='inspector-error'}root.append(head,viz,facts)}"
-"function selectRequest(id){selectedRequestId=String(id);const s=lastSnapshot||{};paintCalls(s.calls,s.request,s.active===true)}"
-"function paintCalls(calls,request,snapshotActive){calls=calls||{};const records=(calls.records||[]).slice(0,200),currentId=snapshotActive?activeId(calls.active_request_id):null;replaceOptions('callFilterClient',[...new Set(records.map(x=>x.client||''))].filter(Boolean),'全部服务');replaceOptions('callFilterApi',[...new Set(records.map(x=>x.api||''))].filter(Boolean),'全部 API');const caller=$('callFilterCaller').value.toLowerCase(),client=$('callFilterClient').value,api=$('callFilterApi').value,status=$('callFilterStatus').value,shown=records.filter(x=>(!caller||String(x.caller||'').toLowerCase().includes(caller))&&(!client||x.client===client)&&(!api||x.api===api)&&(!status||x.status===status)),focused=document.activeElement&&document.activeElement.classList.contains('request-select')?document.activeElement.closest('tr').dataset.requestId:null;if(!shown.some(x=>String(x.request_id)===selectedRequestId))selectedRequestId=null;const selected=records.find(x=>String(x.request_id)===selectedRequestId)||null,body=$('monitorCalls'),signature=JSON.stringify([caller,client,api,status,selectedRequestId,currentId,shown.map(x=>[x.request_id,x.client,x.caller,x.api,x.status,requestDuration(x,request,currentId,snapshotActive),x.error])]),inspector=$('requestInspector'),inspectorSignature=JSON.stringify(selected?[selected.request_id,selected.client,selected.caller,selected.api,selected.kind,selected.status,selected.stream,selected.tools,requestDuration(selected,request,currentId,snapshotActive),selected.prompt_tokens,selected.cached_tokens,selected.cache_write_tokens,selected.output_tokens,selected.cache_source,selected.finish,selected.error]:null);if(body.dataset.signature!==signature){body.dataset.signature=signature;body.replaceChildren();if(!shown.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=7;cell.textContent='暂无匹配调用';row.append(cell);body.append(row)}else for(const call of shown){const row=document.createElement('tr'),id=String(call.request_id||'');row.dataset.requestId=id;row.setAttribute('aria-selected',String(id===selectedRequestId));const first=document.createElement('td'),button=document.createElement('button');button.type='button';button.className='request-select';button.textContent=id||'—';button.setAttribute('aria-label','检查请求 '+(id||'未知'));button.setAttribute('aria-controls','requestInspector');button.addEventListener('click',()=>selectRequest(id));first.append(button);row.append(first);[call.client,call.caller,call.api,callStatus(call.status),requestDuration(call,request,currentId,snapshotActive),call.error].forEach((value,index)=>{const cell=document.createElement('td');if(index===3){cell.className='result';cell.dataset.status=String(call.status||'')}cell.textContent=value==null||value===''?'—':String(value);row.append(cell)});body.append(row)}if(focused){const next=[...body.querySelectorAll('.request-select')].find(button=>button.closest('tr').dataset.requestId===focused);if(next)next.focus()}}if(inspector.dataset.signature!==inspectorSignature){inspector.dataset.signature=inspectorSignature;paintRequestInspector(selected,request,currentId,snapshotActive)}const active='当前活动请求：'+(currentId||'—');text('managementCallsActive',active);text('monitorCallsActive',active)}"
-"function phaseLabel(value){return ({decode:'解码',prefill:'预填充',idle:'空闲'})[value]||'未知'}"
-"function paintRecentCalls(calls,request,snapshotActive){calls=calls||{};const root=$('managementRecentCalls'),records=(calls.records||[]).slice(0,3),currentId=snapshotActive?activeId(calls.active_request_id):null;root.replaceChildren();if(!records.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=5;cell.textContent='暂无调用记录';row.append(cell);root.append(row);return}for(const call of records){const row=document.createElement('tr');row.dataset.callId=String(call.request_id||'');[call.request_id,call.client,call.api,callStatus(call.status),requestDuration(call,request,currentId,snapshotActive)].forEach((value,index)=>{const cell=document.createElement('td');if(index===3){cell.className='result';cell.dataset.status=String(call.status||'')}cell.textContent=value==null||value===''?'—':String(value);row.append(cell)});root.append(row)}}"
-"function pressure(v){return v==='normal'?'正常':v==='warning'?'警告':v==='critical'?'严重':'不可用'}"
-"function paintHost(h){let physical='不可用',swap='不可用',rss='不可用';if(h&&h.available){const physicalValues=[h.memory_used_bytes,h.memory_total_bytes,h.memory_available_bytes],swapValues=[h.swap_used_bytes,h.swap_total_bytes];if(physicalValues.every(nonnegative))physical=physicalValues.map(bytes).join(' / ');if(pressure(h.memory_pressure)!=='不可用'&&swapValues.every(nonnegative))swap=pressure(h.memory_pressure)+' / '+swapValues.map(bytes).join(' / ');if(nonnegative(h.process_rss_bytes))rss=bytes(h.process_rss_bytes)}for(const prefix of ['management','monitor']){text(prefix+'HostPhysical',physical);text(prefix+'HostPressure',swap);text(prefix+'HostRss',rss)}}"
-"function duration(v){if(!nonnegative(v))return '—';const seconds=Math.floor(v),days=Math.floor(seconds/86400),hours=Math.floor(seconds%86400/3600),minutes=Math.floor(seconds%3600/60);return days?days+'d '+hours+'h':hours?hours+'h '+minutes+'m':minutes?minutes+'m':'<1m'}"
-"function timelineState(name,state){const node=document.querySelector('[data-timeline-stage=\"'+name+'\"]');if(node)node.dataset.state=state}"
-"function paintTimeline(s){const p=s.prefill||{},d=s.decode||{},r=s.request||{},calls=s.calls||{},currentId=s.active===true?activeId(calls.active_request_id):null,record=(calls.records||[]).find(call=>currentId&&String(call.request_id)===currentId),active=s.active===true&&!!record,prefilling=active&&s.phase==='prefill',decoding=active&&s.phase==='decode',elapsed=active&&nonnegative(r.elapsed_sec)?Number(r.elapsed_sec).toFixed(1)+'s':'—';text('timelineSummary',active?'#'+currentId+' / '+(record.client||'未标识服务'):'等待实时请求');text('timelinePrompt',active?num(r.prompt_tokens).toLocaleString()+' token':'—');text('timelineKv',active?pct(ratio(r.cached_tokens,r.prompt_tokens))+' hit':'—');text('timelinePrefill',active&&nonnegative(p.elapsed_sec)?Number(p.elapsed_sec).toFixed(1)+'s':'—');text('timelineExpert',decoding?'aggregate route':'逐专家不可用');text('timelineDecode',decoding&&nonnegative(d.elapsed_sec)?Number(d.elapsed_sec).toFixed(1)+'s':'—');text('timelineResponse',active?(r.stream?'stream':'buffered'):'—');text('timelineFootPrompt',active?'输入 '+num(r.prompt_tokens).toLocaleString()+' token':'输入 —');text('timelineFootOutput',active?'输出 '+num(d.generated).toLocaleString()+' token':'输出 —');text('timelineFootElapsed','总耗时 '+elapsed);timelineState('prompt',active?'done':'idle');timelineState('kv',active?'done':'idle');timelineState('prefill',prefilling?'active':decoding?'done':'idle');timelineState('expert',decoding?'active':'idle');timelineState('decode',decoding?'active':'idle');timelineState('response',decoding&&r.stream?'active':'idle')}"
-"function paintUsage(usage){usage=usage||{};const total=num(usage.total_tokens),prompt=num(usage.prompt_tokens),output=num(usage.output_tokens),activeDays=num(usage.active_days),formatDate=seconds=>seconds>0?new Date(seconds*1000).toLocaleDateString('zh-CN',{timeZone:'UTC'}):'尚无记录';text('topTotalTokens',total.toLocaleString());text('usageTotal',total.toLocaleString());text('usagePeak',num(usage.peak_tokens).toLocaleString());text('usageRequests',num(usage.requests).toLocaleString());text('usageCurrentStreak',num(usage.current_streak).toLocaleString()+' 天');text('usageLongestStreak',num(usage.longest_streak).toLocaleString()+' 天');text('usageSince','自 '+formatDate(num(usage.first_day_start))+' 起永久累计 · '+(usage.persistent?'本机持久化':'当前进程'));text('usagePrompt',prompt.toLocaleString());text('usageOutput',output.toLocaleString());text('usageOutputShare',total>0?pct(output/total):'—');text('usageActiveDays',activeDays.toLocaleString()+' 天');text('usageDailyAverage',activeDays>0?Math.round(total/activeDays).toLocaleString():'—');text('usagePersistence',usage.persistent?'本机永久持久化':'仅当前进程');const promptShare=total>0?prompt/total:0;$('usagePromptBar').style.width=Math.max(0,Math.min(100,promptShare*100))+'%';$('usageOutputBar').style.width=Math.max(0,Math.min(100,(1-promptShare)*100))+'%';const heatmap=$('usageHeatmap'),days=usage.days||[],anchor=num(usage.last_day_start)||Math.floor(Date.now()/86400000)*86400,start=anchor-370*86400,byDay=new Map(days.map(day=>[num(day.day_start),day])),windowDays=Array.from({length:371},(_,i)=>byDay.get(start+i*86400)||{day_start:start+i*86400,prompt_tokens:0,output_tokens:0,total_tokens:0,requests:0}),peak=Math.max(1,...windowDays.map(day=>num(day.total_tokens))),signature=JSON.stringify(windowDays.map(day=>[day.day_start,day.prompt_tokens,day.output_tokens,day.total_tokens,day.requests]));heatmap.setAttribute('aria-label','最近 53 周 Token 活动，永久累计 '+total.toLocaleString()+' token');if(heatmap.dataset.signature===signature)return;heatmap.dataset.signature=signature;heatmap.replaceChildren();for(const day of windowDays){const cell=document.createElement('i'),dayTotal=num(day.total_tokens),stamp=new Date(num(day.day_start)*1000),level=dayTotal>0?Math.max(1,Math.min(4,Math.ceil(dayTotal/peak*4))):0;cell.dataset.usageDay=String(day.day_start);cell.dataset.level=String(level);cell.title=stamp.toLocaleDateString('zh-CN',{timeZone:'UTC'})+' · 输入 '+num(day.prompt_tokens).toLocaleString()+' · 输出 '+num(day.output_tokens).toLocaleString()+' · 总计 '+dayTotal.toLocaleString();heatmap.append(cell)}}"
-"function paintRuntimeInspector(s){const k=s.kv_cache||{},h=s.host||{},ku=k.enabled?ratio(k.used_bytes,k.budget_bytes):null,mu=h.available?ratio(h.memory_used_bytes,h.memory_total_bytes):null,routing=s.active===true&&s.phase==='decode',expert=$('inspectorExpertModule');text('inspectorKvUsage',k.enabled?pct(ku):'OFF');text('inspectorKvMeta',k.enabled?bytes(k.used_bytes)+' hot / '+bytes(k.budget_bytes)+' budget · '+num(k.entries).toLocaleString()+' blocks':'磁盘 KV 未配置');$('inspectorKvBar').style.width=Math.max(0,Math.min(100,(ku||0)*100))+'%';text('inspectorExpertValue',routing?'ROUTING':'STANDBY');text('inspectorExpertMeta',routing?'聚合解码信号 · 逐专家占用暂不可用':'逐专家路由遥测暂不可用');if(expert)expert.dataset.active=String(routing);text('inspectorMemoryUsage',h.available?pct(mu):'—');text('inspectorMemoryMeta',h.available?pressure(h.memory_pressure)+' · '+bytes(h.memory_used_bytes)+' / '+bytes(h.memory_total_bytes)+' · RSS '+bytes(h.process_rss_bytes):'等待主机采样');$('inspectorMemoryBar').style.width=Math.max(0,Math.min(100,(mu||0)*100))+'%'}"
-"function paintManagement(s){const x=s.context||{},k=s.kv_cache||{};text('managementPhase',phaseLabel(s.phase));text('managementQueue','队列 '+num(s.queue_depth).toLocaleString()+' · 客户端 '+num(s.clients).toLocaleString());text('managementContext',num(x.remaining).toLocaleString()+' token 可用');text('managementContextRatio',pct(ratio(x.remaining,x.limit_tokens))+' 可用 · '+num(x.current_tokens).toLocaleString()+' / '+num(x.limit_tokens).toLocaleString());if(k.enabled){text('managementKv',bytes(k.used_bytes).replace(/ GB$/,'')+' / '+bytes(k.budget_bytes));text('managementKvRatio',pct(ratio(k.used_bytes,k.budget_bytes))+' 已使用')}else{text('managementKv','已禁用');text('managementKvRatio','未配置磁盘 KV 缓存')}paintRecentCalls(s.calls,s.request,s.active===true);paintHost(s.host)}"
-"const metricMotionValues=Object.create(null),metricMotionText=Object.create(null);function metricTruncation(node,windowNode){node.classList.remove('metric-value-truncated');const truncated=windowNode.scrollWidth>windowNode.clientWidth+1;node.classList.toggle('metric-value-truncated',truncated);if(truncated)node.title=windowNode.textContent;else node.removeAttribute('title')}function refreshMetricTruncation(){document.querySelectorAll('.metric-value-window').forEach(windowNode=>metricTruncation(windowNode.parentElement,windowNode))}function clearMetricMotion(){for(const id of Object.keys(metricMotionValues))delete metricMotionValues[id];for(const id of Object.keys(metricMotionText))delete metricMotionText[id];document.querySelectorAll('.metric-value').forEach(node=>{node.__metricMotionToken=(node.__metricMotionToken||0)+1;node.dataset.motionDirection='none';const windowNode=node.querySelector('.metric-value-window'),layers=windowNode?[...windowNode.querySelectorAll('.metric-value-layer')]:[];if(!windowNode)return;layers.forEach(layer=>layer.getAnimations().forEach(animation=>animation.cancel()));const stable=document.createElement('span');stable.className='metric-value-layer';stable.textContent=layers.length?layers[layers.length-1].textContent:'—';windowNode.replaceChildren(stable);metricTruncation(node,windowNode)})}const metricResizeRoot=$('monitorMetrics');if(metricResizeRoot){if(typeof ResizeObserver==='function')new ResizeObserver(refreshMetricTruncation).observe(metricResizeRoot);else window.addEventListener('resize',refreshMetricTruncation)}function metricText(id,value,raw){const node=$(id),windowNode=node&&node.querySelector('.metric-value-window'),next=String(value);if(!node||!windowNode)return;const numeric=finite(raw)?Number(raw):null,previous=metricMotionValues[id];const direction=numeric!=null&&previous!=null&&numeric!==previous?(numeric>previous?'increase':'decrease'):'none';node.dataset.motionDirection=direction;if(numeric==null)delete metricMotionValues[id];else metricMotionValues[id]=numeric;if(metricMotionText[id]===next)return;const incoming=document.createElement('span');incoming.className='metric-value-layer';incoming.textContent=next;const token=(node.__metricMotionToken||0)+1;node.__metricMotionToken=token;const finish=()=>{if(node.__metricMotionToken!==token)return;windowNode.replaceChildren(incoming);incoming.className='metric-value-layer';metricTruncation(node,windowNode)};if(direction==='none'||matchMedia('(prefers-reduced-motion: reduce)').matches){windowNode.replaceChildren(incoming);metricMotionText[id]=next;metricTruncation(node,windowNode);return}const outgoing=document.createElement('span');outgoing.className='metric-value-layer metric-value-layer-out-'+direction;outgoing.textContent=metricMotionText[id]||windowNode.textContent||'—';outgoing.setAttribute('aria-hidden','true');incoming.className='metric-value-layer metric-value-layer-in-'+direction;windowNode.replaceChildren(outgoing,incoming);incoming.addEventListener('animationend',finish,{once:true});setTimeout(finish,460);metricMotionText[id]=next}function paintMonitor(s){const p=s.prefill||{},d=s.decode||{},r=s.request||{},x=s.context||{},calls=s.calls||{},snapshotActive=s.active===true,currentId=snapshotActive?activeId(calls.active_request_id):null,active=(calls.records||[]).find(call=>currentId&&String(call.request_id)===currentId),current=!!active,phase=({decode:'解码中',prefill:'预填充中',idle:'空闲'})[s.phase]||'未知阶段';text('monitorPhase',phase+' · '+(snapshotActive?'运行中':'就绪')+' · '+(current&&active.client||'—'));const cacheRatio=ratio(r.cached_tokens,r.prompt_tokens),prefillDisplay=current&&['prefill','decode'].includes(s.phase)&&finite(p.avg_tps)?Number(p.avg_tps).toFixed(1)+' t/s':'不可用',decodeDisplay=current&&s.phase==='decode'&&finite(d.avg_tps)?Number(d.avg_tps).toFixed(1)+' t/s':'不可用',cacheDisplay=current&&cacheRatio!=null?pct(cacheRatio):'不可用',contextDisplay=finite(x.utilization)?pct(Number(x.utilization)):'不可用',queueDisplay=finite(s.queue_depth)&&finite(s.clients)?num(s.queue_depth).toLocaleString()+' / '+num(s.clients).toLocaleString():'不可用';metricText('monitorPrefill',prefillDisplay,current&&['prefill','decode'].includes(s.phase)&&finite(p.avg_tps)?p.avg_tps:null);metricText('monitorDecode',decodeDisplay,current&&s.phase==='decode'&&finite(d.avg_tps)?d.avg_tps:null);metricText('monitorCacheHit',cacheDisplay,current&&cacheRatio!=null?cacheRatio:null);metricText('monitorContext',contextDisplay,finite(x.utilization)?x.utilization:null);metricText('monitorQueue',queueDisplay,finite(s.queue_depth)&&finite(s.clients)?s.queue_depth:null);paintCalls(calls,r,snapshotActive)}"
-"function renderSnapshot(s){const m=s.model||{},k=s.kv_cache||{},x=s.context||{},d=s.decode||{},mtp=s.mtp||{},calls=s.calls||{},currentId=s.active===true?activeId(calls.active_request_id):null,tracked=(calls.records||[]).find(record=>currentId&&String(record.request_id)===currentId),live=s.active===true&&!!tracked;dash.classList.toggle('is-active',live);text('model',(m.name||'未知模型')+' / '+(m.backend||'未知后端')+' / '+num(m.context_length).toLocaleString()+' token 上下文');text('health',s.active?'运行中':'就绪');text('topTokens',live&&s.phase==='decode'&&finite(d.avg_tps)?Number(d.avg_tps).toFixed(1):'—');text('topMtp',finite(mtp.acceptance_rate)?pct(mtp.acceptance_rate):'—');text('topUptime',duration(s.uptime_sec));paintManagement(s);paintMonitor(s);paintTimeline(s);paintUsage(s.token_usage);paintRuntimeInspector(s);"
-"if(!k.enabled){text('kvUsed','已禁用');text('kvBudget','已禁用');text('kvEntries','—');text('kvUtilization','未配置磁盘 KV 缓存。');$('kvBar').style.width='0%'}else{const ku=ratio(k.used_bytes,k.budget_bytes);text('kvUsed',bytes(k.used_bytes));text('kvBudget',bytes(k.budget_bytes));text('kvEntries',num(k.entries).toLocaleString());text('kvUtilization',pct(ku)+' 已使用');$('kvBar').style.width=Math.max(0,Math.min(100,(ku||0)*100))+'%';if(!kvTargetTouched&&!$('kvForm').contains(document.activeElement)){$('kvBudgetInput').value=(num(k.budget_bytes)/1073741824).toFixed(2).replace(/\\.?0+$/,'');$('kvBudgetUnit').value='GB'}}text('contextCurrent',num(x.current_tokens).toLocaleString()+' / '+num(x.limit_tokens).toLocaleString());text('contextRemaining',num(x.remaining).toLocaleString());text('contextUtilization',pct(x.utilization));if(!contextTargetTouched&&!$('contextForm').contains(document.activeElement))$('contextNextInput').value=num(x.next_limit_tokens)||num(x.limit_tokens)||''}"
-"function paint(s){validateSnapshot(s);const previous=lastSnapshot;try{renderSnapshot(s)}catch(error){if(previous)renderSnapshot(previous);throw error}lastSnapshot=s;lastUpdatedAt=Date.now();online=true;kvEnabled=s.kv_cache.enabled===true;currentKvBudgetBytes=kvEnabled?s.kv_cache.budget_bytes:null;setStale(false);text('updatedAt',freshnessLabel(false));cueFreshness();updateKvTargetState();contextControls();setKvState(kvState)}"
-"function kvLocalError(message,code){const error=new Error(message);error.safe=true;error.code=code||'';return error}"
-"function budgetMB(){const value=Number($('kvBudgetInput').value),factor=$('kvBudgetUnit').value==='GB'?1024:1,mb=value*factor;if(!Number.isFinite(mb)||!Number.isInteger(mb)||mb<256)throw kvLocalError('请输入换算后为整数 MB 的容量（最小 256 MB）。');return mb}"
-"function updateKvTargetState(){if(!kvEnabled||!Number.isSafeInteger(currentKvBudgetBytes)){text('kvTargetState','当前运行时容量不可用');return}let target;try{target=budgetMB()*1048576}catch(e){text('kvTargetState',kvTargetTouched?'目标容量尚无效':'等待有效目标容量');return}text('kvTargetState',target===currentKvBudgetBytes?'目标容量与当前运行时一致':'尚未应用到当前运行时')}"
-"async function admin(mode,mb,revision){const payload={mode,budget_mb:mb};if(mode==='apply')payload.revision=String(revision);const response=await fetch('/ds4/admin/kv-cache',{method:'POST',headers:{'Content-Type':'application/json','X-DS4-Admin':'1'},body:JSON.stringify(payload)});if(response.status===403){adminLocal=false;setKvState(kvState);throw kvLocalError('KV 容量设置仅可从本机管理。','forbidden')}let body;try{body=await response.json()}catch(e){throw kvLocalError('操作失败：服务器返回了无法读取的结果。','unreadable')}if(!body.ok&&!(mode==='persist'&&body.persistent&&body.persistent.committed)){const error=new Error('server error');error.code=body.error&&body.error.code;error.body=body;throw error}return body}"
-"function runtimeMessage(r){const evicted=r.before_entries-r.after_entries;return '运行时：'+bytes(r.before_bytes)+' → '+bytes(r.after_bytes)+'，条目 '+r.before_entries+' → '+r.after_entries+'（清理 '+evicted+' 条）；上限 '+bytes(r.old_budget_bytes)+' → '+bytes(r.new_budget_bytes)+'。'}"
-"function persistentMessage(body){const p=body.persistent||{};if(!p.attempted)return '未尝试持久化。';if(p.ok&&p.committed&&p.durable)return '已保存供下次启动使用：已提交并完成持久化。';if(p.committed&&!p.durable)return '已保存供下次启动使用：已提交，但尚未确认持久化。';return '未能提交下次启动设置。'}"
-"function setKvMessage(message,bad){$('adminNotice').className=bad?'notice bad':'notice';text('adminNotice',message)}"
-"function kvErrorMessage(error){if(error&&error.code==='kv_state_changed')return 'KV 状态持续变化，请等待活动缓存操作结束后重试。';if(error&&error.safe)return error.message;return '操作失败：请检查输入、权限或服务器状态。'}"
-"function focusKvTrigger(){if(kvTrigger&&!kvTrigger.disabled)kvTrigger.focus();else $('kvCapacity').focus()}"
-"function finishKvSuccess(message){kvReview=null;setKvInvalid(false);setKvState('success');setKvMessage(message,false);focusKvTrigger()}"
-"function finishKvError(error){kvReview=null;setKvState('error');setKvMessage(kvErrorMessage(error),true);focusKvTrigger()}"
-"function reviewFingerprint(r){return JSON.stringify([r.old_budget_bytes,r.new_budget_bytes,r.before_bytes,r.before_entries,r.after_bytes,r.after_entries,r.eviction_required])}"
-"function reviewFact(label,value){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value;$('kvReviewFacts').append(dt,dd)}"
-"function showKvReview(runtime,mb){const facts=$('kvReviewFacts');facts.replaceChildren();reviewFact('容量',bytes(runtime.old_budget_bytes)+' → '+bytes(runtime.new_budget_bytes));reviewFact('修改前使用量',bytes(runtime.before_bytes)+' / '+num(runtime.before_entries).toLocaleString()+' 条');reviewFact('需要清理',runtime.eviction_required?'是':'否');reviewFact('预计清理',Math.max(0,num(runtime.before_entries)-num(runtime.after_entries)).toLocaleString()+' 条');reviewFact('预计释放',bytes(Math.max(0,num(runtime.before_bytes)-num(runtime.after_bytes))));kvReview={runtime,mb,fingerprint:reviewFingerprint(runtime)};setKvState('review');setKvMessage(runtime.eviction_required?'请确认清理影响后再立即应用。':'请确认运行时影响后再立即应用。',runtime.eviction_required);$('kvReview').focus()}"
-"function normalizeRuntime(body,expectedTargetBytes,requireApplied){const r=body&&body.runtime,invalid=()=>{throw kvLocalError('操作失败：服务器返回的运行时结果无法读取。','unreadable_runtime')};if(!Number.isSafeInteger(expectedTargetBytes)||expectedTargetBytes<0||!r||typeof r!=='object'||Array.isArray(r)||r.attempted!==true||r.ok!==true||r.applied!==requireApplied||typeof r.eviction_required!=='boolean'||typeof r.revision!=='string'||!/^(0|[1-9][0-9]*)$/.test(r.revision))invalid();const normalized={ok:true,applied:r.applied,revision:r.revision,eviction_required:r.eviction_required};for(const field of ['old_budget_bytes','new_budget_bytes','before_bytes','after_bytes','before_entries','after_entries']){if(typeof r[field]!=='number'||!Number.isSafeInteger(r[field])||r[field]<0)invalid();normalized[field]=r[field]}const eviction=normalized.before_bytes>expectedTargetBytes;if(normalized.new_budget_bytes!==expectedTargetBytes||normalized.after_bytes>expectedTargetBytes||normalized.eviction_required!==eviction||normalized.after_bytes>normalized.before_bytes||normalized.after_entries>normalized.before_entries)invalid();if(eviction&&(normalized.after_bytes>=normalized.before_bytes||normalized.after_entries>=normalized.before_entries))invalid();if(!eviction&&(normalized.after_bytes!==normalized.before_bytes||normalized.after_entries!==normalized.before_entries))invalid();return normalized}"
-"async function checkKvImpact(){if(!online||!adminLocal||!kvEnabled||['checking','review','applying','saving'].includes(kvState)){setKvState(kvState);return}kvTrigger=$('kvApplyNow');let mb;try{mb=budgetMB();setKvInvalid(false)}catch(e){setKvInvalid(true);finishKvError(e);return}setKvState('checking');setKvMessage('正在检查清理压力…',false);try{showKvReview(normalizeRuntime(await admin('dry-run',mb),mb*1048576,false),mb)}catch(e){finishKvError(e)}}"
-"async function confirmKvApply(){if(kvState!=='review'||!kvReview||!online||!adminLocal||!kvEnabled){setKvState(kvState);return}const reviewed=kvReview,targetBytes=reviewed.mb*1048576;setKvState('applying');setKvMessage('正在应用已审阅的运行时上限…',false);try{let applied;try{applied=normalizeRuntime(await admin('apply',reviewed.mb,String(reviewed.runtime.revision)),targetBytes,true)}catch(e){if(e.code!=='kv_state_changed')throw e;setKvMessage('KV 状态已变化，正在重新检查影响…',false);const refreshed=normalizeRuntime(await admin('dry-run',reviewed.mb),targetBytes,false),fingerprint=reviewFingerprint(refreshed);if(fingerprint!==reviewed.fingerprint){showKvReview(refreshed,reviewed.mb);return}try{applied=normalizeRuntime(await admin('apply',reviewed.mb,String(refreshed.revision)),targetBytes,true)}catch(retry){if(retry.code==='kv_state_changed')throw kvLocalError('KV 状态持续变化，请等待活动缓存操作结束后重试。','kv_state_changed');throw retry}}finishKvSuccess(runtimeMessage(applied))}catch(e){finishKvError(e)}}"
-"function cancelKvApply(){if(kvState!=='review')return;kvReview=null;setKvState('idle');setKvMessage('已取消应用；运行时容量未改变。',false);focusKvTrigger()}"
-"async function persistKvBudget(){if(!online||!adminLocal||!kvEnabled||['checking','review','applying','saving'].includes(kvState)){setKvState(kvState);return}kvTrigger=$('kvSaveRestart');let mb;try{mb=budgetMB();setKvInvalid(false)}catch(e){setKvInvalid(true);finishKvError(e);return}setKvState('saving');setKvMessage('正在保存下次启动上限…',false);try{const saved=await admin('persist',mb),p=saved.persistent||{};if(!p.committed)throw kvLocalError('服务器未提交下次启动设置。');if(!p.ok||!p.durable){kvReview=null;setKvState('error');setKvMessage(persistentMessage(saved),true);focusKvTrigger();return}finishKvSuccess(persistentMessage(saved))}catch(e){finishKvError(e)}}"
-"function contextNotice(message,bad){$('contextNotice').className=bad?'notice bad':'notice';text('contextNotice',message)}async function saveContext(){if(contextBusy||!online||!contextLocal){contextControls();return}const value=Number($('contextNextInput').value);if(!Number.isInteger(value)||value<4096||value>2147483647){$('contextNextInput').setAttribute('aria-invalid','true');contextNotice('请输入 4,096 到 2,147,483,647 之间的整数 token 上限。',true);return}$('contextNextInput').setAttribute('aria-invalid','false');contextBusy=true;contextNotice('正在保存下次启动设置…',false);contextControls();try{const response=await fetch('/ds4/admin/context',{method:'POST',headers:{'Content-Type':'application/json','X-DS4-Admin':'1'},body:JSON.stringify({context_tokens:value})});let body;try{body=await response.json()}catch(e){throw new Error('服务器返回了无法读取的上下文设置结果。')}if(response.status===403){contextLocal=false;throw new Error('上下文设置仅可从本机管理。')}if(!body.ok&&!(body.persistent&&body.persistent.committed))throw new Error('上下文设置失败，请检查数值后重试。');const p=body.persistent||{};contextNotice(p.committed&&p.durable?'已保存：下次启动生效，需要重启；当前运行值未改变。':p.committed?'已提交，但尚未确认已持久化；下次启动生效，需要重启；当前运行值未改变。':'未能提交下次启动设置。',!p.committed||!p.durable)}catch(e){contextNotice(e.message,true)}finally{contextBusy=false;contextControls()}}"
-"const themeMedia=matchMedia('(prefers-color-scheme: dark)');function setTheme(value){const preference=['system','dark','light'].includes(value)?value:'system',resolved=preference==='system'?(themeMedia.matches?'dark':'light'):preference;document.documentElement.dataset.theme=resolved;document.documentElement.dataset.themePreference=preference;dash.dataset.themePreference=preference;try{localStorage.setItem('ds4-dashboard-theme',preference)}catch(e){}document.querySelectorAll('[data-theme-choice]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.themeChoice===preference)))}"
-"function setStale(flag){const stale=!!flag;dash.classList.toggle('stale',stale);document.body.classList.toggle('dashboard-stale',stale);document.querySelectorAll('.light-field,.light-shadow').forEach(light=>light.style.animationPlayState=stale?'paused':'running');if(stale){clearFreshness();clearMetricMotion()}}function setMode(value){const mode=['management','monitor','usage'].includes(value)?value:'monitor';dash.dataset.mode=mode;for(const name of ['management','monitor','usage']){const root=$(name+'Layout'),active=name===mode;root.hidden=!active;root.setAttribute('aria-hidden',String(!active))}try{localStorage.setItem('ds4-dashboard-mode',mode)}catch(e){}document.querySelectorAll('[data-mode-choice]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.modeChoice===mode)))}const filterLabels={callFilterCaller:'调用方',callFilterClient:'服务',callFilterApi:'API',callFilterStatus:'结果'};for(const [id,labelText] of Object.entries(filterLabels)){const control=$(id),field=document.createElement('div'),label=document.createElement('label');field.className='filter-field';label.className='eyebrow';label.htmlFor=id;label.textContent=labelText;control.before(field);field.append(label,control)}try{setMode(localStorage.getItem('ds4-dashboard-mode'));setTheme(localStorage.getItem('ds4-dashboard-theme'))}catch(e){setMode('monitor');setTheme('system')}document.querySelectorAll('[data-mode-choice]').forEach(b=>b.addEventListener('click',()=>setMode(b.dataset.modeChoice)));document.querySelectorAll('[data-theme-choice]').forEach(b=>b.addEventListener('click',()=>setTheme(b.dataset.themeChoice)));const syncSystemTheme=()=>{if(document.documentElement.dataset.themePreference==='system')setTheme('system')};if(themeMedia.addEventListener)themeMedia.addEventListener('change',syncSystemTheme);else if(themeMedia.addListener)themeMedia.addListener(syncSystemTheme);const touchKvTarget=()=>{kvTargetTouched=true;setKvInvalid(false);updateKvTargetState()};$('kvBudgetInput').addEventListener('input',touchKvTarget);$('kvBudgetUnit').addEventListener('input',touchKvTarget);$('kvBudgetUnit').addEventListener('change',touchKvTarget);$('contextNextInput').addEventListener('input',()=>{contextTargetTouched=true;$('contextNextInput').setAttribute('aria-invalid','false')});['callFilterCaller','callFilterClient','callFilterApi','callFilterStatus'].forEach(id=>$(id).addEventListener('input',()=>{const s=lastSnapshot||{};paintCalls(s.calls,s.request,s.active===true)}));"
-"const STATUS_TIMEOUT_MS=2000;/* Bound a status request without overlapping client polls. */async function tick(){const generation=++pollGeneration,controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),STATUS_TIMEOUT_MS);try{const response=await fetch('/ds4/status',{cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error('status '+response.status);const snapshot=await response.json();if(generation===pollGeneration){pollFailures=0;paint(snapshot)}}catch(e){if(generation===pollGeneration){pollFailures++;online=false;setStale(true);text('health',lastSnapshot?'数据已过期':'不可用');text('updatedAt',freshnessLabel(true));setKvState(kvState);contextControls()}}finally{clearTimeout(timeout);if(generation===pollGeneration)if(pollFailures)setTimeout(tick,Math.min(5000,1000*pollFailures));else setTimeout(tick,1000)}}$('kvApplyNow').addEventListener('click',checkKvImpact);$('kvSaveRestart').addEventListener('click',persistKvBudget);$('kvConfirmApply').addEventListener('click',confirmKvApply);$('kvCancelApply').addEventListener('click',cancelKvApply);$('contextSaveRestart').addEventListener('click',saveContext);setInterval(()=>text('updatedAt',freshnessLabel(!online)),1000);setKvState(kvState);contextControls();tick();"
-"const ds4UnknownClient=value=>{const text=String(value==null?'':value).trim();return !text||text==='未标识服务'||text==='—'};const ds4StableClient=(record,records)=>{const raw=String(record&&record.client!=null?record.client:'').trim();if(!ds4UnknownClient(raw))return raw;const caller=String(record&&record.caller!=null?record.caller:'').trim();if(!caller||ds4AmbiguousClients.has(caller))return raw||'未标识服务';const known=[...new Set((records||[]).filter(item=>String(item&&item.caller!=null?item.caller:'').trim()===caller).map(item=>String(item&&item.client!=null?item.client:'').trim()).filter(item=>!ds4UnknownClient(item)))];return known.length===1?known[0]:raw||'未标识服务'};const ds4StableCalls=calls=>{const source=Array.isArray(calls&&calls.records)?calls.records:[],records=source.map(record=>({...record,client:ds4StableClient(record,source)}));return {...(calls||{}),records}};const rawPaintCalls=paintCalls;paintCalls=function(calls,request,snapshotActive){return rawPaintCalls(ds4StableCalls(calls),request,snapshotActive)};const rawPaintRecentCalls=paintRecentCalls;paintRecentCalls=function(calls,request,snapshotActive){return rawPaintRecentCalls(ds4StableCalls(calls),request,snapshotActive)};const rawPaintMonitor=paintMonitor;paintMonitor=function(snapshot){const stable={...snapshot,calls:ds4StableCalls(snapshot&&snapshot.calls)};rawPaintMonitor(stable);const calls=stable.calls||{},currentId=stable.active===true?activeId(calls.active_request_id):null,current=(calls.records||[]).find(record=>currentId&&String(record.request_id)===currentId),prefill=stable.prefill||{},decode=stable.decode||{},active=stable.active===true&&!!current,showPrefill=active&&['prefill','decode'].includes(stable.phase)&&finite(prefill.current)&&finite(prefill.total)&&prefill.total>0,showDecode=active&&stable.phase==='decode'&&finite(decode.generated)&&finite(decode.max_tokens)&&decode.max_tokens>0;const setProgress=(id,show,value,total)=>{const node=$(id);if(node)node.style.width=(show?Math.max(0,Math.min(100,value/total*100)):0)+'%'};setProgress('monitorPrefillBar',showPrefill,num(prefill.current),num(prefill.total));setProgress('monitorDecodeBar',showDecode,num(decode.generated),num(decode.max_tokens))};const metricCells=[...document.querySelectorAll('#monitorMetrics>div')];[[1,'monitorPrefillBar'],[2,'monitorDecodeBar']].forEach(([index,id])=>{const cell=metricCells[index];if(!cell)return;cell.classList.add('metric-primary');let bar=cell.querySelector('.metric-bar');if(!bar){bar=document.createElement('div');bar.className='metric-bar';bar.setAttribute('aria-hidden','true');const span=document.createElement('span');span.id=id;bar.append(span);cell.append(bar)}});document.querySelectorAll('[data-mode-choice]').forEach(button=>button.addEventListener('click',()=>{const activeLayout=document.querySelector('.mode-layout:not([hidden])');if(activeLayout){activeLayout.classList.remove('mode-enter');void activeLayout.offsetWidth;activeLayout.classList.add('mode-enter')}}))"
-";const ds4ClientMemoryKey='ds4-dashboard-client-map',ds4AmbiguousMemoryKey='ds4-dashboard-client-ambiguous',ds4KnownClients=(()=>{try{const raw=JSON.parse(localStorage.getItem(ds4ClientMemoryKey)||'{}');return new Map(Object.entries(raw).filter(([caller,client])=>caller&&client&&caller.length<=160&&client.length<=160).slice(-128))}catch(e){return new Map()}})(),ds4AmbiguousClients=(()=>{try{const raw=JSON.parse(localStorage.getItem(ds4AmbiguousMemoryKey)||'[]');return new Set((Array.isArray(raw)?raw:[]).filter(caller=>typeof caller==='string'&&caller&&caller.length<=160).slice(-128))}catch(e){return new Set()}})(),ds4PersistClients=()=>{try{const known=[...ds4KnownClients].filter(([caller])=>!ds4AmbiguousClients.has(caller)).slice(-128);localStorage.setItem(ds4ClientMemoryKey,JSON.stringify(Object.fromEntries(known)));localStorage.setItem(ds4AmbiguousMemoryKey,JSON.stringify([...ds4AmbiguousClients].slice(-128)))}catch(e){}};const ds4StableCallsPersistent=calls=>{const source=Array.isArray(calls&&calls.records)?calls.records:[],snapshotClients=new Map();source.forEach(record=>{const caller=String(record&&record.caller!=null?record.caller:'').trim(),client=String(record&&record.client!=null?record.client:'').trim();if(!caller||ds4UnknownClient(client))return;let clients=snapshotClients.get(caller);if(!clients){clients=new Set();snapshotClients.set(caller,clients)}clients.add(client)});let clientsChanged=false;snapshotClients.forEach((clients,caller)=>{if(clients.size!==1){if(!ds4AmbiguousClients.has(caller)){ds4AmbiguousClients.add(caller);clientsChanged=true}if(ds4KnownClients.delete(caller))clientsChanged=true;return}const client=clients.values().next().value,known=ds4KnownClients.get(caller);if(ds4AmbiguousClients.has(caller)){if(ds4KnownClients.delete(caller))clientsChanged=true}else if(known&&known!==client){ds4KnownClients.delete(caller);ds4AmbiguousClients.add(caller);clientsChanged=true}else if(known!==client){ds4KnownClients.set(caller,client);clientsChanged=true}});const records=source.map(record=>{const raw=String(record&&record.client!=null?record.client:'').trim();if(!ds4UnknownClient(raw))return record;const caller=String(record&&record.caller!=null?record.caller:'').trim(),clients=snapshotClients.get(caller),mapped=caller&&!ds4AmbiguousClients.has(caller)?clients&&clients.size===1?clients.values().next().value:clients&&clients.size>1?null:ds4KnownClients.get(caller):null;return {...record,client:mapped||raw||'未标识服务'}});if(clientsChanged)ds4PersistClients();return {...(calls||{}),records}};const ds4PaintCallsWithMemory=paintCalls;paintCalls=function(calls,request,snapshotActive){return ds4PaintCallsWithMemory(ds4StableCallsPersistent(calls),request,snapshotActive)};const ds4PaintRecentWithMemory=paintRecentCalls;paintRecentCalls=function(calls,request,snapshotActive){return ds4PaintRecentWithMemory(ds4StableCallsPersistent(calls),request,snapshotActive)};const ds4PaintTimelineWithMemory=paintTimeline;paintTimeline=function(snapshot){return ds4PaintTimelineWithMemory({...snapshot,calls:ds4StableCallsPersistent(snapshot&&snapshot.calls)})};const ds4MetricCells=[...document.querySelectorAll('#monitorMetrics>div')],ds4MetricMeta=(index,id,label,klass)=>{const cell=ds4MetricCells[index];if(!cell)return;const eyebrow=cell.querySelector('.eyebrow');if(eyebrow)eyebrow.textContent=label;let node=$(id);if(!node){node=document.createElement('span');node.id=id;node.className=klass||'metric-subvalue';node.textContent='—';cell.append(node)}};ds4MetricMeta(0,'monitorPhaseMeta','CURRENT PHASE','metric-phase-meta');ds4MetricMeta(1,'monitorPrefillMeta','PREFILL');ds4MetricMeta(2,'monitorDecodeMeta','LIVE DECODE');const ds4FormatProgress=(value,total)=>finite(value)&&finite(total)&&total>0?num(value).toLocaleString()+' / '+num(total).toLocaleString()+' token · '+Math.min(100,value/total*100).toFixed(1)+'%':'不可用';const ds4PaintMonitorWithMemory=paintMonitor;paintMonitor=function(snapshot){const stable={...snapshot,calls:ds4StableCallsPersistent(snapshot&&snapshot.calls)};ds4PaintMonitorWithMemory(stable);const phase=$('monitorPhase'),phaseMeta=$('monitorPhaseMeta'),phaseParts=String(phase&&phase.textContent||'').split(' · ');if(phase&&phaseMeta){phase.textContent=phaseParts.length>2?phaseParts.slice(0,2).join(' · '):phaseParts.join(' · ');phaseMeta.textContent='服务 · '+(phaseParts.length>2?phaseParts.slice(2).join(' · '):'—')}const p=stable.prefill||{},d=stable.decode||{},prefillMeta=$('monitorPrefillMeta'),decodeMeta=$('monitorDecodeMeta');if(prefillMeta)prefillMeta.textContent=ds4FormatProgress(p.current,p.total);if(decodeMeta)decodeMeta.textContent=ds4FormatProgress(d.generated,d.max_tokens)};"
-"</script></body></html>\n";
-
-static bool send_dashboard_page(int fd, bool enable_cors) {
-    return http_response(fd, enable_cors, 200,
-                         "text/html; charset=utf-8",
-                         dashboard_html);
-}
-
-static const char *call_status_name(ds4_call_status status) {
-	return status == DS4_CALL_ACTIVE ? "active" :
-		status == DS4_CALL_COMPLETED ? "completed" :
-		status == DS4_CALL_CANCELLED ? "cancelled" : "failed";
-}
-
-static void append_status_calls_json(buf *b, const ds4_call_history_snapshot *calls,
-							 size_t capacity, uint64_t active_request_id) {
-	buf_printf(b, ",\"calls\":{\"capacity\":%llu,\"active_request_id\":\"%llu\",\"records\":[",
-		(unsigned long long)capacity, (unsigned long long)active_request_id);
-	for (size_t i = 0; calls && i < calls->records_len; i++) {
-		const ds4_call_record *r = &calls->records[i];
-		if (i) buf_putc(b, ',');
-		buf_puts(b, "{\"request_id\":");
-		buf_printf(b, "\"%llu\",\"caller\":", (unsigned long long)r->request_id);
-		json_escape(b, r->caller); buf_puts(b, ",\"client\":"); json_escape(b, r->client);
-		buf_puts(b, ",\"api\":"); json_escape(b, r->api);
-		buf_puts(b, ",\"kind\":"); json_escape(b, r->kind);
-		buf_printf(b, ",\"stream\":%s,\"tools\":%s,\"status\":",
-			r->stream ? "true" : "false", r->has_tools ? "true" : "false");
-		json_escape(b, call_status_name(r->status));
-		buf_printf(b, ",\"started_at\":%.3f,\"finished_at\":%.3f,\"prompt_tokens\":%d,\"cached_tokens\":%d,\"cache_write_tokens\":%d,\"output_tokens\":%d,\"cache_source\":",
-			r->started_at, r->finished_at, r->prompt_tokens, r->cached_tokens,
-			r->cache_write_tokens, r->output_tokens);
-		json_escape(b, r->cache_source); buf_puts(b, ",\"finish\":");
-		json_escape(b, r->finish); buf_puts(b, ",\"error\":");
-		json_escape(b, r->error); buf_putc(b, '}');
-	}
-	buf_puts(b, "],\"callers\":[");
-	for (size_t i = 0; calls && i < calls->callers_len; i++) {
-		const ds4_call_caller *c = &calls->callers[i];
-		if (i) buf_putc(b, ',');
-		buf_puts(b, "{\"caller\":"); json_escape(b, c->caller);
-		buf_puts(b, ",\"client\":"); json_escape(b, c->client);
-		buf_printf(b, ",\"calls\":%llu,\"failed\":%llu,\"prompt_tokens\":%llu,\"cached_tokens\":%llu,\"average_duration_sec\":%.3f,\"recent_at\":%.3f}",
-			(unsigned long long)c->calls, (unsigned long long)c->failures,
-			(unsigned long long)c->prompt_tokens, (unsigned long long)c->cached_tokens,
-			c->average_terminal_duration, c->recent_activity);
-	}
-	buf_puts(b, "]}");
-}
-
-static void append_token_usage_json(
-	buf *b, const ds4_token_history_snapshot *usage) {
-	const ds4_token_history_snapshot empty = {0};
-	if (!usage) usage = &empty;
-	const uint64_t total = status_sat_add(
-		usage->prompt_tokens, usage->output_tokens);
-	buf_printf(b, ",\"token_usage\":{\"persistent\":%s,"
-		"\"retention\":\"unlimited\",\"window_days\":%d,"
-		"\"prompt_tokens\":%llu,"
-		"\"output_tokens\":%llu,\"total_tokens\":%llu,"
-		"\"requests\":%llu,\"active_days\":%llu,"
-		"\"peak_tokens\":%llu,\"peak_day_start\":%lld,"
-		"\"current_streak\":%llu,\"longest_streak\":%llu,"
-		"\"first_day_start\":%lld,\"last_day_start\":%lld,\"days\":[",
-		usage->persistent ? "true" : "false",
-		DS4_TOKEN_HISTORY_WINDOW_DAYS,
-		(unsigned long long)usage->prompt_tokens,
-		(unsigned long long)usage->output_tokens,
-		(unsigned long long)total,
-		(unsigned long long)usage->requests,
-		(unsigned long long)usage->active_days,
-		(unsigned long long)usage->peak_tokens,
-		(long long)(usage->peak_day * 86400),
-		(unsigned long long)usage->current_streak,
-		(unsigned long long)usage->longest_streak,
-		(long long)(usage->first_day * 86400),
-		(long long)(usage->last_day * 86400));
-	for (size_t i = 0; i < usage->len; i++) {
-		const ds4_token_history_day *day = &usage->days[i];
-		const uint64_t day_total = status_sat_add(
-			day->prompt_tokens, day->output_tokens);
-		if (i) buf_putc(b, ',');
-		buf_printf(b, "{\"day_start\":%lld,\"prompt_tokens\":%llu,"
-			"\"output_tokens\":%llu,\"total_tokens\":%llu,"
-			"\"requests\":%llu}",
-			(long long)(day->day * 86400),
-			(unsigned long long)day->prompt_tokens,
-			(unsigned long long)day->output_tokens,
-			(unsigned long long)day_total,
-			(unsigned long long)day->requests);
-	}
-	buf_puts(b, "]}");
-}
-
-static void append_status_json(buf *b, const server_status *st,
-                               const ds4_kvstore_stats *kv,
-							 const ds4_host_metrics *host,
-							 const ds4_call_history_snapshot *calls,
-							 size_t calls_capacity, uint64_t active_request_id,
-							 const ds4_token_history_snapshot *usage) {
-    double uptime_sec = st->server_started_t > 0.0 ?
-        now_sec() - st->server_started_t : 0.0;
-    if (uptime_sec < 0.0) uptime_sec = 0.0;
-    double prefill_percent = st->prefill_total > 0 ?
-        100.0 * (double)st->prefill_current / (double)st->prefill_total : 100.0;
-    if (prefill_percent < 0.0) prefill_percent = 0.0;
-    if (prefill_percent > 100.0) prefill_percent = 100.0;
-    buf_puts(b, "{\"phase\":");
-    json_escape(b, st->phase);
-    buf_printf(b, ",\"active\":%s,\"uptime_sec\":%.3f,\"queue_depth\":%d,\"clients\":%d",
-               st->active ? "true" : "false",
-               uptime_sec,
-               st->queue_depth,
-               st->clients);
-    buf_puts(b, ",\"model\":{\"name\":");
-    json_escape(b, st->model_name);
-    buf_puts(b, ",\"backend\":");
-    json_escape(b, st->backend_name);
-    buf_printf(b, ",\"context_length\":%d,\"session_pos\":%d,\"default_tokens\":%d}",
-               st->ctx_size,
-               st->session_pos,
-               st->default_tokens);
-    buf_puts(b, ",\"request\":{\"kind\":");
-    json_escape(b, st->request_kind);
-    buf_puts(b, ",\"api\":");
-    json_escape(b, st->api);
-    buf_printf(b, ",\"stream\":%s,\"tools\":%s,\"prompt_tokens\":%d,"
-                  "\"cached_tokens\":%d,\"cache_write_tokens\":%d,"
-                  "\"elapsed_sec\":%.3f,\"started_sec\":%.3f,"
-                  "\"cache_source\":",
-               st->stream ? "true" : "false",
-               st->has_tools ? "true" : "false",
-               st->prompt_tokens,
-               st->cached_tokens,
-               st->cache_write_tokens,
-               st->active ? now_sec() - st->request_started_t : 0.0,
-               st->request_started_t);
-    json_escape(b, st->cache_source);
-    buf_puts(b, ",\"finish\":");
-    json_escape(b, st->finish);
-    buf_puts(b, ",\"last_error\":");
-    json_escape(b, st->last_error);
-    buf_putc(b, '}');
-    buf_printf(b, ",\"prefill\":{\"current\":%d,\"total\":%d,"
-                  "\"percent\":%.3f,\"avg_tps\":%.3f,\"chunk_tps\":%.3f,"
-                  "\"elapsed_sec\":%.3f,\"eta_sec\":%.3f}",
-               st->prefill_current,
-               st->prefill_total,
-               prefill_percent,
-               st->prefill_avg_tps,
-               st->prefill_chunk_tps,
-               st->prefill_elapsed_s,
-               st->prefill_eta_s > 0.0 ? st->prefill_eta_s : 0.0);
-    buf_printf(b, ",\"decode\":{\"generated\":%d,\"max_tokens\":%d,"
-                  "\"avg_tps\":%.3f,\"chunk_tps\":%.3f,\"elapsed_sec\":%.3f}",
-               st->decode_generated,
-               st->decode_max_tokens,
-               st->decode_avg_tps,
-               st->decode_chunk_tps,
-               st->decode_elapsed_s);
-    buf_printf(b, ",\"totals\":{\"requests\":%llu,\"completed\":%llu,\"failed\":%llu,"
-				  "\"cancelled\":%llu,"
-                  "\"cache\":{\"prompt_tokens\":%llu,\"cached_tokens\":%llu,"
-                  "\"prompt_requests\":%llu,\"hit_requests\":%llu}}",
-               (unsigned long long)st->total_requests,
-               (unsigned long long)st->completed_requests,
-               (unsigned long long)st->failed_requests,
-			   (unsigned long long)st->cancelled_requests,
-               (unsigned long long)st->total_prompt_tokens,
-               (unsigned long long)st->total_cached_tokens,
-               (unsigned long long)st->prompt_requests,
-               (unsigned long long)st->cache_hit_requests);
-	append_token_usage_json(b, usage);
-    const bool kv_enabled = kv && kv->enabled;
-    buf_printf(b, ",\"kv_cache\":{\"enabled\":%s,\"budget_bytes\":%llu,"
-                  "\"used_bytes\":%llu,\"entries\":%llu,\"revision\":\"%llu\"}",
-               kv_enabled ? "true" : "false",
-               (unsigned long long)(kv_enabled ? kv->budget_bytes : 0),
-               (unsigned long long)(kv_enabled ? kv->used_bytes : 0),
-               (unsigned long long)(kv_enabled ? kv->entries : 0),
-               (unsigned long long)(kv ? kv->revision : 0));
-	int limit = st->ctx_size > 0 ? st->ctx_size : 0;
-	int current = limit > 0 && st->session_pos > 0 ? st->session_pos : 0;
-	if (current > limit) current = limit;
-	int remaining = limit > current ? limit - current : 0;
-	double utilization = limit > 0 ? (double)current / (double)limit : 0.0;
-	int next_limit = st->next_ctx_size > 0 ? st->next_ctx_size : limit;
-	buf_printf(b, ",\"context\":{\"current_tokens\":%d,\"limit_tokens\":%d,\"next_limit_tokens\":%d,\"remaining\":%d,\"utilization\":%.3f}",
-		current, limit, next_limit, remaining, utilization);
-	const ds4_host_metrics unavailable = { .pressure = DS4_HOST_PRESSURE_UNKNOWN };
-	if (!host) host = &unavailable;
-	buf_printf(b, ",\"host\":{\"available\":%s,\"memory_total_bytes\":%llu,\"memory_used_bytes\":%llu,\"memory_available_bytes\":%llu,\"memory_pressure\":",
-		host->available ? "true" : "false", (unsigned long long)host->memory_total_bytes,
-		(unsigned long long)host->memory_used_bytes, (unsigned long long)host->memory_available_bytes);
-	json_escape(b, ds4_host_pressure_name(host->pressure));
-	buf_printf(b, ",\"swap_total_bytes\":%llu,\"swap_used_bytes\":%llu,\"process_rss_bytes\":%llu,\"sampled_at\":%.3f}",
-		(unsigned long long)host->swap_total_bytes, (unsigned long long)host->swap_used_bytes,
-		(unsigned long long)host->process_rss_bytes, host->sampled_at);
-	append_status_calls_json(b, calls, calls_capacity, active_request_id);
-    buf_puts(b, "}\n");
-}
-
-static bool send_status_json(server *s, int fd) {
-    server_status snapshot;
-    ds4_kvstore_stats kv = {0};
-	ds4_host_metrics host = {0};
-	ds4_call_history_snapshot calls = {0};
-	ds4_token_history_snapshot usage = {0};
-	size_t calls_capacity = 0;
-	uint64_t active_request_id = 0;
-    memset(&snapshot, 0, sizeof(snapshot));
-    if (s) {
-        pthread_mutex_lock(&s->status_mu);
-        snapshot = s->status;
-        pthread_mutex_unlock(&s->status_mu);
-		/* KV stats are the last completed wrapper snapshot.  Active disk I/O
-		 * may make them briefly stale, but status never waits for kv_mu. */
-		kv = server_kv_get_published_stats(s);
-		host = server_host_get_snapshot(s);
-		pthread_mutex_lock(&s->call_history_mu);
-		calls = ds4_call_history_snapshot_take(&s->call_history, ds4_wall_time_sec());
-		calls_capacity = s->call_history.capacity;
-		active_request_id = s->worker_active_call_request_id;
-		pthread_mutex_unlock(&s->call_history_mu);
-		usage = server_token_history_snapshot_take(s);
-    }
-    buf b = {0};
-	append_status_json(&b, &snapshot, &kv, &host, &calls, calls_capacity,
-		active_request_id, &usage);
-    bool ok = http_response(fd, s ? s->enable_cors : false, 200,
-                            "application/json", b.ptr);
-    buf_free(&b);
-	ds4_call_history_snapshot_free(&calls);
-    return ok;
+static bool slot_job_cancelled(const server_slot *slot) {
+    return slot && slot->running && job_cancelled(slot->running);
 }
 
 /* =========================================================================
@@ -9601,6 +9025,12 @@ static void anthropic_live_clear(server *s, server_slot *slot) {
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&slot->anthropic_live);
     pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void request_live_state_clear(server *s, server_slot *slot) {
+    responses_live_clear(s, slot);
+    anthropic_live_clear(s, slot);
+    thinking_live_clear(s, slot);
 }
 
 static bool responses_live_has_call_id(server *s, const char *id) {
@@ -10513,6 +9943,817 @@ static void server_discard_cancelled_live_state(server *s, server_slot *slot) {
 	thinking_live_clear(s, slot);
 }
 
+static bool kv_admin_origin_is_local(const char *origin);
+
+static void status_copy(char *dst, size_t len, const char *src);
+static bool server_client_disconnected(int fd);
+static bool server_job_client_disconnected(const job *j);
+static bool server_drop_disconnected_queued_job(server *s, job *j);
+static void server_call_history_update_prompt(server *s, job *j, int prompt_tokens, int cached_tokens, const char *cache_source);
+static void server_call_history_finish(server *s, job *j, ds4_call_status status, int output_tokens, const char *cache_source, const char *finish, const char *error);
+static bool kv_admin_origin_is_local(const char *origin);
+
+static bool server_drop_disconnected_queued_job(server *s, job *j) {
+	if (!server_job_client_disconnected(j)) return false;
+	server_log(DS4_LOG_GENERATION,
+		"ds4-server: dropping queued request after client disconnected");
+	server_call_history_finish(s, j, DS4_CALL_CANCELLED, 0, "none",
+		"cancelled", "client disconnected while queued");
+	return true;
+}
+
+static bool server_job_cancel_cb(void *ud) {
+	return server_job_client_disconnected((const job *)ud);
+}
+
+static bool kv_admin_origin_is_local(const char *origin) {
+    if (!origin || !origin[0]) return true;
+    const char *host = strstr(origin, "://");
+    if (!host) return false;
+    host += 3;
+    if (!strncmp(host, "127.0.0.1", 9) &&
+        (host[9] == '\0' || host[9] == ':' || host[9] == '/')) return true;
+    if (!strncmp(host, "localhost", 9) &&
+        (host[9] == '\0' || host[9] == ':' || host[9] == '/')) return true;
+    if (!strncmp(host, "[::1]", 5) &&
+        (host[5] == '\0' || host[5] == ':' || host[5] == '/')) return true;
+    return false;
+}
+
+static bool kv_admin_origin_is_local(const char *origin);
+
+
+static void server_status_decode_start(server *s, int max_tokens) {
+    if (!s) return;
+    const double now = now_sec();
+    pthread_mutex_lock(&s->status_mu);
+    status_copy(s->status.phase, sizeof(s->status.phase), "decode");
+    s->status.phase_started_t = now;
+    s->status.decode_generated = 0;
+    s->status.decode_max_tokens = max_tokens;
+    s->status.decode_elapsed_s = 0.0;
+    s->status.decode_avg_tps = 0.0;
+    s->status.decode_chunk_tps = 0.0;
+    s->status.decode_last_generated = 0;
+    s->status.decode_last_t = now;
+    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
+    s->status.updated_t = now;
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_update_decode(server *s, int generated) {
+    if (!s) return;
+    const double now = now_sec();
+    pthread_mutex_lock(&s->status_mu);
+    const double elapsed = now - s->status.phase_started_t;
+    const int interval_tokens = generated - s->status.decode_last_generated;
+    const double interval_s = now - s->status.decode_last_t;
+    s->status.decode_generated = generated;
+    s->status.decode_elapsed_s = elapsed > 0.0 ? elapsed : 0.0;
+    s->status.decode_avg_tps = elapsed > 0.0 ? (double)generated / elapsed : 0.0;
+    s->status.decode_chunk_tps = interval_s > 0.0 && interval_tokens > 0 ?
+        (double)interval_tokens / interval_s : 0.0;
+    s->status.decode_last_generated = generated;
+    s->status.decode_last_t = now;
+    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
+    s->status.updated_t = now;
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_finalize_call_history(server *s, job *j,
+								 int output_tokens, const char *cache_source,
+								 const char **final_finish, char *err,
+								 size_t errlen, bool response_ok) {
+	if (!response_ok && server_job_client_disconnected(j)) {
+		if (final_finish) *final_finish = "cancelled";
+		if (err && errlen && !err[0])
+			snprintf(err, errlen, "client disconnected during final response");
+	} else if (!response_ok) {
+		if (final_finish) *final_finish = "error";
+		if (err && errlen && !err[0])
+			snprintf(err, errlen, "client stream write failed");
+	}
+	const char *finish = final_finish && *final_finish ? *final_finish : "error";
+	ds4_call_status status = !strcmp(finish, "error") ? DS4_CALL_FAILED :
+		!strcmp(finish, "cancelled") ? DS4_CALL_CANCELLED : DS4_CALL_COMPLETED;
+	server_call_history_finish(s, j,
+			status,
+			output_tokens, cache_source, finish,
+			(status == DS4_CALL_FAILED || status == DS4_CALL_CANCELLED) &&
+				err && err[0] ? err : "");
+}
+
+static void server_status_set_queue(server *s, int queue_depth) {
+    if (!s) return;
+    pthread_mutex_lock(&s->status_mu);
+    s->status.queue_depth = queue_depth;
+    s->status.updated_t = now_sec();
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_set_clients(server *s, int clients) {
+    if (!s) return;
+    pthread_mutex_lock(&s->status_mu);
+    s->status.clients = clients;
+    s->status.updated_t = now_sec();
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_init(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->status_mu);
+    memset(&s->status, 0, sizeof(s->status));
+    status_copy(s->status.phase, sizeof(s->status.phase), "idle");
+    s->status.server_started_t = now_sec();
+    s->status.updated_t = s->status.server_started_t;
+    s->status.default_tokens = s->default_tokens;
+    if (s->engine) {
+        status_copy(s->status.model_name, sizeof(s->status.model_name),
+                    ds4_engine_model_name(s->engine));
+    }
+    if (s->session) {
+        s->status.ctx_size = ds4_session_ctx(s->session);
+        s->status.next_ctx_size = s->status.ctx_size;
+        s->status.session_pos = ds4_session_pos(s->session);
+    }
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_set_model(server *s, ds4_backend backend) {
+    if (!s) return;
+    pthread_mutex_lock(&s->status_mu);
+    status_copy(s->status.model_name, sizeof(s->status.model_name),
+                s->engine ? ds4_engine_model_name(s->engine) : "");
+    status_copy(s->status.backend_name, sizeof(s->status.backend_name),
+                ds4_backend_name(backend));
+    s->status.ctx_size = s->session ? ds4_session_ctx(s->session) : 0;
+    s->status.next_ctx_size = s->status.ctx_size;
+    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
+    s->status.default_tokens = s->default_tokens;
+    s->status.updated_t = now_sec();
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+
+static bool server_client_disconnected(int fd) {
+	if (fd < 0) return true;
+	struct pollfd pfd = { .fd = fd, .events = POLLIN
+#ifdef POLLRDHUP
+			| POLLRDHUP
+#endif
+	};
+	int rc;
+	do {
+		rc = poll(&pfd, 1, 0);
+	} while (rc < 0 && errno == EINTR);
+	if (rc == 0) return false;
+	if (rc < 0 || (pfd.revents & (POLLERR | POLLNVAL))) return true;
+#ifdef POLLRDHUP
+	if (pfd.revents & POLLRDHUP) return true;
+#endif
+	if (pfd.revents & POLLHUP) return true;
+	if (pfd.revents & POLLIN) {
+		char byte;
+		ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+		if (n == 0) return true;
+		if (n > 0) return false;
+		return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+	}
+	return false;
+}
+
+static bool server_job_client_disconnected(const job *j) {
+	return j && !j->req.stream && server_client_disconnected(j->fd);
+}
+
+static void server_call_history_update_prompt(server *s, job *j,
+									int prompt_tokens, int cached_tokens,
+									const char *cache_source) {
+	if (!s || !j || !j->call_request_id) return;
+	j->usage_prompt_tokens = prompt_tokens > 0 ? prompt_tokens : 0;
+	j->usage_started = true;
+	pthread_mutex_lock(&s->call_history_mu);
+	ds4_call_history_update_prompt(&s->call_history, j->call_request_id,
+								 prompt_tokens, cached_tokens, cache_source);
+	pthread_mutex_unlock(&s->call_history_mu);
+}
+
+static void server_call_history_finish(server *s, job *j,
+							  ds4_call_status status, int output_tokens,
+							  const char *cache_source, const char *finish,
+							  const char *error) {
+	if (!s || !j || !j->call_request_id) return;
+	pthread_mutex_lock(&s->call_history_mu);
+	ds4_call_history_finish(&s->call_history, j->call_request_id, status,
+							ds4_wall_time_sec(), output_tokens, cache_source, finish, error);
+	pthread_mutex_unlock(&s->call_history_mu);
+	if (j->usage_started && !j->usage_recorded && s->token_history_ready) {
+		j->usage_recorded = true;
+		char history_err[256] = {0};
+		pthread_mutex_lock(&s->token_history_mu);
+		bool persisted = ds4_token_history_record(&s->token_history,
+			(int64_t)ds4_wall_time_sec(),
+			(uint64_t)j->usage_prompt_tokens,
+			(uint64_t)(output_tokens > 0 ? output_tokens : 0),
+			history_err, sizeof(history_err));
+		pthread_mutex_unlock(&s->token_history_mu);
+		if (!persisted) {
+			server_log(DS4_LOG_DEFAULT,
+				"ds4-server: token usage history not persisted: %s",
+				history_err[0] ? history_err : "unknown error");
+		}
+	}
+}
+
+static const char *request_api_name(api_style api) {
+    switch (api) {
+    case API_OPENAI: return "openai";
+    case API_ANTHROPIC: return "anthropic";
+    case API_RESPONSES: return "responses";
+    }
+    return "unknown";
+}
+
+static const char *request_kind_name(req_kind kind) {
+    return kind == REQ_CHAT ? "chat" : "completion";
+}
+
+static void status_copy(char *dst, size_t len, const char *src) {
+    if (!dst || !len) return;
+    snprintf(dst, len, "%s", src ? src : "");
+}
+
+static uint64_t status_sat_add(uint64_t value, uint64_t add) {
+    return UINT64_MAX - value < add ? UINT64_MAX : value + add;
+}
+
+static uint64_t status_sat_inc(uint64_t value) {
+    return status_sat_add(value, 1);
+}
+
+static void server_status_begin_request(server *s, const request *r,
+                                        int cached_tokens,
+                                        int prompt_tokens,
+                                        const char *cache_source) {
+    if (!s || !r) return;
+    if (prompt_tokens < 0) prompt_tokens = 0;
+    if (cached_tokens < 0) cached_tokens = 0;
+    if (cached_tokens > prompt_tokens) cached_tokens = prompt_tokens;
+    const double now = now_sec();
+    pthread_mutex_lock(&s->status_mu);
+    s->status.active = true;
+    status_copy(s->status.phase, sizeof(s->status.phase), "prefill");
+    status_copy(s->status.request_kind, sizeof(s->status.request_kind),
+                request_kind_name(r->kind));
+    status_copy(s->status.api, sizeof(s->status.api),
+                request_api_name(r->api));
+    s->status.stream = r->stream;
+    s->status.has_tools = r->has_tools;
+    status_copy(s->status.cache_source, sizeof(s->status.cache_source),
+                cache_source ? cache_source : "none");
+    s->status.finish[0] = '\0';
+    s->status.last_error[0] = '\0';
+    s->status.total_requests = status_sat_inc(s->status.total_requests);
+    s->status.total_prompt_tokens = status_sat_add(
+        s->status.total_prompt_tokens, (uint64_t)prompt_tokens);
+    s->status.total_cached_tokens = status_sat_add(
+        s->status.total_cached_tokens, (uint64_t)cached_tokens);
+    if (prompt_tokens > 0) {
+        s->status.prompt_requests = status_sat_inc(s->status.prompt_requests);
+        if (cached_tokens > 0) {
+            s->status.cache_hit_requests = status_sat_inc(
+                s->status.cache_hit_requests);
+        }
+    }
+    s->status.prompt_tokens = prompt_tokens;
+    s->status.cached_tokens = cached_tokens;
+    s->status.cache_write_tokens = prompt_tokens > cached_tokens ?
+        prompt_tokens - cached_tokens : 0;
+    s->status.request_started_t = now;
+    s->status.phase_started_t = now;
+    int prefill_total = prompt_tokens > cached_tokens ?
+        prompt_tokens - cached_tokens : 0;
+    s->status.prefill_current = 0;
+    s->status.prefill_total = prefill_total;
+    s->status.prefill_elapsed_s = 0.0;
+    s->status.prefill_avg_tps = 0.0;
+    s->status.prefill_chunk_tps = 0.0;
+    s->status.prefill_eta_s = prefill_total > 0 ? -1.0 : 0.0;
+    s->status.prefill_last_current = 0;
+    s->status.prefill_last_t = now;
+    s->status.decode_generated = 0;
+    s->status.decode_max_tokens = 0;
+    s->status.decode_elapsed_s = 0.0;
+    s->status.decode_avg_tps = 0.0;
+    s->status.decode_chunk_tps = 0.0;
+    s->status.decode_last_generated = 0;
+    s->status.decode_last_t = now;
+    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
+    s->status.updated_t = now;
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_update_prefill(server *s, int current, int total,
+                                         int cached_tokens) {
+    if (!s) return;
+    const double now = now_sec();
+    pthread_mutex_lock(&s->status_mu);
+    int display_start = cached_tokens;
+    if (display_start < 0 || display_start > s->status.prompt_tokens)
+        display_start = 0;
+    int display_total = s->status.prompt_tokens - display_start;
+    if (display_total <= 0) {
+        display_start = 0;
+        display_total = total > 0 ? total : s->status.prompt_tokens;
+    }
+    int display_current = current - display_start;
+    if (display_current < 0) display_current = 0;
+    if (display_current > display_total) display_current = display_total;
+    const double elapsed = now - s->status.phase_started_t;
+    const int interval_tokens = display_current - s->status.prefill_last_current;
+    const double interval_s = now - s->status.prefill_last_t;
+    s->status.prefill_current = display_current;
+    s->status.prefill_total = display_total;
+    s->status.prefill_elapsed_s = elapsed > 0.0 ? elapsed : 0.0;
+    s->status.prefill_avg_tps = elapsed > 0.0 ?
+        (double)display_current / elapsed : 0.0;
+    s->status.prefill_chunk_tps = interval_s > 0.0 && interval_tokens > 0 ?
+        (double)interval_tokens / interval_s : 0.0;
+    int remaining = display_total - display_current;
+    s->status.prefill_eta_s =
+        remaining > 0 && s->status.prefill_avg_tps > 0.0 ?
+        (double)remaining / s->status.prefill_avg_tps : 0.0;
+    s->status.prefill_last_current = display_current;
+    s->status.prefill_last_t = now;
+    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
+    s->status.updated_t = now;
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static void server_status_finish_request(server *s, const char *finish,
+                                         const char *err) {
+    if (!s) return;
+    pthread_mutex_lock(&s->status_mu);
+    if (finish && !strcmp(finish, "error")) {
+        s->status.failed_requests = status_sat_inc(s->status.failed_requests);
+	} else if (finish && !strcmp(finish, "cancelled")) {
+		s->status.cancelled_requests = status_sat_inc(
+			s->status.cancelled_requests);
+    } else {
+        s->status.completed_requests = status_sat_inc(
+            s->status.completed_requests);
+    }
+    s->status.active = false;
+    status_copy(s->status.phase, sizeof(s->status.phase), "idle");
+    status_copy(s->status.finish, sizeof(s->status.finish),
+                finish ? finish : "");
+    status_copy(s->status.last_error, sizeof(s->status.last_error),
+                err ? err : "");
+    s->status.session_pos = s->session ? ds4_session_pos(s->session) : 0;
+    s->status.updated_t = now_sec();
+    pthread_mutex_unlock(&s->status_mu);
+}
+
+static int server_queue_depth_locked(const server *s) {
+    int n = 0;
+    for (const job *j = s ? s->head : NULL; j; j = j->next) n++;
+    return n;
+}
+
+static const char dashboard_html[] =
+"<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+"<title>DwarfStar Inference Console</title><script>(()=>{try{const p=localStorage.getItem('ds4-dashboard-theme'),v=['system','dark','light'].includes(p)?p:'system',d=matchMedia('(prefers-color-scheme: dark)').matches;document.documentElement.dataset.theme=v==='system'?(d?'dark':'light'):v;document.documentElement.dataset.themePreference=v}catch(e){document.documentElement.dataset.theme='light';document.documentElement.dataset.themePreference='system'}})()</script><style>"
+":root{color-scheme:light;--wall:#c8cdd2;--surface:rgba(232,235,238,.58);--surface-strong:rgba(244,246,248,.74);--surface-soft:rgba(221,225,229,.46);--ink:#171c23;--muted:#626b75;--faint:#7f8892;--line:rgba(25,31,39,.12);--edge:rgba(255,255,255,.58);--edge-soft:rgba(255,255,255,.32);--success:#16784a;--danger:#bd3c49;--warning:#9a6421;--accent:#547895;--accent-soft:rgba(84,120,149,.16);--selected:rgba(68,91,111,.11);--shadow:rgba(31,39,47,.16);--shadow-soft:rgba(31,39,47,.08);--focus:#2e6f9e;--control-height:44px;--motion-fast:180ms;--motion-smooth:240ms;--motion-mode:280ms;--radius:18px;--instrument-font:SFMono-Regular,Menlo,Consolas,\"Hiragino Sans GB\",\"PingFang SC\",\"Microsoft YaHei\",\"Arial Unicode MS\",monospace}"
+":root[data-theme=dark]{color-scheme:dark;--wall:#0d1219;--surface:rgba(19,26,35,.66);--surface-strong:rgba(29,38,49,.72);--surface-soft:rgba(16,22,30,.5);--ink:#edf3f8;--muted:#98a4b1;--faint:#707d8a;--line:rgba(224,235,246,.11);--edge:rgba(255,255,255,.12);--edge-soft:rgba(255,255,255,.06);--success:#72d5a2;--danger:#ff8993;--warning:#e8b066;--accent:#84b4d5;--accent-soft:rgba(95,154,194,.18);--selected:rgba(115,166,200,.13);--shadow:rgba(0,0,0,.38);--shadow-soft:rgba(0,0,0,.22);--focus:#8cc8f1}"
+"body{margin:0;min-height:100vh;background:radial-gradient(circle at 8% -10%,rgba(255,255,255,.7),transparent 34%),radial-gradient(circle at 92% 16%,rgba(123,145,162,.18),transparent 30%),linear-gradient(142deg,#d8dbde 0%,#cbd0d4 48%,#bcc2c7 100%);color:var(--ink);overflow-x:hidden;transition:background-color var(--motion-smooth) ease,color var(--motion-smooth) ease}"
+":root[data-theme=dark] body{background:radial-gradient(circle at 12% -8%,rgba(94,132,164,.16),transparent 34%),radial-gradient(circle at 88% 12%,rgba(77,103,128,.11),transparent 30%),linear-gradient(145deg,#121923 0%,#0c1118 52%,#090d13 100%)}"
+".light-field{position:fixed;z-index:-2;width:1100px;height:780px;left:-180px;top:-260px;pointer-events:none;opacity:.48;background:radial-gradient(ellipse at center,rgba(255,255,255,.72) 0%,rgba(255,255,255,.28) 36%,rgba(255,255,255,0) 70%);animation:signal-drift 18s cubic-bezier(.42,0,.58,1) infinite alternate;will-change:transform}"
+".light-shadow{position:fixed;z-index:-2;width:780px;height:620px;right:-150px;bottom:-250px;pointer-events:none;opacity:.62;background:radial-gradient(ellipse at center,rgba(81,102,119,.18),rgba(81,102,119,0) 68%);animation:signal-shadow 26s cubic-bezier(.42,0,.58,1) infinite alternate;will-change:transform}"
+":root[data-theme=dark] .light-field{opacity:.34;background:radial-gradient(ellipse at center,rgba(88,133,169,.3),rgba(50,78,102,.09) 42%,transparent 72%)}:root[data-theme=dark] .light-shadow{opacity:.72;background:radial-gradient(ellipse at center,rgba(0,0,0,.44),transparent 68%)}"
+"@keyframes signal-drift{from{transform:translate3d(-5vw,-1vh,0)}to{transform:translate3d(5vw,2vh,0)}}@keyframes signal-shadow{from{transform:translate3d(3vw,2vh,0)}to{transform:translate3d(-4vw,-2vh,0)}}"
+".glass-column,.instrument-panel{background:linear-gradient(145deg,var(--surface-strong),var(--surface));backdrop-filter:blur(24px) saturate(1.12);-webkit-backdrop-filter:blur(24px) saturate(1.12);border:1px solid var(--edge);border-bottom-color:var(--line);border-radius:var(--radius);box-shadow:inset 0 1px 0 var(--edge-soft),0 24px 64px var(--shadow),0 2px 8px var(--shadow-soft)}"
+".instrument-panel{box-shadow:inset 0 1px 0 var(--edge-soft),0 14px 36px var(--shadow-soft)}"
+"@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){.glass-column,.instrument-panel{background:var(--wall)}}"
+"@media(max-width:760px){.light-field,.light-shadow{animation:none}.light-field{transform:translate3d(2vw,0,0)}.light-shadow{transform:none}.glass-column{backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}}"
+"@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}.light-field{transform:translate3d(2vw,0,0)}.light-shadow{transform:none}}"
+"*{box-sizing:border-box}:focus-visible{outline:2px solid var(--focus);outline-offset:3px}h1,h2,h3,p,dl,dd{margin:0}a{color:inherit}"
+"body{font:15px/1.5 -apple-system,BlinkMacSystemFont,\"Hiragino Sans GB\",\"PingFang SC\",\"Microsoft YaHei\",\"Arial Unicode MS\",\"Helvetica Neue\",Arial,sans-serif}"
+"button,input,select{min-height:var(--control-height);font:inherit;color:inherit;border:1px solid var(--edge);border-bottom-color:var(--line);background:var(--surface-soft);border-radius:11px;box-shadow:inset 0 1px 0 var(--edge-soft)}button{padding:0 16px;cursor:pointer}button.primary{background:var(--ink);border-color:var(--ink);color:var(--wall)}button:disabled{cursor:not-allowed;opacity:.45}input{width:9rem;padding:0 10px;font-family:var(--instrument-font)}select{padding:0 30px 0 10px}"
+"button,input,select,.status-dot,.metric-bar span{transition:transform var(--motion-fast) ease,background-color var(--motion-fast) ease,color var(--motion-fast) ease,border-color var(--motion-fast) ease,box-shadow var(--motion-fast) ease}button:active{transform:translateY(1px);box-shadow:none}"
+".mono{font-family:var(--instrument-font)}.eyebrow{display:block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}.caption{font-size:12px;color:var(--muted)}"
+".page{width:min(100%,1440px);min-height:100vh;margin:0 auto;padding:18px 30px 48px}.topbar{display:grid;grid-template-columns:minmax(280px,1fr) auto auto;align-items:center;gap:22px}"
+".brand{display:flex;align-items:center;gap:13px;font:750 20px/1.1 var(--instrument-font);letter-spacing:-.035em}.brand a{display:inline-flex;align-items:center;min-height:var(--control-height);text-decoration:none}.brand-title{display:grid;gap:3px}.brand-title small{font:500 10px/1.2 var(--instrument-font);letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}.brand .model{font:500 11px/1.4 var(--instrument-font);color:var(--muted);letter-spacing:0}.status-glyph{width:9px;height:9px;border-radius:2px;background:var(--success);box-shadow:0 0 18px var(--success);transform:rotate(45deg);margin-right:3px}"
+".header-telemetry{display:flex;align-items:center;gap:20px}.live-badge{display:flex;align-items:center;gap:7px;font:700 10px/1 var(--instrument-font);letter-spacing:.14em;color:var(--success)}.header-stat{display:grid;gap:3px;min-width:70px}.header-stat span{font:500 9px/1 var(--instrument-font);letter-spacing:.11em;color:var(--muted)}.header-stat strong{font:650 13px/1.1 var(--instrument-font);white-space:nowrap}.header-controls{display:flex;align-items:center;gap:8px}.mode-switch,.theme-switch{display:flex;gap:3px;padding:3px;border:1px solid var(--edge);border-bottom-color:var(--line);border-radius:13px;background:var(--surface-soft);box-shadow:inset 0 1px 0 var(--edge-soft)}.mode-switch button,.theme-switch button{min-height:44px;border:0;border-radius:9px;background:transparent;box-shadow:none;padding:0 12px;font-size:12px;color:var(--muted)}.theme-switch button{min-width:44px;padding:0 8px}.mode-switch button[aria-pressed=true],.theme-switch button[aria-pressed=true]{background:var(--surface-strong);color:var(--ink);box-shadow:0 4px 12px var(--shadow-soft),inset 0 1px 0 var(--edge)}"
+".activity-ribbon{position:relative;height:10px;margin:8px 0 2px;overflow:hidden}.activity-ribbon:before,.activity-ribbon:after{content:\"\";position:absolute;left:0;right:0;top:4px;height:1px}.activity-ribbon:before{background:var(--line)}.activity-ribbon:after{opacity:.18;background:linear-gradient(90deg,#6b7f94,#7c6d94,#a07377,#a68b58,#6c9279,#63899f,#7a6d9b);transform:translateX(-38%)}#dashboard.is-active .activity-ribbon:after{opacity:.72;animation:energy-flow 7s linear infinite}@keyframes energy-flow{to{transform:translateX(38%)}}"
+".console-meta{display:flex;align-items:center;justify-content:space-between;gap:18px;min-height:28px}.state{display:flex;align-items:center;gap:10px;font:11px/1.4 var(--instrument-font);color:var(--muted)}.state strong{font-weight:600;color:var(--ink)}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--success)}#dashboard.stale .status-dot{background:var(--warning)}"
+".mode-layout,.mode-enter{animation:mode-in var(--motion-mode) cubic-bezier(.22,.8,.24,1) both}.mode-enter>.model{animation:mode-subtitle 220ms 40ms ease both}@keyframes mode-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}@keyframes mode-subtitle{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}#dashboard.stale *,#dashboard.stale *:before,#dashboard.stale *:after{animation:none!important;transition:none!important}body.dashboard-stale .light-field,body.dashboard-stale .light-shadow{animation:none!important;transition:none!important}"
+"#dashboard.stale .mode-layout,#dashboard.stale .mode-enter,#dashboard.stale .metric-value-layer,#dashboard.stale .value-changing{animation:none!important}"
+".monitor-title,.management-layout>h1,.usage-layout h1{font-size:18px;font-weight:650;letter-spacing:-.02em;margin:16px 0 2px}.mode-layout>.model{color:var(--muted);font-size:12px;margin-bottom:12px}"
+".num-wall{position:relative}#monitorMetrics{display:grid;grid-template-columns:minmax(260px,1.55fr) repeat(5,minmax(92px,1fr));grid-template-areas:\"decode prefill phase cache context queue\";align-items:stretch;overflow:visible;margin:0;padding:12px}"
+".vital{position:relative;z-index:1;display:flex;flex-direction:column;justify-content:flex-end;min-width:0;padding:12px 16px}.vital+.vital:before{content:\"\";position:absolute;left:0;top:16%;bottom:16%;width:1px;background:linear-gradient(transparent,var(--line),transparent)}.vital-decode{grid-area:decode}.vital-prefill{grid-area:prefill}.vital-phase{grid-area:phase}.vital-cache{grid-area:cache}.vital-context{grid-area:context}.vital-queue{grid-area:queue}.vital strong{display:block;font-size:17px;font-weight:650;white-space:nowrap;margin-top:5px}.vital-decode strong{font-size:46px;line-height:1.05;letter-spacing:-.045em}.vital-phase strong{white-space:normal;overflow-wrap:anywhere}.metric-subvalue,.metric-phase-meta{display:block;font-size:10px;color:var(--muted);font-family:var(--instrument-font);overflow-wrap:anywhere}.metric-bar{height:2px;background:var(--line);margin-top:9px;overflow:hidden}.metric-bar span{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),transparent);box-shadow:0 0 12px var(--accent-soft);transition:width 360ms cubic-bezier(.22,.8,.24,1),background-color var(--motion-fast) ease}.value-changing{animation:value-flash var(--motion-fast) ease}@keyframes value-flash{from{color:var(--muted)}to{color:inherit}}"
+".metric-value-window{display:inline-block;position:relative;overflow:hidden;max-width:100%;height:1.15em;vertical-align:bottom}.metric-value-layer{display:inline-block;white-space:nowrap;line-height:1.15}.metric-value-truncated .metric-value-window{display:block;width:100%}.metric-value-truncated .metric-value-layer{display:block;width:100%;overflow:hidden;text-overflow:ellipsis}.metric-value-layer-out-increase,.metric-value-layer-out-decrease{position:absolute;left:0;right:0;top:0}.metric-value-layer-in-increase{animation:metric-in-up 420ms ease both}.metric-value-layer-out-increase{animation:metric-out-up 420ms ease both}.metric-value-layer-in-decrease{animation:metric-in-down 420ms ease both}.metric-value-layer-out-decrease{animation:metric-out-down 420ms ease both}@keyframes metric-in-up{from{transform:translateY(105%) scale(.96);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}@keyframes metric-out-up{from{transform:translateY(0);opacity:1}to{transform:translateY(-105%);opacity:0}}@keyframes metric-in-down{from{transform:translateY(-105%) scale(1.04);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}@keyframes metric-out-down{from{transform:translateY(0);opacity:1}to{transform:translateY(105%);opacity:0}}"
+".monitor-grid{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:18px 22px;align-items:start;margin-top:18px}.monitor-left{display:grid;gap:16px;align-content:start;min-width:0}.monitor-console{min-width:0;overflow:hidden}.monitor-panel{padding:16px 18px;min-width:0}.inspector h2{font-size:14px;margin-bottom:8px}.inspector dl{display:grid;grid-template-columns:auto minmax(0,1fr) auto minmax(0,1fr);gap:4px 10px;font-size:10px}.inspector dt{color:var(--muted);white-space:nowrap}.inspector dd{font-family:var(--instrument-font);word-break:break-all}.inspector-empty{padding:16px 0 6px}"
+".section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:10px}.section-head h2,.monitor-panel>h2{font-size:14px;font-weight:650}.call-filters{display:grid;grid-template-columns:1.2fr repeat(3,minmax(0,1fr));gap:8px;margin-bottom:10px}.filter-field{display:flex;flex-direction:column;gap:4px;min-width:0}.filter-field input,.filter-field select{width:100%}"
+".timeline-panel{padding:17px 18px 15px}.timeline-track{display:grid;grid-template-columns:.8fr 1fr 1.1fr 1fr 1.25fr .8fr;gap:0;margin-top:15px}.timeline-stage{min-width:0;padding-right:9px}.stage-name,.stage-value{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--instrument-font)}.stage-name{font-size:10px;color:var(--muted);letter-spacing:.04em}.stage-value{font-size:10px;color:var(--faint);margin-top:6px}.stage-line{position:relative;height:8px;margin-top:8px}.stage-line:before,.stage-line:after{content:\"\";position:absolute;left:0;right:0;top:3px;height:1px}.stage-line:before{background:var(--line)}.stage-line:after{background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:0;transform:scaleX(.35);transform-origin:left}.stage-node{position:absolute;z-index:1;left:0;top:0;width:7px;height:7px;border:1px solid var(--line);border-radius:50%;background:var(--surface-strong)}.timeline-stage[data-state=done] .stage-line:after{opacity:.5;transform:scaleX(1)}.timeline-stage[data-state=done] .stage-node{border-color:var(--accent);background:var(--accent)}.timeline-stage[data-state=active] .stage-name{color:var(--ink)}.timeline-stage[data-state=active] .stage-line:after{opacity:.9;animation:timeline-flow 2.8s ease-in-out infinite}.timeline-stage[data-state=active] .stage-node{border-color:var(--accent);box-shadow:0 0 0 4px var(--accent-soft),0 0 16px var(--accent)}@keyframes timeline-flow{0%,100%{transform:translateX(-22%) scaleX(.35);opacity:.32}50%{transform:translateX(38%) scaleX(.58);opacity:.9}}"
+".usage-layout{padding:18px 0 0}.usage-shell{width:min(100%,1120px);margin:0 auto;padding:30px 34px 34px}.usage-hero{text-align:center;padding:4px 0 26px}.usage-emblem{width:68px;height:68px;margin:0 auto 12px;display:grid;place-items:center;border-radius:22px;background:linear-gradient(145deg,var(--accent),var(--accent-bright));box-shadow:0 14px 36px var(--accent-soft);color:white;font:750 22px/1 var(--instrument-font);letter-spacing:-.06em}.usage-layout h1{font-size:26px;margin:0}.usage-hero p{margin-top:5px;color:var(--muted)}.usage-summary{display:grid;grid-template-columns:1.35fr repeat(4,1fr);margin-bottom:28px;border:1px solid var(--line);border-radius:16px;background:rgba(255,255,255,.08);overflow:hidden}.usage-stat{min-width:0;padding:17px 14px;text-align:center}.usage-stat+.usage-stat{border-left:1px solid var(--line)}.usage-stat strong{display:block;font:650 20px/1.2 var(--instrument-font);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.usage-stat span{display:block;margin-top:5px;color:var(--muted);font-size:12px}.usage-section{padding-top:4px}.usage-section-head{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin-bottom:16px}.usage-section-head h2{font-size:16px}.usage-permanent{padding:5px 9px;border:1px solid var(--line);border-radius:999px;color:var(--success);font:650 10px/1 var(--instrument-font);letter-spacing:.05em}.usage-heatmap-scroll{overflow-x:auto;padding:4px 2px 12px}.usage-heatmap{display:grid;grid-template-rows:repeat(7,12px);grid-auto-flow:column;grid-auto-columns:12px;gap:4px;width:max-content;min-width:100%}.usage-heatmap i{display:block;width:12px;height:12px;border-radius:3px;background:var(--surface-soft);box-shadow:inset 0 0 0 1px var(--line)}.usage-heatmap i[data-level=\"1\"]{background:rgba(84,120,149,.24)}.usage-heatmap i[data-level=\"2\"]{background:rgba(84,120,149,.44)}.usage-heatmap i[data-level=\"3\"]{background:rgba(84,120,149,.68)}.usage-heatmap i[data-level=\"4\"]{background:var(--accent);box-shadow:0 0 10px var(--accent-soft)}.usage-heatmap-legend{display:flex;align-items:center;justify-content:flex-end;gap:5px;color:var(--muted);font-size:10px}.usage-heatmap-legend i{width:10px;height:10px;border-radius:2px;background:var(--surface-soft);box-shadow:inset 0 0 0 1px var(--line)}.usage-heatmap-legend i:nth-of-type(2){background:rgba(84,120,149,.24)}.usage-heatmap-legend i:nth-of-type(3){background:rgba(84,120,149,.44)}.usage-heatmap-legend i:nth-of-type(4){background:rgba(84,120,149,.68)}.usage-heatmap-legend i:nth-of-type(5){background:var(--accent)}.usage-insights{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:30px}.usage-insight{padding:20px;border-top:1px solid var(--line)}.usage-insight h2{font-size:15px;margin-bottom:16px}.usage-facts{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:11px 18px}.usage-facts dt{color:var(--muted)}.usage-facts dd{font-family:var(--instrument-font);text-align:right}.usage-composition{height:10px;margin:4px 0 16px;border-radius:999px;overflow:hidden;background:var(--line);display:flex}.usage-composition span:first-child{background:var(--accent)}.usage-composition span:last-child{background:var(--success)}"
+".call-table-wrap{overflow-x:auto;overflow-y:auto;max-height:258px}.monitor-table{width:100%;min-width:700px;border-collapse:collapse;font-size:12px;line-height:1.35}.monitor-table thead tr,.monitor-table tbody tr{display:grid;grid-template-columns:minmax(62px,.65fr) minmax(110px,1.25fr) minmax(110px,1.05fr) minmax(70px,.75fr) 70px 64px;column-gap:10px;align-items:center;padding:0 10px}.monitor-table thead tr{min-height:28px;border-bottom:1px solid var(--line)}.monitor-table thead th:nth-child(7),.monitor-table tbody td:nth-child(7){display:none}.monitor-table tbody tr{min-height:45px;border-bottom:1px solid var(--line);transition:padding-left var(--motion-fast) ease,background-color var(--motion-fast) ease,box-shadow var(--motion-fast) ease}.monitor-table th{font-size:10px;letter-spacing:.06em;color:var(--muted);text-align:left;white-space:nowrap}.monitor-table td{font-family:var(--instrument-font);white-space:nowrap;padding:0;overflow:hidden;text-overflow:ellipsis}.monitor-table tr[aria-selected=true]{background:linear-gradient(90deg,var(--selected),transparent);box-shadow:inset 2px 0 0 var(--accent);padding-left:14px}.request-select{padding:0 10px;font-family:var(--instrument-font)}"
+".result{font-weight:600}.result[data-status=active]{color:var(--success)}.result[data-status=failed]{color:var(--danger)}@media(hover:hover) and (pointer:fine){.mode-switch button:hover,.theme-switch button:hover,.call-filters input:hover,.call-filters select:hover{transform:translateY(-1px);border-color:var(--edge);box-shadow:0 6px 16px var(--shadow-soft)}.monitor-table tbody tr:not([aria-selected=true]):hover{background:linear-gradient(90deg,var(--selected),transparent);box-shadow:inset 2px 0 0 var(--accent);padding-left:12px}}"
+".monitor-host{padding:14px 18px}.host-ruler{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.host-ruler>div{min-width:0}.host-ruler strong{display:block;font-size:14px;margin-top:4px}"
+".runtime-inspector{border-top:1px solid var(--line);padding:8px 18px 16px}.runtime-inspector>h2{font-size:14px;margin:8px 0 4px}.inspector-module{padding:12px 0}.inspector-module+.inspector-module{border-top:1px solid var(--line)}.inspector-module-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px}.inspector-module h3{font:600 10px/1 var(--instrument-font);letter-spacing:.1em;color:var(--muted)}.inspector-module strong{font:650 13px/1.2 var(--instrument-font)}.inspector-module p{margin-top:5px;font:10px/1.45 var(--instrument-font);color:var(--muted)}.inspector-progress{height:2px;background:var(--line);margin-top:10px;overflow:hidden}.inspector-progress span{display:block;width:0;height:100%;background:linear-gradient(90deg,var(--accent),transparent);box-shadow:0 0 10px var(--accent-soft)}.expert-signal{display:grid;grid-template-columns:repeat(8,1fr);gap:4px;margin-top:10px}.expert-signal i{height:2px;background:var(--line)}.expert-signal i:nth-child(3n){background:var(--accent-soft)}"
+".management-grid{display:grid;grid-template-columns:minmax(0,8fr) minmax(360px,4fr);gap:18px 24px;align-items:start;margin-top:14px}.management-wall{display:grid;gap:14px;align-content:start;min-width:0}.management-summary,.management-section{padding:14px 18px;border:1px solid var(--edge);border-bottom-color:var(--line);border-radius:var(--radius);background:linear-gradient(145deg,var(--surface-strong),var(--surface));box-shadow:inset 0 1px 0 var(--edge-soft),0 14px 36px var(--shadow-soft)}"
+".summary-ruler{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.summary-ruler>div{min-width:0}.summary-ruler strong{display:block;font-size:20px;font-family:var(--instrument-font);white-space:nowrap;margin-top:4px}.recent-calls{width:100%;border-collapse:collapse;font-size:13px;line-height:1.35}.recent-calls th{padding:6px 10px;border-bottom:1px solid var(--line);font-size:11px;letter-spacing:.06em;color:var(--muted);text-align:left}.recent-calls td{padding:6px 10px;border-bottom:1px solid var(--line);font-family:var(--instrument-font)}"
+".management-console{display:block}.management-nav{border-bottom:1px solid var(--line);padding:6px 8px}.management-nav nav{display:flex;flex-wrap:wrap}.management-nav a{display:inline-flex;align-items:center;min-height:var(--control-height);padding:0 12px;text-decoration:none;font-size:13px;color:var(--muted)}.management-nav a:hover{color:var(--ink);background:var(--selected)}"
+".settings-grid{display:grid;grid-template-columns:1fr}.setting-block{padding:14px 18px;min-width:0}.setting-block+.setting-block{border-top:1px solid var(--line)}.setting-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:10px}.setting-head h2{font-size:15px}.effect{font-size:11px;color:var(--muted)}"
+".capacity-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:10px}.capacity-stats>div{min-width:0}.capacity-stats strong{display:block;font-size:16px;font-family:var(--instrument-font);margin-top:2px}.progress{height:4px;background:var(--line);margin:8px 0}.progress span{display:block;height:100%;width:0;background:var(--ink)}"
+".editor{display:grid;gap:8px}.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.unit-label{font-size:11px;color:var(--muted)}.target-state{font-family:var(--instrument-font)}.impact-review{border:1px solid var(--line);border-radius:12px;padding:12px;margin-top:8px}.impact-review dl{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;font-size:12px}.impact-review dd{font-family:var(--instrument-font)}.notice{font-size:12px;min-height:18px;color:var(--muted)}.notice.bad{color:var(--danger)}"
+"@media(min-width:981px) and (max-width:1307px){.topbar{grid-template-columns:1fr auto}.header-telemetry{grid-column:1/-1;grid-row:2;justify-content:flex-start}.monitor-grid{grid-template-columns:minmax(0,1fr) 340px}#monitorMetrics{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-areas:\"decode decode prefill\" \"phase cache context\" \"queue queue queue\"}.vital:nth-child(4):before{display:none}}"
+"@media(max-width:980px){.topbar{grid-template-columns:1fr auto}.header-telemetry{grid-column:1/-1;grid-row:2;justify-content:flex-start}.monitor-grid{grid-template-columns:minmax(0,1fr)}#monitorMetrics{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-areas:\"decode decode prefill\" \"phase cache context\" \"queue queue queue\"}.vital:nth-child(4):before{display:none}.management-grid{grid-template-columns:minmax(0,1fr)}.management-nav{display:none}.settings-grid{grid-template-columns:1fr 1fr}.setting-block+.setting-block{border-top:none;border-left:1px solid var(--line)}}"
+"@media(max-width:760px){.page{padding:14px 14px 36px}.topbar{grid-template-columns:1fr;gap:8px;align-items:start}.header-telemetry{grid-column:1;grid-row:auto;gap:14px;width:100%;overflow-x:auto;padding-bottom:4px}.header-controls{flex-wrap:wrap}.console-meta{align-items:flex-start;flex-direction:column;gap:4px}.theme-switch,.mode-switch{max-width:100%}#monitorMetrics{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:\"decode decode\" \"prefill phase\" \"cache context\" \"queue queue\";padding:8px}.vital{padding:10px 11px}.vital:nth-child(2n+1):before{display:none}.vital-decode strong{font-size:40px}.timeline-track{grid-template-columns:1fr 1fr;gap:12px 0}.timeline-stage:nth-child(odd){padding-right:12px}.timeline-stage:nth-child(even){padding-right:0}.call-filters{grid-template-columns:1fr 1fr}.host-ruler{grid-template-columns:1fr}.summary-ruler{grid-template-columns:1fr}.settings-grid{grid-template-columns:1fr}.setting-block+.setting-block{border-left:none;border-top:1px solid var(--line)}.inspector dl{grid-template-columns:auto minmax(0,1fr)}.glass-column,.instrument-panel{border-radius:15px}.monitor-table{min-width:650px}}"
+":root{--wall:#cfd3d4;--surface:rgba(239,241,241,.62);--surface-strong:rgba(250,251,250,.78);--surface-soft:rgba(218,222,223,.48);--ink:#151a20;--muted:#5f6870;--faint:#7b858d;--line:rgba(25,31,37,.13);--edge:rgba(255,255,255,.72);--edge-soft:rgba(255,255,255,.44);--accent:#477c97;--accent-bright:#8bc3da;--accent-soft:rgba(78,129,155,.16);--spectral:rgba(177,210,222,.22);--panel-shadow:rgba(38,46,52,.14);--panel-depth:rgba(38,46,52,.07);--body-font:\"Avenir Next\",\"Hiragino Sans GB\",\"PingFang SC\",\"Microsoft YaHei\",\"Helvetica Neue\",Arial,sans-serif}"
+":root[data-theme=dark]{--wall:#081018;--surface:rgba(15,24,33,.7);--surface-strong:rgba(25,36,47,.78);--surface-soft:rgba(8,16,24,.58);--ink:#e8eef2;--muted:#94a1ab;--faint:#667580;--line:rgba(207,224,234,.12);--edge:rgba(216,235,246,.13);--edge-soft:rgba(255,255,255,.07);--accent:#6aa9c5;--accent-bright:#a9dced;--accent-soft:rgba(80,151,183,.18);--spectral:rgba(94,164,194,.16);--panel-shadow:rgba(0,0,0,.42);--panel-depth:rgba(0,0,0,.25)}"
+"body{font-family:var(--body-font);background:radial-gradient(ellipse at 50% -20%,rgba(255,255,255,.72),transparent 48%),linear-gradient(132deg,#d9dcdd 0%,#cdd1d2 46%,#c2c7c9 100%)}:root[data-theme=dark] body{background:radial-gradient(ellipse at 46% -18%,rgba(58,99,125,.17),transparent 48%),linear-gradient(138deg,#111c27 0%,#09121a 48%,#060c12 100%)}"
+"body:before{content:\"\";position:fixed;inset:0;z-index:-3;pointer-events:none;opacity:.38;background-image:linear-gradient(rgba(255,255,255,.2) 1px,transparent 1px),linear-gradient(90deg,rgba(25,31,37,.035) 1px,transparent 1px);background-size:48px 48px;mask-image:linear-gradient(to bottom,black,transparent 82%)}:root[data-theme=dark] body:before{opacity:.22;background-image:linear-gradient(rgba(219,237,246,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(219,237,246,.035) 1px,transparent 1px)}"
+".light-field{left:12%;top:-390px;width:1180px;height:760px;opacity:.54;background:radial-gradient(ellipse at center,rgba(255,255,255,.82),rgba(227,238,241,.2) 42%,transparent 72%)}.light-shadow{right:-90px;bottom:-330px;width:920px;height:720px;opacity:.45;background:radial-gradient(ellipse at center,rgba(81,105,117,.16),transparent 68%)}:root[data-theme=dark] .light-field{opacity:.3;background:radial-gradient(ellipse at center,rgba(80,141,173,.3),rgba(32,72,95,.08) 42%,transparent 72%)}"
+".instrument-panel,.glass-column,.optical-panel{position:relative;isolation:isolate;background:linear-gradient(152deg,var(--surface-strong) 0%,var(--surface) 56%,rgba(214,220,222,.42) 100%);border:1px solid var(--edge);border-right-color:rgba(65,76,84,.11);border-bottom-color:rgba(45,55,63,.16);box-shadow:inset 0 1px 0 var(--edge-soft),inset 0 -1px 0 rgba(255,255,255,.16),0 22px 50px var(--panel-shadow),0 3px 10px var(--panel-depth);backdrop-filter:blur(30px) saturate(1.05);-webkit-backdrop-filter:blur(30px) saturate(1.05)}:root[data-theme=dark] .instrument-panel,:root[data-theme=dark] .glass-column,:root[data-theme=dark] .optical-panel{background:linear-gradient(148deg,rgba(30,43,55,.8),rgba(14,23,32,.74) 58%,rgba(7,14,21,.68));border-right-color:rgba(0,0,0,.22);border-bottom-color:rgba(0,0,0,.34);box-shadow:inset 0 1px 0 rgba(255,255,255,.08),inset 0 -1px 0 rgba(255,255,255,.025),0 26px 58px rgba(0,0,0,.4),0 4px 12px rgba(0,0,0,.25)}"
+".instrument-panel:before,.glass-column:before,.optical-panel:before{content:\"\";position:absolute;z-index:-1;pointer-events:none;inset:0;border-radius:inherit;background:linear-gradient(115deg,rgba(255,255,255,.16),transparent 28%,transparent 70%,var(--spectral));opacity:.68}.instrument-panel,.optical-panel{border-radius:14px}.glass-column{border-radius:20px}"
+".page{width:min(100%,1480px);padding:18px 28px 40px}.topbar{min-height:52px;padding:0 2px}.brand{font-size:19px}.brand-title small{font-size:9px}.header-stat{min-width:64px}.header-stat strong{font-size:14px;font-variant-numeric:tabular-nums}.header-controls{opacity:.9}.mode-switch,.theme-switch{border-radius:11px;background:rgba(255,255,255,.12);box-shadow:inset 0 1px 0 var(--edge-soft)}.mode-switch button,.theme-switch button{border-radius:8px}.activity-ribbon{height:8px;margin-top:5px}.console-meta{min-height:25px}"
+".monitor-layout{padding-top:8px}.monitor-heading{display:flex;align-items:end;justify-content:space-between;gap:20px;margin:0 2px 11px}.monitor-heading-copy{display:grid;gap:2px}.monitor-title{margin:0;font-size:17px;letter-spacing:-.02em}.monitor-heading .model{margin:0;font-size:11px}.monitor-request-state{display:flex;align-items:center;gap:8px;font:10px/1.2 var(--instrument-font);color:var(--muted)}.monitor-request-state:before{content:\"\";width:6px;height:6px;border-radius:50%;background:var(--success);box-shadow:0 0 10px rgba(64,160,112,.45)}"
+".monitor-grid{grid-template-columns:minmax(0,1fr) 344px;gap:16px;margin-top:0;align-items:stretch}.monitor-left{gap:14px;grid-template-rows:auto auto minmax(0,1fr) auto}.monitor-console{display:flex;flex-direction:column;min-height:676px;overflow:hidden;position:sticky;top:16px}.monitor-panel{padding:15px 17px}"
+"#monitorMetrics{display:grid;grid-template-columns:minmax(265px,1.36fr) minmax(190px,.95fr) repeat(2,minmax(120px,.7fr));grid-template-areas:\"decode phase prefill cache\" \"decode phase context queue\";min-height:154px;padding:0;overflow:hidden;border-radius:20px}.vital{justify-content:center;padding:16px 18px}.vital+.vital:before{top:18%;bottom:18%;background:linear-gradient(transparent,var(--line),transparent)}.vital-decode{background:linear-gradient(115deg,rgba(255,255,255,.16),transparent 62%)}:root[data-theme=dark] .vital-decode{background:linear-gradient(115deg,rgba(77,140,169,.1),transparent 66%)}.vital-decode strong{font-size:54px;line-height:.98;font-weight:620;letter-spacing:-.06em;text-shadow:0 1px 0 rgba(255,255,255,.35)}:root[data-theme=dark] .vital-decode strong{text-shadow:0 0 20px rgba(100,181,215,.1)}.vital-decode:after{content:\"TOKENS / SECOND\";font:9px/1 var(--instrument-font);letter-spacing:.13em;color:var(--faint);margin-top:9px}.vital-phase strong{font-size:20px;line-height:1.2;white-space:normal}.vital-prefill,.vital-cache,.vital-context,.vital-queue{padding-top:13px;padding-bottom:13px}.vital-prefill strong,.vital-cache strong,.vital-context strong,.vital-queue strong{font-size:16px}.metric-bar{height:2px;margin-top:10px;border-radius:2px}.metric-bar span{background:linear-gradient(90deg,var(--accent-bright),var(--accent),transparent);box-shadow:0 0 14px var(--accent-soft)}"
+".timeline-panel{min-height:182px;padding:15px 17px 16px;overflow:hidden}.timeline-panel .section-head{margin-bottom:7px}.timeline-axis{display:grid;grid-template-columns:repeat(5,1fr);margin:0 0 8px;padding-left:2px;font:8px/1 var(--instrument-font);letter-spacing:.06em;color:var(--faint)}.timeline-axis span:not(:first-child){text-align:right}.timeline-bed{position:relative;padding:10px 0 3px;background:repeating-linear-gradient(90deg,transparent 0,transparent calc(20% - 1px),var(--line) 20%);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.timeline-track{display:grid;grid-template-columns:.85fr 1fr 1.35fr 1fr 1.7fr .8fr;gap:7px;margin:0}.timeline-stage{position:relative;min-width:0;padding:0}.stage-name{display:flex;align-items:center;gap:6px;font-size:9px;letter-spacing:.08em}.stage-index{font-size:8px;color:var(--faint)}.stage-line{height:25px;margin-top:7px;border-radius:4px;overflow:visible;background:linear-gradient(180deg,rgba(255,255,255,.14),rgba(66,94,109,.035));border-top:1px solid var(--edge-soft);border-bottom:1px solid var(--line)}.stage-line:before{left:6px;right:6px;top:11px;background:var(--line)}.stage-line:after{left:3px;right:3px;top:3px;height:17px;border-radius:3px;background:linear-gradient(90deg,transparent,var(--accent-soft) 18%,rgba(105,169,196,.22) 58%,transparent);transform:none;opacity:.08}.stage-node{left:6px;top:8px;width:7px;height:7px;background:var(--surface-strong)}.stage-value{margin-top:7px;font-size:9px}.timeline-stage[data-state=done] .stage-line:after{opacity:.45;transform:none}.timeline-stage[data-state=active] .stage-line:after{opacity:.88;animation:timeline-flow 2.8s ease-in-out infinite}.timeline-stage[data-state=active] .stage-line{border-color:rgba(100,166,194,.3);box-shadow:inset 0 0 18px var(--accent-soft)}@keyframes timeline-flow{0%,100%{transform:translateX(-18%);opacity:.28}50%{transform:translateX(18%);opacity:.9}}.timeline-foot{display:flex;justify-content:space-between;gap:16px;margin-top:9px;font:9px/1.3 var(--instrument-font);color:var(--muted)}"
+".trace-panel{padding:14px 17px 12px;min-height:270px}.trace-toolbar{display:grid;grid-template-columns:auto minmax(0,1fr);gap:14px;align-items:end;margin-bottom:9px}.trace-toolbar .section-head{display:block;margin:0}.call-filters{grid-template-columns:1.1fr repeat(3,minmax(0,.75fr));margin:0}.filter-field{gap:3px}.filter-field .eyebrow{font-size:8px}.filter-field input,.filter-field select{min-height:44px;background:rgba(255,255,255,.1);border-radius:8px}.call-table-wrap{max-height:248px}.monitor-table{font-size:11px}.monitor-table tbody tr{min-height:44px}.monitor-table thead tr{min-height:25px}.monitor-table tr[aria-selected=true]{background:linear-gradient(90deg,var(--accent-soft),rgba(255,255,255,.03) 55%,transparent);box-shadow:inset 2px 0 0 var(--accent-bright)}.request-select{min-height:44px;border-radius:7px;background:rgba(255,255,255,.08)}"
+".monitor-host{padding:11px 17px}.monitor-host .section-head{margin-bottom:5px}.host-ruler strong{font-size:11px}.host-ruler .eyebrow{font-size:8px}"
+".inspector-rail-head{display:flex;align-items:center;justify-content:space-between;padding:16px 17px 12px;border-bottom:1px solid var(--line)}.inspector-rail-head h2{font-size:14px}.inspector-kicker{font:8px/1 var(--instrument-font);letter-spacing:.12em;color:var(--faint)}.inspector{padding:14px 17px 12px}.inspector>h2{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}.inspector-empty{min-height:170px;display:grid;place-items:center;text-align:center}.request-profile-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.request-identity{min-width:0}.request-identity span{display:block;font:8px/1 var(--instrument-font);letter-spacing:.11em;color:var(--muted)}.request-identity strong{display:block;margin-top:5px;font:650 17px/1.2 var(--instrument-font);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.request-status{flex:0 0 auto;padding:5px 7px;border:1px solid var(--line);border-radius:999px;font:700 8px/1 var(--instrument-font);letter-spacing:.08em}.request-status[data-status=active]{color:var(--success);border-color:rgba(64,154,108,.28)}.request-status[data-status=failed]{color:var(--danger);border-color:rgba(189,60,73,.28)}.request-viz{display:grid;grid-template-columns:96px minmax(0,1fr);gap:14px;align-items:center;margin-bottom:15px;padding:12px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.token-orbit{--cache-angle:0deg;width:88px;height:88px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(var(--accent) var(--cache-angle),var(--line) 0);box-shadow:inset 0 0 0 12px rgba(255,255,255,.22),0 0 24px var(--accent-soft)}:root[data-theme=dark] .token-orbit{box-shadow:inset 0 0 0 12px rgba(7,15,22,.9),0 0 26px var(--accent-soft)}.token-orbit-core{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;text-align:center;background:var(--surface-strong);border:1px solid var(--edge);font:650 12px/1.1 var(--instrument-font)}.token-orbit-core small{display:block;font-size:7px;font-weight:500;color:var(--muted);letter-spacing:.08em}.token-stack{display:grid;gap:8px}.token-stack div{display:flex;align-items:baseline;justify-content:space-between;gap:8px}.token-stack span{font:8px/1 var(--instrument-font);letter-spacing:.08em;color:var(--muted)}.token-stack strong{font:650 12px/1 var(--instrument-font)}.inspector-facts{display:grid!important;grid-template-columns:auto minmax(0,1fr)!important;gap:5px 10px!important;font-size:9px!important}.inspector-facts dt{color:var(--muted)}.inspector-facts dd{text-align:right;word-break:break-word!important}.inspector-error{grid-column:1/-1;margin-top:6px;padding-top:8px;border-top:1px solid var(--line);color:var(--danger)!important;text-align:left!important}"
+".runtime-inspector{margin-top:auto;border-top:1px solid var(--line);padding:8px 17px 14px}.runtime-inspector>h2{font-size:12px;margin:7px 0 3px}.inspector-module{padding:10px 0}.inspector-module-head h3{font-size:8px}.inspector-module strong{font-size:12px}.inspector-module p{font-size:8px;line-height:1.4}.runtime-scale{position:relative;height:18px;margin-top:8px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:repeating-linear-gradient(90deg,transparent 0,transparent calc(12.5% - 1px),var(--line) 12.5%);overflow:hidden}.runtime-scale span{display:block;height:100%;width:0;background:linear-gradient(90deg,rgba(82,138,164,.12),rgba(103,173,201,.32),rgba(103,173,201,.05));box-shadow:0 0 18px var(--accent-soft)}.expert-signal{height:30px;align-items:end;grid-template-columns:repeat(12,1fr);gap:3px}.expert-signal i{height:var(--h,20%);background:linear-gradient(to top,var(--accent-soft),rgba(121,182,207,.42));border-radius:1px 1px 0 0;opacity:.35;transition:opacity var(--motion-smooth) ease,transform var(--motion-smooth) ease}.inspector-module[data-active=true] .expert-signal i{opacity:.78}.expert-signal i:nth-child(3n){background:linear-gradient(to top,var(--accent-soft),var(--accent))}.memory-scale{position:relative}.memory-scale:after{content:\"RSS\";position:absolute;right:5px;top:5px;font:7px/1 var(--instrument-font);color:var(--muted)}"
+"@media(min-width:981px) and (max-width:1307px){.monitor-grid{grid-template-columns:minmax(0,1fr) 326px}#monitorMetrics{grid-template-columns:minmax(230px,1.2fr) repeat(3,minmax(110px,.8fr));grid-template-areas:\"decode phase prefill cache\" \"decode phase context queue\"}.trace-toolbar{grid-template-columns:1fr}.call-filters{grid-template-columns:repeat(4,minmax(0,1fr))}}"
+"@media(max-width:980px){.monitor-grid{grid-template-columns:1fr}.monitor-console{position:relative;top:auto;min-height:0}.monitor-left{grid-template-rows:auto}.trace-toolbar{grid-template-columns:1fr}#monitorMetrics{grid-template-columns:1.3fr 1fr 1fr;grid-template-areas:\"decode decode phase\" \"prefill cache context\" \"queue queue queue\"}.vital-decode{min-height:130px}.request-viz{grid-template-columns:88px minmax(0,1fr)}}"
+"@media(max-width:760px){body:before{background-size:32px 32px}.page{padding:12px 12px 28px}.monitor-heading{align-items:flex-start;flex-direction:column;gap:5px}.monitor-grid{gap:12px}#monitorMetrics{grid-template-columns:1fr 1fr;grid-template-areas:\"decode decode\" \"phase phase\" \"prefill cache\" \"context queue\";border-radius:15px}.vital{padding:13px}.vital-decode strong{font-size:46px}.timeline-panel{overflow-x:auto}.timeline-axis,.timeline-track,.timeline-foot{min-width:680px}.timeline-track{grid-template-columns:.85fr 1fr 1.35fr 1fr 1.7fr .8fr}.usage-shell{padding:22px 16px}.usage-summary{grid-template-columns:1fr 1fr}.usage-stat{padding:15px 9px}.usage-stat+.usage-stat{border-left:0;border-top:1px solid var(--line)}.usage-stat:first-child{grid-column:1/-1}.usage-stat:nth-child(even){border-right:1px solid var(--line)}.usage-insights{grid-template-columns:1fr;gap:8px}.usage-insight{padding:18px 2px}.trace-panel{padding:13px 12px}.call-filters{grid-template-columns:1fr 1fr}.glass-column{backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}.monitor-console{border-radius:15px}.request-viz{grid-template-columns:88px minmax(0,1fr)}.request-select{min-height:44px}#dashboard.is-active .activity-ribbon:after,.timeline-stage[data-state=active] .stage-line:after{animation:none}.monitor-host .section-head{display:block}.host-ruler{grid-template-columns:1fr 1fr}.host-ruler>div:last-child{grid-column:1/-1}.monitor-table{min-width:630px}}"
+"</style></head><body><div class=\"light-field\" aria-hidden=\"true\"></div><div class=\"light-shadow\" aria-hidden=\"true\"></div>"
+"<main class=\"page\" id=\"dashboard\" data-mode=\"monitor\">"
+"<header class=\"topbar\"><div class=\"brand\"><a href=\"#managementSummary\"><span class=\"status-glyph\" aria-hidden=\"true\"></span><span class=\"brand-title\"><span>DwarfStar</span><small>Inference Console</small></span></a></div>"
+"<div class=\"header-telemetry\" aria-label=\"实时推理状态\"><div class=\"live-badge\"><span class=\"status-dot\" aria-hidden=\"true\"></span>LIVE</div><div class=\"header-stat\"><span>TOK / S</span><strong id=\"topTokens\">—</strong></div><div class=\"header-stat\"><span>总 TOKEN</span><strong id=\"topTotalTokens\">—</strong></div><div class=\"header-stat\"><span>MTP ACCEPT</span><strong id=\"topMtp\" title=\"状态接口暂未提供 MTP 采纳率\">—</strong></div><div class=\"header-stat\"><span>UPTIME</span><strong id=\"topUptime\">—</strong></div></div>"
+"<div class=\"header-controls\"><nav class=\"mode-switch\" aria-label=\"Dashboard 模式\"><button type=\"button\" data-mode-choice=\"management\" aria-pressed=\"false\">管理</button><button type=\"button\" data-mode-choice=\"monitor\" aria-pressed=\"true\">监控</button><button type=\"button\" data-mode-choice=\"usage\" aria-pressed=\"false\">用量</button></nav><div class=\"theme-switch\" role=\"group\" aria-label=\"颜色主题\"><button type=\"button\" data-theme-choice=\"system\" aria-pressed=\"true\" title=\"跟随系统\">系统</button><button type=\"button\" data-theme-choice=\"dark\" aria-pressed=\"false\" title=\"深色主题\">深色</button><button type=\"button\" data-theme-choice=\"light\" aria-pressed=\"false\" title=\"浅灰主题\">浅灰</button></div></div></header>"
+"<div class=\"activity-ribbon\" aria-hidden=\"true\"></div><div class=\"console-meta\"><span id=\"model\" class=\"model mono\">正在读取状态</span><div id=\"connectionState\" class=\"state\"><span id=\"connectionPulse\" class=\"status-dot\" aria-hidden=\"true\"></span><strong id=\"health\" aria-label=\"健康\">等待中</strong><strong id=\"updatedAt\" aria-label=\"更新时间\">尚未更新</strong></div></div>"
+"<div id=\"managementLayout\" class=\"mode-layout management-layout\" hidden aria-hidden=\"true\"><h1 id=\"managementTitle\">运行与容量</h1>"
+"<div class=\"management-grid\"><div class=\"management-wall num-wall\">"
+"<section id=\"managementSummary\" class=\"management-summary\" aria-labelledby=\"managementTitle\"><div class=\"summary-ruler\">"
+"<div class=\"summary-cell\"><span class=\"eyebrow\">运行阶段</span><strong id=\"managementPhase\">连接中</strong><p id=\"managementQueue\" class=\"caption mono\">—</p></div>"
+"<div class=\"summary-cell\"><span class=\"eyebrow\">上下文余量</span><strong id=\"managementContext\">—</strong><p id=\"managementContextRatio\" class=\"caption mono\">—</p></div>"
+"<div class=\"summary-cell\"><span class=\"eyebrow\">KV 已用 / 上限</span><strong id=\"managementKv\">—</strong><p id=\"managementKvRatio\" class=\"caption mono\">—</p></div></div></section>"
+"<section id=\"managementRecent\" class=\"management-section\"><div class=\"section-head\"><h2>最近调用</h2><p id=\"managementCallsActive\" class=\"caption\">当前活动请求：—</p></div>"
+"<table class=\"recent-calls\"><thead><tr><th>请求</th><th>服务</th><th>API</th><th>结果</th><th>时长</th></tr></thead><tbody id=\"managementRecentCalls\"></tbody></table></section>"
+"<section id=\"managementHost\" class=\"management-section\"><div class=\"section-head\"><h2>主机资源</h2><p class=\"caption\">系统采样不可用时明确标注。</p></div>"
+"<div class=\"host-ruler\"><div><span class=\"eyebrow\">内存压力 / Swap</span><strong id=\"managementHostPressure\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">物理内存 已用 / 总量 / 可用</span><strong id=\"managementHostPhysical\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">DS4 RSS</span><strong id=\"managementHostRss\" class=\"mono\">不可用</strong></div></div></section></div>"
+"<aside class=\"glass-column management-console\"><aside class=\"management-nav\"><nav aria-label=\"管理章节\"><a href=\"#managementSummary\">运行概览</a><a href=\"#kvCapacity\">KV 容量</a><a href=\"#contextCapacity\">上下文窗口</a><a href=\"#managementRecent\">最近调用</a><a href=\"#managementHost\">主机资源</a></nav></aside>"
+"<div class=\"settings-grid\"><section id=\"kvCapacity\" class=\"setting-block\" tabindex=\"-1\">"
+"<div class=\"setting-head\"><h2>磁盘 KV 容量</h2><span id=\"kvEffect\" class=\"effect\">立即影响运行</span></div>"
+"<div class=\"capacity-stats\"><div><span class=\"eyebrow\">已用</span><strong id=\"kvUsed\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">容量上限</span><strong id=\"kvBudget\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">条目 / 利用率</span><strong id=\"kvEntries\" class=\"mono\">—</strong><small id=\"kvUtilization\" class=\"caption\">—</small></div></div>"
+"<div class=\"progress\" aria-hidden=\"true\"><span id=\"kvBar\"></span></div>"
+"<form class=\"editor\" id=\"kvForm\"><label class=\"eyebrow\" for=\"kvBudgetInput\">容量上限</label>"
+"<div class=\"controls\"><input id=\"kvBudgetInput\" inputmode=\"decimal\" type=\"number\" min=\"0.25\" step=\"0.25\" aria-describedby=\"budgetHelp kvTargetState adminNotice\" aria-invalid=\"false\" disabled><label class=\"unit-label\" for=\"kvBudgetUnit\">单位</label><select id=\"kvBudgetUnit\" aria-describedby=\"budgetHelp kvTargetState adminNotice\" aria-invalid=\"false\" disabled><option value=\"GB\">GB</option><option value=\"MB\">MB</option></select></div>"
+"<p id=\"budgetHelp\" class=\"caption\">最小 256 MB。立即应用会修改运行时状态；保存会写入下次启动上限。</p>"
+"<p id=\"kvTargetState\" class=\"caption target-state\" role=\"status\" aria-live=\"polite\">等待当前运行时容量</p>"
+"<div class=\"controls\"><button id=\"kvApplyNow\" class=\"primary\" type=\"button\" disabled>立即应用</button><button id=\"kvSaveRestart\" type=\"button\" disabled>保存供重启后使用</button></div>"
+"<section id=\"kvReview\" class=\"impact-review\" hidden tabindex=\"-1\" aria-labelledby=\"kvReviewTitle\"><h3 id=\"kvReviewTitle\">审阅运行时影响</h3><dl id=\"kvReviewFacts\"></dl>"
+"<div class=\"controls\"><button id=\"kvConfirmApply\" class=\"primary\" type=\"button\" disabled>确认立即应用</button><button id=\"kvCancelApply\" type=\"button\" disabled>取消</button></div></section>"
+"<div id=\"adminNotice\" class=\"notice\" role=\"status\" aria-live=\"polite\"></div></form></section>"
+"<section id=\"contextCapacity\" class=\"setting-block\">"
+"<div class=\"setting-head\"><h2>上下文窗口</h2><span id=\"contextEffect\" class=\"effect\">重启后生效</span></div>"
+"<div class=\"capacity-stats\"><div><span class=\"eyebrow\">当前 / 上限</span><strong id=\"contextCurrent\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">剩余</span><strong id=\"contextRemaining\" class=\"mono\">—</strong></div><div><span class=\"eyebrow\">利用率</span><strong id=\"contextUtilization\" class=\"mono\">—</strong></div></div>"
+"<form class=\"editor\" id=\"contextForm\"><label class=\"eyebrow\" for=\"contextNextInput\">下次启动窗口（token）</label>"
+"<div class=\"controls\"><input id=\"contextNextInput\" type=\"number\" inputmode=\"numeric\" min=\"4096\" step=\"1\" aria-describedby=\"contextEffect contextNotice\" aria-invalid=\"false\" disabled><button id=\"contextSaveRestart\" class=\"primary\" type=\"button\" disabled>保存下次启动设置</button></div>"
+"<div id=\"contextNotice\" class=\"notice\" role=\"status\" aria-live=\"polite\"></div></form></section></div></aside></div></div>"
+"<section id=\"monitorLayout\" class=\"mode-layout monitor-layout\" aria-hidden=\"false\" aria-labelledby=\"monitorTitle\">"
+"<div class=\"monitor-heading\"><div class=\"monitor-heading-copy\"><h1 id=\"monitorTitle\" class=\"monitor-title\">实时推理工作台</h1><p class=\"model\">生命周期信号、请求轨迹与运行时剖面</p></div><p id=\"monitorCallsActive\" class=\"monitor-request-state\">当前活动请求：—</p></div>"
+"<div class=\"monitor-grid\"><div class=\"monitor-left\">"
+"<section id=\"monitorMetrics\" class=\"num-wall metrics-deck optical-panel\" aria-label=\"实时体征\">"
+"<div class=\"vital vital-phase\"><span class=\"eyebrow\">CURRENT PHASE</span><strong id=\"monitorPhase\" class=\"mono\">—</strong><span id=\"monitorPhaseMeta\" class=\"metric-phase-meta\">服务 · —</span></div>"
+"<div class=\"vital vital-prefill\"><span class=\"eyebrow\">PREFILL</span><strong id=\"monitorPrefill\" class=\"mono metric-value\" data-motion-direction=\"none\"><span class=\"metric-value-window\"><span class=\"metric-value-layer\">—</span></span></strong><span id=\"monitorPrefillMeta\" class=\"metric-subvalue\">—</span><div class=\"metric-bar\" aria-hidden=\"true\"><span id=\"monitorPrefillBar\"></span></div></div>"
+"<div class=\"vital vital-decode\"><span class=\"eyebrow\">LIVE DECODE</span><strong id=\"monitorDecode\" class=\"mono metric-value\" data-motion-direction=\"none\"><span class=\"metric-value-window\"><span class=\"metric-value-layer\">—</span></span></strong><span id=\"monitorDecodeMeta\" class=\"metric-subvalue\">—</span><div class=\"metric-bar\" aria-hidden=\"true\"><span id=\"monitorDecodeBar\"></span></div></div>"
+"<div class=\"vital vital-cache\"><span class=\"eyebrow\">REQUEST KV HIT</span><strong id=\"monitorCacheHit\" class=\"mono metric-value\" data-motion-direction=\"none\"><span class=\"metric-value-window\"><span class=\"metric-value-layer\">—</span></span></strong></div>"
+"<div class=\"vital vital-context\"><span class=\"eyebrow\">CONTEXT LOAD</span><strong id=\"monitorContext\" class=\"mono metric-value\" data-motion-direction=\"none\"><span class=\"metric-value-window\"><span class=\"metric-value-layer\">—</span></span></strong></div>"
+"<div class=\"vital vital-queue\"><span class=\"eyebrow\">QUEUE / CLIENTS</span><strong id=\"monitorQueue\" class=\"mono metric-value\" data-motion-direction=\"none\"><span class=\"metric-value-window\"><span class=\"metric-value-layer\">—</span></span></strong></div></section>"
+"<section id=\"inferenceTimeline\" class=\"timeline-panel optical-panel\" aria-labelledby=\"timelineTitle\"><div class=\"section-head\"><h2 id=\"timelineTitle\">Inference Timeline</h2><p id=\"timelineSummary\" class=\"caption\">等待实时请求</p></div>"
+"<div class=\"timeline-axis\" aria-hidden=\"true\"><span>0 ms</span><span>25%</span><span>50%</span><span>75%</span><span>NOW</span></div><div class=\"timeline-bed\"><div class=\"timeline-track\">"
+"<div class=\"timeline-stage\" data-timeline-stage=\"prompt\" data-state=\"idle\"><span class=\"stage-name\"><b class=\"stage-index\">01</b>PROMPT</span><div class=\"stage-line\"><i class=\"stage-node\"></i></div><span id=\"timelinePrompt\" class=\"stage-value\">—</span></div>"
+"<div class=\"timeline-stage\" data-timeline-stage=\"kv\" data-state=\"idle\"><span class=\"stage-name\"><b class=\"stage-index\">02</b>KV LOOKUP</span><div class=\"stage-line\"><i class=\"stage-node\"></i></div><span id=\"timelineKv\" class=\"stage-value\">—</span></div>"
+"<div class=\"timeline-stage\" data-timeline-stage=\"prefill\" data-state=\"idle\"><span class=\"stage-name\"><b class=\"stage-index\">03</b>PREFILL</span><div class=\"stage-line\"><i class=\"stage-node\"></i></div><span id=\"timelinePrefill\" class=\"stage-value\">—</span></div>"
+"<div class=\"timeline-stage\" data-timeline-stage=\"expert\" data-state=\"idle\"><span class=\"stage-name\"><b class=\"stage-index\">04</b>ROUTING</span><div class=\"stage-line\"><i class=\"stage-node\"></i></div><span id=\"timelineExpert\" class=\"stage-value\">遥测未提供</span></div>"
+"<div class=\"timeline-stage\" data-timeline-stage=\"decode\" data-state=\"idle\"><span class=\"stage-name\"><b class=\"stage-index\">05</b>DECODE</span><div class=\"stage-line\"><i class=\"stage-node\"></i></div><span id=\"timelineDecode\" class=\"stage-value\">—</span></div>"
+"<div class=\"timeline-stage\" data-timeline-stage=\"response\" data-state=\"idle\"><span class=\"stage-name\"><b class=\"stage-index\">06</b>RESPONSE</span><div class=\"stage-line\"><i class=\"stage-node\"></i></div><span id=\"timelineResponse\" class=\"stage-value\">—</span></div></div>"
+"<div class=\"timeline-foot\"><span id=\"timelineFootPrompt\">输入 —</span><span id=\"timelineFootOutput\">输出 —</span><span id=\"timelineFootElapsed\">总耗时 —</span></div></div></section>"
+"<section class=\"monitor-panel trace-panel optical-panel\" aria-labelledby=\"monitorCallsTitle\"><div class=\"trace-toolbar\"><div class=\"section-head\"><h2 id=\"monitorCallsTitle\">Request Trace</h2></div>"
+"<div class=\"call-filters\"><input id=\"callFilterCaller\" data-call-filter=\"caller\" aria-label=\"按调用方筛选\" placeholder=\"调用方\"><select id=\"callFilterClient\" data-call-filter=\"client\" aria-label=\"按服务筛选\"><option value=\"\">全部服务</option></select><select id=\"callFilterApi\" data-call-filter=\"api\" aria-label=\"按 API 筛选\"><option value=\"\">全部 API</option></select><select id=\"callFilterStatus\" data-call-filter=\"result\" aria-label=\"按结果筛选\"><option value=\"\">全部结果</option><option value=\"active\">进行中</option><option value=\"completed\">完成</option><option value=\"failed\">失败</option><option value=\"cancelled\">已取消</option></select></div></div>"
+"<div class=\"monitor-table-wrap call-table-wrap\"><table class=\"monitor-table\"><thead><tr><th>请求</th><th>服务</th><th>调用方</th><th>API</th><th>结果</th><th>时长</th><th>错误</th></tr></thead><tbody id=\"monitorCalls\"></tbody></table></div></section>"
+"<section id=\"monitorHost\" class=\"monitor-host host-rail optical-panel\" aria-labelledby=\"monitorHostTitle\"><div class=\"section-head\"><h2 id=\"monitorHostTitle\">Host Signal</h2><p class=\"caption\">来自当前系统采样</p></div>"
+"<div class=\"host-ruler\"><div><span class=\"eyebrow\">PRESSURE / SWAP</span><strong id=\"monitorHostPressure\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">PHYSICAL MEMORY</span><strong id=\"monitorHostPhysical\" class=\"mono\">不可用</strong></div><div><span class=\"eyebrow\">DS4 RSS</span><strong id=\"monitorHostRss\" class=\"mono\">不可用</strong></div></div></section></div>"
+"<aside class=\"glass-column monitor-console\" aria-label=\"请求与运行时检查器\"><header class=\"inspector-rail-head\"><div><span class=\"inspector-kicker\">ANALYSIS RAIL</span><h2>Inspector</h2></div><span class=\"inspector-kicker\">LIVE CONTEXT</span></header>"
+"<aside id=\"requestInspector\" class=\"monitor-panel inspector\" tabindex=\"-1\" aria-labelledby=\"requestInspectorTitle\"><h2 id=\"requestInspectorTitle\">Request Inspector</h2><div id=\"requestInspectorContent\"><p class=\"caption inspector-empty\">从 Request Trace 选择请求以查看剖面</p></div></aside>"
+"<section class=\"runtime-inspector\" aria-labelledby=\"runtimeInspectorTitle\"><h2 id=\"runtimeInspectorTitle\">Runtime Fabric</h2>"
+"<div class=\"inspector-module\"><div class=\"inspector-module-head\"><h3>KV CACHE</h3><strong id=\"inspectorKvUsage\">—</strong></div><p id=\"inspectorKvMeta\">等待容量数据</p><div class=\"runtime-scale\" aria-hidden=\"true\"><span id=\"inspectorKvBar\"></span></div></div>"
+"<div id=\"inspectorExpertModule\" class=\"inspector-module\" data-active=\"false\"><div class=\"inspector-module-head\"><h3>EXPERT ROUTING</h3><strong id=\"inspectorExpertValue\">—</strong></div><p id=\"inspectorExpertMeta\">状态接口未提供 MoE 路由遥测</p><div class=\"expert-signal\" aria-hidden=\"true\"><i style=\"--h:24%\"></i><i style=\"--h:48%\"></i><i style=\"--h:32%\"></i><i style=\"--h:72%\"></i><i style=\"--h:43%\"></i><i style=\"--h:88%\"></i><i style=\"--h:54%\"></i><i style=\"--h:68%\"></i><i style=\"--h:38%\"></i><i style=\"--h:80%\"></i><i style=\"--h:46%\"></i><i style=\"--h:62%\"></i></div></div>"
+"<div class=\"inspector-module\"><div class=\"inspector-module-head\"><h3>MEMORY PRESSURE</h3><strong id=\"inspectorMemoryUsage\">—</strong></div><p id=\"inspectorMemoryMeta\">等待主机采样</p><div class=\"runtime-scale memory-scale\" aria-hidden=\"true\"><span id=\"inspectorMemoryBar\"></span></div></div></section></aside></div></section>"
+"<section id=\"usageLayout\" class=\"mode-layout usage-layout\" hidden aria-hidden=\"true\" aria-labelledby=\"usageTitle\"><div class=\"glass-column usage-shell\">"
+"<header class=\"usage-hero\"><div class=\"usage-emblem\" aria-hidden=\"true\">DS4</div><h1 id=\"usageTitle\">Token 用量</h1><p id=\"usageSince\">正在读取永久历史</p></header>"
+"<section class=\"usage-summary\" aria-label=\"永久用量摘要\"><div class=\"usage-stat\"><strong id=\"usageTotal\">—</strong><span>累计 Token 数</span></div><div class=\"usage-stat\"><strong id=\"usagePeak\">—</strong><span>单日峰值</span></div><div class=\"usage-stat\"><strong id=\"usageRequests\">—</strong><span>请求总数</span></div><div class=\"usage-stat\"><strong id=\"usageCurrentStreak\">—</strong><span>当前连续</span></div><div class=\"usage-stat\"><strong id=\"usageLongestStreak\">—</strong><span>最长连续</span></div></section>"
+"<section class=\"usage-section\" aria-labelledby=\"usageActivityTitle\"><div class=\"usage-section-head\"><div><h2 id=\"usageActivityTitle\">Token 活动</h2><p class=\"caption\">最近 53 周 · 按 UTC 日聚合</p></div><span class=\"usage-permanent\">永久累计</span></div>"
+"<div class=\"usage-heatmap-scroll\"><div id=\"usageHeatmap\" class=\"usage-heatmap\" role=\"img\" aria-label=\"Token 活动热力图\"></div></div><div class=\"usage-heatmap-legend\" aria-hidden=\"true\"><span>少</span><i></i><i></i><i></i><i></i><i></i><span>多</span></div></section>"
+"<div class=\"usage-insights\"><section class=\"usage-insight\"><h2>Token 构成</h2><div class=\"usage-composition\" aria-hidden=\"true\"><span id=\"usagePromptBar\"></span><span id=\"usageOutputBar\"></span></div><dl class=\"usage-facts\"><dt>输入 Token</dt><dd id=\"usagePrompt\">—</dd><dt>输出 Token</dt><dd id=\"usageOutput\">—</dd><dt>输出占比</dt><dd id=\"usageOutputShare\">—</dd></dl></section>"
+"<section class=\"usage-insight\"><h2>活动洞察</h2><dl class=\"usage-facts\"><dt>活跃天数</dt><dd id=\"usageActiveDays\">—</dd><dt>活跃日均 Token</dt><dd id=\"usageDailyAverage\">—</dd><dt>记录方式</dt><dd id=\"usagePersistence\">—</dd><dt>可视窗口</dt><dd>最近 371 天</dd></dl></section></div></div></section>"
+"</main><script>"
+"const $=id=>document.getElementById(id),dash=$('dashboard');let lastSnapshot=null,lastUpdatedAt=0,online=false,adminLocal=true,kvEnabled=false,currentKvBudgetBytes=null,kvState='idle',kvReview=null,kvTrigger=null,pollGeneration=0,pollFailures=0,contextLocal=true,contextBusy=false,kvTargetTouched=false,contextTargetTouched=false,selectedRequestId=null;"
+"const finite=n=>typeof n==='number'&&Number.isFinite(n),nonnegative=n=>finite(n)&&n>=0,num=n=>finite(n)?n:0,ratio=(n,d)=>num(d)>0?num(n)/num(d):null,pct=v=>v==null?'—':(v*100).toFixed(1)+'%',activeId=value=>{const id=value==null?'':String(value);return id&&id!=='0'?id:null};"
+"const bytes=n=>{n=num(n);if(n>=1073741824)return (n/1073741824).toFixed(1)+' GB';if(n>=1048576)return (n/1048576).toFixed(1)+' MB';if(n>=1024)return (n/1024).toFixed(1)+' KB';return Math.round(n)+' B'};"
+"const text=(id,v)=>{const node=$(id),next=String(v);if(node.textContent===next)return;node.textContent=next};"
+"function freshnessLabel(stale){if(!lastUpdatedAt)return '尚未更新';const seconds=Math.max(0,Math.floor((Date.now()-lastUpdatedAt)/1000)),age=seconds<1?'刚刚更新':seconds+' 秒前更新';return stale?'数据已过期 · '+age:age}"
+"let signalRevision=0;const reducedMotion=matchMedia('(prefers-reduced-motion: reduce)');function freshnessNodes(){return [$('connectionPulse'),$('updatedAt')].filter(Boolean)}function clearFreshness(){freshnessNodes().forEach(node=>node.getAnimations().forEach(animation=>animation.cancel()))}function motionAllowed(){return !dash.classList.contains('stale')&&!reducedMotion.matches}function cueFreshness(){if(!motionAllowed())return;const pulse=$('connectionPulse'),stamp=$('updatedAt');if(!pulse||!stamp)return;const revision=String(++signalRevision);pulse.dataset.signalRevision=revision;stamp.dataset.signalRevision=revision;pulse.getAnimations().forEach(animation=>animation.cancel());stamp.getAnimations().forEach(animation=>animation.cancel());pulse.animate([{boxShadow:'0 0 0 0 rgba(27,30,36,.18)'},{boxShadow:'0 0 0 10px rgba(27,30,36,0)',offset:.7},{boxShadow:'0 0 0 10px rgba(27,30,36,0)'}],{duration:620,easing:'cubic-bezier(.22,.8,.24,1)'});stamp.animate([{opacity:.55,transform:'translateY(1px)'},{opacity:1,transform:'none'}],{duration:420,easing:'ease-out'})}const stopReducedSignal=()=>{if(reducedMotion.matches)clearFreshness()};if(reducedMotion.addEventListener)reducedMotion.addEventListener('change',stopReducedSignal);else if(reducedMotion.addListener)reducedMotion.addListener(stopReducedSignal);"
+"function validateSnapshot(s){const object=(value,name)=>{if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('invalid '+name);return value},number=(value,name)=>{if(!nonnegative(value))throw new Error('invalid '+name)},string=(value,name)=>{if(typeof value!=='string')throw new Error('invalid '+name)};object(s,'snapshot');if(typeof s.active!=='boolean')throw new Error('invalid active');string(s.phase,'phase');number(s.queue_depth,'queue_depth');number(s.clients,'clients');const model=object(s.model,'model');string(model.name,'model.name');string(model.backend,'model.backend');number(model.context_length,'model.context_length');const kv=object(s.kv_cache,'kv_cache');if(typeof kv.enabled!=='boolean')throw new Error('invalid kv_cache.enabled');if(kv.enabled){number(kv.used_bytes,'kv_cache.used_bytes');number(kv.budget_bytes,'kv_cache.budget_bytes');number(kv.entries,'kv_cache.entries')}const context=object(s.context,'context');for(const field of ['current_tokens','limit_tokens','next_limit_tokens','remaining'])number(context[field],'context.'+field);if(!finite(context.utilization)||context.utilization<0||context.utilization>1)throw new Error('invalid context.utilization');const request=object(s.request,'request'),prefill=object(s.prefill,'prefill'),decode=object(s.decode,'decode'),calls=object(s.calls,'calls'),usage=object(s.token_usage,'token_usage');if(typeof usage.persistent!=='boolean'||usage.retention!=='unlimited')throw new Error('invalid token_usage persistence');for(const field of ['window_days','prompt_tokens','output_tokens','total_tokens','requests','active_days','peak_tokens','peak_day_start','current_streak','longest_streak','first_day_start','last_day_start'])number(usage[field],'token_usage.'+field);if(!Array.isArray(usage.days)||!usage.days.every(day=>day&&typeof day==='object'&&!Array.isArray(day)&&['day_start','prompt_tokens','output_tokens','total_tokens','requests'].every(field=>nonnegative(day[field]))))throw new Error('invalid token_usage.days');if(s.active){for(const field of ['prompt_tokens','cached_tokens','elapsed_sec'])number(request[field],'request.'+field);if(['prefill','decode'].includes(s.phase))for(const field of ['current','total','avg_tps'])number(prefill[field],'prefill.'+field);if(s.phase==='decode')for(const field of ['generated','max_tokens','avg_tps'])number(decode[field],'decode.'+field)}if(!Array.isArray(calls.records)||!calls.records.every(record=>record&&typeof record==='object'&&!Array.isArray(record)))throw new Error('invalid calls.records')}"
+"function setKvState(state){kvState=state;dash.dataset.kvState=state;const reviewing=state==='review';$('kvReview').hidden=!reviewing;const available=online&&adminLocal&&kvEnabled,locked=['checking','review','applying','saving'].includes(state)||!available;for(const id of ['kvBudgetInput','kvBudgetUnit','kvApplyNow','kvSaveRestart'])$(id).disabled=locked;$('kvConfirmApply').disabled=!reviewing||!available;$('kvCancelApply').disabled=!reviewing}"
+"function contextControls(){const disabled=contextBusy||!online||!contextLocal;$('contextNextInput').disabled=disabled;$('contextSaveRestart').disabled=disabled}"
+"function setKvInvalid(value){for(const id of ['kvBudgetInput','kvBudgetUnit'])$(id).setAttribute('aria-invalid',String(value))}"
+"function callStatus(value){return ({active:'进行中',completed:'完成',failed:'失败',cancelled:'已取消'})[value]||'未知'}"
+"function replaceOptions(id,values,label){const select=$(id),next=[''].concat(values),options=[...select.options],same=options.length===next.length&&options.every((option,i)=>option.value===next[i]&&option.textContent===(next[i]||label));if(same)return;const old=select.value;select.replaceChildren();for(const value of next){const option=document.createElement('option');option.value=value;option.textContent=value||label;select.append(option)}select.value=values.includes(old)?old:''}"
+"function inspectorFact(root,label,value){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value==null||value===''?'—':String(value);root.append(dt,dd)}"
+"function requestDuration(record,request,currentId,snapshotActive){const started=nonnegative(record.started_at)?Number(record.started_at):null,finished=nonnegative(record.finished_at)?Number(record.finished_at):null;if(record.status!=='active')return started!==null&&finished!==null&&finished>=started?(finished-started).toFixed(1)+'s':'—';if(snapshotActive&&currentId&&String(record.request_id)===currentId){if(nonnegative(request&&request.elapsed_sec))return Number(request.elapsed_sec).toFixed(1)+'s';const now=Date.now()/1000;if(started!==null&&started<=now)return (now-started).toFixed(1)+'s'}return '—'}"
+"function paintRequestInspector(record,request,currentId,snapshotActive){const root=$('requestInspectorContent');root.replaceChildren();if(!record){const empty=document.createElement('p');empty.className='caption inspector-empty';empty.textContent='从 Request Trace 选择请求以查看剖面';root.append(empty);return}const make=(tag,className,value)=>{const node=document.createElement(tag);if(className)node.className=className;if(value!=null)node.textContent=String(value);return node},cacheRatio=ratio(record.cached_tokens,record.prompt_tokens),cache=pct(cacheRatio),head=make('div','request-profile-head'),identity=make('div','request-identity'),idLabel=make('span','',`REQUEST #${record.request_id||'—'}`),service=make('strong','',record.client||'未标识服务'),status=make('span','request-status',callStatus(record.status));status.dataset.status=String(record.status||'unknown');identity.append(idLabel,service);head.append(identity,status);const viz=make('div','request-viz'),orbit=make('div','token-orbit'),core=make('div','token-orbit-core'),cacheValue=make('span','',cache),cacheLabel=make('small','','CACHE HIT');core.append(cacheValue,cacheLabel);orbit.style.setProperty('--cache-angle',Math.max(0,Math.min(360,(cacheRatio||0)*360))+'deg');orbit.append(core);const stack=make('div','token-stack'),tokenRows=[['PROMPT',num(record.prompt_tokens).toLocaleString()],['CACHED',num(record.cached_tokens).toLocaleString()],['OUTPUT',num(record.output_tokens).toLocaleString()]];for(const [label,value] of tokenRows){const row=make('div',''),name=make('span','',label),number=make('strong','',value);row.append(name,number);stack.append(row)}viz.append(orbit,stack);const facts=make('dl','inspector-facts'),values=[['调用方',record.caller],['API / 类型',(record.api||'—')+' / '+(record.kind||'—')],['传输',record.stream?'STREAM':'BUFFERED'],['工具调用',record.tools?'是':'否'],['持续时间',requestDuration(record,request,currentId,snapshotActive)],['写入缓存',num(record.cache_write_tokens).toLocaleString()+' token'],['缓存来源',record.cache_source],['结束原因',record.finish]];for(const pair of values)inspectorFact(facts,pair[0],pair[1]);if(record.error){inspectorFact(facts,'错误',record.error);const error=facts.lastElementChild;if(error)error.className='inspector-error'}root.append(head,viz,facts)}"
+"function selectRequest(id){selectedRequestId=String(id);const s=lastSnapshot||{};paintCalls(s.calls,s.request,s.active===true)}"
+"function paintCalls(calls,request,snapshotActive){calls=calls||{};const records=(calls.records||[]).slice(0,200),currentId=snapshotActive?activeId(calls.active_request_id):null;replaceOptions('callFilterClient',[...new Set(records.map(x=>x.client||''))].filter(Boolean),'全部服务');replaceOptions('callFilterApi',[...new Set(records.map(x=>x.api||''))].filter(Boolean),'全部 API');const caller=$('callFilterCaller').value.toLowerCase(),client=$('callFilterClient').value,api=$('callFilterApi').value,status=$('callFilterStatus').value,shown=records.filter(x=>(!caller||String(x.caller||'').toLowerCase().includes(caller))&&(!client||x.client===client)&&(!api||x.api===api)&&(!status||x.status===status)),focused=document.activeElement&&document.activeElement.classList.contains('request-select')?document.activeElement.closest('tr').dataset.requestId:null;if(!shown.some(x=>String(x.request_id)===selectedRequestId))selectedRequestId=null;const selected=records.find(x=>String(x.request_id)===selectedRequestId)||null,body=$('monitorCalls'),signature=JSON.stringify([caller,client,api,status,selectedRequestId,currentId,shown.map(x=>[x.request_id,x.client,x.caller,x.api,x.status,requestDuration(x,request,currentId,snapshotActive),x.error])]),inspector=$('requestInspector'),inspectorSignature=JSON.stringify(selected?[selected.request_id,selected.client,selected.caller,selected.api,selected.kind,selected.status,selected.stream,selected.tools,requestDuration(selected,request,currentId,snapshotActive),selected.prompt_tokens,selected.cached_tokens,selected.cache_write_tokens,selected.output_tokens,selected.cache_source,selected.finish,selected.error]:null);if(body.dataset.signature!==signature){body.dataset.signature=signature;body.replaceChildren();if(!shown.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=7;cell.textContent='暂无匹配调用';row.append(cell);body.append(row)}else for(const call of shown){const row=document.createElement('tr'),id=String(call.request_id||'');row.dataset.requestId=id;row.setAttribute('aria-selected',String(id===selectedRequestId));const first=document.createElement('td'),button=document.createElement('button');button.type='button';button.className='request-select';button.textContent=id||'—';button.setAttribute('aria-label','检查请求 '+(id||'未知'));button.setAttribute('aria-controls','requestInspector');button.addEventListener('click',()=>selectRequest(id));first.append(button);row.append(first);[call.client,call.caller,call.api,callStatus(call.status),requestDuration(call,request,currentId,snapshotActive),call.error].forEach((value,index)=>{const cell=document.createElement('td');if(index===3){cell.className='result';cell.dataset.status=String(call.status||'')}cell.textContent=value==null||value===''?'—':String(value);row.append(cell)});body.append(row)}if(focused){const next=[...body.querySelectorAll('.request-select')].find(button=>button.closest('tr').dataset.requestId===focused);if(next)next.focus()}}if(inspector.dataset.signature!==inspectorSignature){inspector.dataset.signature=inspectorSignature;paintRequestInspector(selected,request,currentId,snapshotActive)}const active='当前活动请求：'+(currentId||'—');text('managementCallsActive',active);text('monitorCallsActive',active)}"
+"function phaseLabel(value){return ({decode:'解码',prefill:'预填充',idle:'空闲'})[value]||'未知'}"
+"function paintRecentCalls(calls,request,snapshotActive){calls=calls||{};const root=$('managementRecentCalls'),records=(calls.records||[]).slice(0,3),currentId=snapshotActive?activeId(calls.active_request_id):null;root.replaceChildren();if(!records.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=5;cell.textContent='暂无调用记录';row.append(cell);root.append(row);return}for(const call of records){const row=document.createElement('tr');row.dataset.callId=String(call.request_id||'');[call.request_id,call.client,call.api,callStatus(call.status),requestDuration(call,request,currentId,snapshotActive)].forEach((value,index)=>{const cell=document.createElement('td');if(index===3){cell.className='result';cell.dataset.status=String(call.status||'')}cell.textContent=value==null||value===''?'—':String(value);row.append(cell)});root.append(row)}}"
+"function pressure(v){return v==='normal'?'正常':v==='warning'?'警告':v==='critical'?'严重':'不可用'}"
+"function paintHost(h){let physical='不可用',swap='不可用',rss='不可用';if(h&&h.available){const physicalValues=[h.memory_used_bytes,h.memory_total_bytes,h.memory_available_bytes],swapValues=[h.swap_used_bytes,h.swap_total_bytes];if(physicalValues.every(nonnegative))physical=physicalValues.map(bytes).join(' / ');if(pressure(h.memory_pressure)!=='不可用'&&swapValues.every(nonnegative))swap=pressure(h.memory_pressure)+' / '+swapValues.map(bytes).join(' / ');if(nonnegative(h.process_rss_bytes))rss=bytes(h.process_rss_bytes)}for(const prefix of ['management','monitor']){text(prefix+'HostPhysical',physical);text(prefix+'HostPressure',swap);text(prefix+'HostRss',rss)}}"
+"function duration(v){if(!nonnegative(v))return '—';const seconds=Math.floor(v),days=Math.floor(seconds/86400),hours=Math.floor(seconds%86400/3600),minutes=Math.floor(seconds%3600/60);return days?days+'d '+hours+'h':hours?hours+'h '+minutes+'m':minutes?minutes+'m':'<1m'}"
+"function timelineState(name,state){const node=document.querySelector('[data-timeline-stage=\"'+name+'\"]');if(node)node.dataset.state=state}"
+"function paintTimeline(s){const p=s.prefill||{},d=s.decode||{},r=s.request||{},calls=s.calls||{},currentId=s.active===true?activeId(calls.active_request_id):null,record=(calls.records||[]).find(call=>currentId&&String(call.request_id)===currentId),active=s.active===true&&!!record,prefilling=active&&s.phase==='prefill',decoding=active&&s.phase==='decode',elapsed=active&&nonnegative(r.elapsed_sec)?Number(r.elapsed_sec).toFixed(1)+'s':'—';text('timelineSummary',active?'#'+currentId+' / '+(record.client||'未标识服务'):'等待实时请求');text('timelinePrompt',active?num(r.prompt_tokens).toLocaleString()+' token':'—');text('timelineKv',active?pct(ratio(r.cached_tokens,r.prompt_tokens))+' hit':'—');text('timelinePrefill',active&&nonnegative(p.elapsed_sec)?Number(p.elapsed_sec).toFixed(1)+'s':'—');text('timelineExpert',decoding?'aggregate route':'逐专家不可用');text('timelineDecode',decoding&&nonnegative(d.elapsed_sec)?Number(d.elapsed_sec).toFixed(1)+'s':'—');text('timelineResponse',active?(r.stream?'stream':'buffered'):'—');text('timelineFootPrompt',active?'输入 '+num(r.prompt_tokens).toLocaleString()+' token':'输入 —');text('timelineFootOutput',active?'输出 '+num(d.generated).toLocaleString()+' token':'输出 —');text('timelineFootElapsed','总耗时 '+elapsed);timelineState('prompt',active?'done':'idle');timelineState('kv',active?'done':'idle');timelineState('prefill',prefilling?'active':decoding?'done':'idle');timelineState('expert',decoding?'active':'idle');timelineState('decode',decoding?'active':'idle');timelineState('response',decoding&&r.stream?'active':'idle')}"
+"function paintUsage(usage){usage=usage||{};const total=num(usage.total_tokens),prompt=num(usage.prompt_tokens),output=num(usage.output_tokens),activeDays=num(usage.active_days),formatDate=seconds=>seconds>0?new Date(seconds*1000).toLocaleDateString('zh-CN',{timeZone:'UTC'}):'尚无记录';text('topTotalTokens',total.toLocaleString());text('usageTotal',total.toLocaleString());text('usagePeak',num(usage.peak_tokens).toLocaleString());text('usageRequests',num(usage.requests).toLocaleString());text('usageCurrentStreak',num(usage.current_streak).toLocaleString()+' 天');text('usageLongestStreak',num(usage.longest_streak).toLocaleString()+' 天');text('usageSince','自 '+formatDate(num(usage.first_day_start))+' 起永久累计 · '+(usage.persistent?'本机持久化':'当前进程'));text('usagePrompt',prompt.toLocaleString());text('usageOutput',output.toLocaleString());text('usageOutputShare',total>0?pct(output/total):'—');text('usageActiveDays',activeDays.toLocaleString()+' 天');text('usageDailyAverage',activeDays>0?Math.round(total/activeDays).toLocaleString():'—');text('usagePersistence',usage.persistent?'本机永久持久化':'仅当前进程');const promptShare=total>0?prompt/total:0;$('usagePromptBar').style.width=Math.max(0,Math.min(100,promptShare*100))+'%';$('usageOutputBar').style.width=Math.max(0,Math.min(100,(1-promptShare)*100))+'%';const heatmap=$('usageHeatmap'),days=usage.days||[],anchor=num(usage.last_day_start)||Math.floor(Date.now()/86400000)*86400,start=anchor-370*86400,byDay=new Map(days.map(day=>[num(day.day_start),day])),windowDays=Array.from({length:371},(_,i)=>byDay.get(start+i*86400)||{day_start:start+i*86400,prompt_tokens:0,output_tokens:0,total_tokens:0,requests:0}),peak=Math.max(1,...windowDays.map(day=>num(day.total_tokens))),signature=JSON.stringify(windowDays.map(day=>[day.day_start,day.prompt_tokens,day.output_tokens,day.total_tokens,day.requests]));heatmap.setAttribute('aria-label','最近 53 周 Token 活动，永久累计 '+total.toLocaleString()+' token');if(heatmap.dataset.signature===signature)return;heatmap.dataset.signature=signature;heatmap.replaceChildren();for(const day of windowDays){const cell=document.createElement('i'),dayTotal=num(day.total_tokens),stamp=new Date(num(day.day_start)*1000),level=dayTotal>0?Math.max(1,Math.min(4,Math.ceil(dayTotal/peak*4))):0;cell.dataset.usageDay=String(day.day_start);cell.dataset.level=String(level);cell.title=stamp.toLocaleDateString('zh-CN',{timeZone:'UTC'})+' · 输入 '+num(day.prompt_tokens).toLocaleString()+' · 输出 '+num(day.output_tokens).toLocaleString()+' · 总计 '+dayTotal.toLocaleString();heatmap.append(cell)}}"
+"function paintRuntimeInspector(s){const k=s.kv_cache||{},h=s.host||{},ku=k.enabled?ratio(k.used_bytes,k.budget_bytes):null,mu=h.available?ratio(h.memory_used_bytes,h.memory_total_bytes):null,routing=s.active===true&&s.phase==='decode',expert=$('inspectorExpertModule');text('inspectorKvUsage',k.enabled?pct(ku):'OFF');text('inspectorKvMeta',k.enabled?bytes(k.used_bytes)+' hot / '+bytes(k.budget_bytes)+' budget · '+num(k.entries).toLocaleString()+' blocks':'磁盘 KV 未配置');$('inspectorKvBar').style.width=Math.max(0,Math.min(100,(ku||0)*100))+'%';text('inspectorExpertValue',routing?'ROUTING':'STANDBY');text('inspectorExpertMeta',routing?'聚合解码信号 · 逐专家占用暂不可用':'逐专家路由遥测暂不可用');if(expert)expert.dataset.active=String(routing);text('inspectorMemoryUsage',h.available?pct(mu):'—');text('inspectorMemoryMeta',h.available?pressure(h.memory_pressure)+' · '+bytes(h.memory_used_bytes)+' / '+bytes(h.memory_total_bytes)+' · RSS '+bytes(h.process_rss_bytes):'等待主机采样');$('inspectorMemoryBar').style.width=Math.max(0,Math.min(100,(mu||0)*100))+'%'}"
+"function paintManagement(s){const x=s.context||{},k=s.kv_cache||{};text('managementPhase',phaseLabel(s.phase));text('managementQueue','队列 '+num(s.queue_depth).toLocaleString()+' · 客户端 '+num(s.clients).toLocaleString());text('managementContext',num(x.remaining).toLocaleString()+' token 可用');text('managementContextRatio',pct(ratio(x.remaining,x.limit_tokens))+' 可用 · '+num(x.current_tokens).toLocaleString()+' / '+num(x.limit_tokens).toLocaleString());if(k.enabled){text('managementKv',bytes(k.used_bytes).replace(/ GB$/,'')+' / '+bytes(k.budget_bytes));text('managementKvRatio',pct(ratio(k.used_bytes,k.budget_bytes))+' 已使用')}else{text('managementKv','已禁用');text('managementKvRatio','未配置磁盘 KV 缓存')}paintRecentCalls(s.calls,s.request,s.active===true);paintHost(s.host)}"
+"const metricMotionValues=Object.create(null),metricMotionText=Object.create(null);function metricTruncation(node,windowNode){node.classList.remove('metric-value-truncated');const truncated=windowNode.scrollWidth>windowNode.clientWidth+1;node.classList.toggle('metric-value-truncated',truncated);if(truncated)node.title=windowNode.textContent;else node.removeAttribute('title')}function refreshMetricTruncation(){document.querySelectorAll('.metric-value-window').forEach(windowNode=>metricTruncation(windowNode.parentElement,windowNode))}function clearMetricMotion(){for(const id of Object.keys(metricMotionValues))delete metricMotionValues[id];for(const id of Object.keys(metricMotionText))delete metricMotionText[id];document.querySelectorAll('.metric-value').forEach(node=>{node.__metricMotionToken=(node.__metricMotionToken||0)+1;node.dataset.motionDirection='none';const windowNode=node.querySelector('.metric-value-window'),layers=windowNode?[...windowNode.querySelectorAll('.metric-value-layer')]:[];if(!windowNode)return;layers.forEach(layer=>layer.getAnimations().forEach(animation=>animation.cancel()));const stable=document.createElement('span');stable.className='metric-value-layer';stable.textContent=layers.length?layers[layers.length-1].textContent:'—';windowNode.replaceChildren(stable);metricTruncation(node,windowNode)})}const metricResizeRoot=$('monitorMetrics');if(metricResizeRoot){if(typeof ResizeObserver==='function')new ResizeObserver(refreshMetricTruncation).observe(metricResizeRoot);else window.addEventListener('resize',refreshMetricTruncation)}function metricText(id,value,raw){const node=$(id),windowNode=node&&node.querySelector('.metric-value-window'),next=String(value);if(!node||!windowNode)return;const numeric=finite(raw)?Number(raw):null,previous=metricMotionValues[id];const direction=numeric!=null&&previous!=null&&numeric!==previous?(numeric>previous?'increase':'decrease'):'none';node.dataset.motionDirection=direction;if(numeric==null)delete metricMotionValues[id];else metricMotionValues[id]=numeric;if(metricMotionText[id]===next)return;const incoming=document.createElement('span');incoming.className='metric-value-layer';incoming.textContent=next;const token=(node.__metricMotionToken||0)+1;node.__metricMotionToken=token;const finish=()=>{if(node.__metricMotionToken!==token)return;windowNode.replaceChildren(incoming);incoming.className='metric-value-layer';metricTruncation(node,windowNode)};if(direction==='none'||matchMedia('(prefers-reduced-motion: reduce)').matches){windowNode.replaceChildren(incoming);metricMotionText[id]=next;metricTruncation(node,windowNode);return}const outgoing=document.createElement('span');outgoing.className='metric-value-layer metric-value-layer-out-'+direction;outgoing.textContent=metricMotionText[id]||windowNode.textContent||'—';outgoing.setAttribute('aria-hidden','true');incoming.className='metric-value-layer metric-value-layer-in-'+direction;windowNode.replaceChildren(outgoing,incoming);incoming.addEventListener('animationend',finish,{once:true});setTimeout(finish,460);metricMotionText[id]=next}function paintMonitor(s){const p=s.prefill||{},d=s.decode||{},r=s.request||{},x=s.context||{},calls=s.calls||{},snapshotActive=s.active===true,currentId=snapshotActive?activeId(calls.active_request_id):null,active=(calls.records||[]).find(call=>currentId&&String(call.request_id)===currentId),current=!!active,phase=({decode:'解码中',prefill:'预填充中',idle:'空闲'})[s.phase]||'未知阶段';text('monitorPhase',phase+' · '+(snapshotActive?'运行中':'就绪')+' · '+(current&&active.client||'—'));const cacheRatio=ratio(r.cached_tokens,r.prompt_tokens),prefillDisplay=current&&['prefill','decode'].includes(s.phase)&&finite(p.avg_tps)?Number(p.avg_tps).toFixed(1)+' t/s':'不可用',decodeDisplay=current&&s.phase==='decode'&&finite(d.avg_tps)?Number(d.avg_tps).toFixed(1)+' t/s':'不可用',cacheDisplay=current&&cacheRatio!=null?pct(cacheRatio):'不可用',contextDisplay=finite(x.utilization)?pct(Number(x.utilization)):'不可用',queueDisplay=finite(s.queue_depth)&&finite(s.clients)?num(s.queue_depth).toLocaleString()+' / '+num(s.clients).toLocaleString():'不可用';metricText('monitorPrefill',prefillDisplay,current&&['prefill','decode'].includes(s.phase)&&finite(p.avg_tps)?p.avg_tps:null);metricText('monitorDecode',decodeDisplay,current&&s.phase==='decode'&&finite(d.avg_tps)?d.avg_tps:null);metricText('monitorCacheHit',cacheDisplay,current&&cacheRatio!=null?cacheRatio:null);metricText('monitorContext',contextDisplay,finite(x.utilization)?x.utilization:null);metricText('monitorQueue',queueDisplay,finite(s.queue_depth)&&finite(s.clients)?s.queue_depth:null);paintCalls(calls,r,snapshotActive)}"
+"function renderSnapshot(s){const m=s.model||{},k=s.kv_cache||{},x=s.context||{},d=s.decode||{},mtp=s.mtp||{},calls=s.calls||{},currentId=s.active===true?activeId(calls.active_request_id):null,tracked=(calls.records||[]).find(record=>currentId&&String(record.request_id)===currentId),live=s.active===true&&!!tracked;dash.classList.toggle('is-active',live);text('model',(m.name||'未知模型')+' / '+(m.backend||'未知后端')+' / '+num(m.context_length).toLocaleString()+' token 上下文');text('health',s.active?'运行中':'就绪');text('topTokens',live&&s.phase==='decode'&&finite(d.avg_tps)?Number(d.avg_tps).toFixed(1):'—');text('topMtp',finite(mtp.acceptance_rate)?pct(mtp.acceptance_rate):'—');text('topUptime',duration(s.uptime_sec));paintManagement(s);paintMonitor(s);paintTimeline(s);paintUsage(s.token_usage);paintRuntimeInspector(s);"
+"if(!k.enabled){text('kvUsed','已禁用');text('kvBudget','已禁用');text('kvEntries','—');text('kvUtilization','未配置磁盘 KV 缓存。');$('kvBar').style.width='0%'}else{const ku=ratio(k.used_bytes,k.budget_bytes);text('kvUsed',bytes(k.used_bytes));text('kvBudget',bytes(k.budget_bytes));text('kvEntries',num(k.entries).toLocaleString());text('kvUtilization',pct(ku)+' 已使用');$('kvBar').style.width=Math.max(0,Math.min(100,(ku||0)*100))+'%';if(!kvTargetTouched&&!$('kvForm').contains(document.activeElement)){$('kvBudgetInput').value=(num(k.budget_bytes)/1073741824).toFixed(2).replace(/\\.?0+$/,'');$('kvBudgetUnit').value='GB'}}text('contextCurrent',num(x.current_tokens).toLocaleString()+' / '+num(x.limit_tokens).toLocaleString());text('contextRemaining',num(x.remaining).toLocaleString());text('contextUtilization',pct(x.utilization));if(!contextTargetTouched&&!$('contextForm').contains(document.activeElement))$('contextNextInput').value=num(x.next_limit_tokens)||num(x.limit_tokens)||''}"
+"function paint(s){validateSnapshot(s);const previous=lastSnapshot;try{renderSnapshot(s)}catch(error){if(previous)renderSnapshot(previous);throw error}lastSnapshot=s;lastUpdatedAt=Date.now();online=true;kvEnabled=s.kv_cache.enabled===true;currentKvBudgetBytes=kvEnabled?s.kv_cache.budget_bytes:null;setStale(false);text('updatedAt',freshnessLabel(false));cueFreshness();updateKvTargetState();contextControls();setKvState(kvState)}"
+"function kvLocalError(message,code){const error=new Error(message);error.safe=true;error.code=code||'';return error}"
+"function budgetMB(){const value=Number($('kvBudgetInput').value),factor=$('kvBudgetUnit').value==='GB'?1024:1,mb=value*factor;if(!Number.isFinite(mb)||!Number.isInteger(mb)||mb<256)throw kvLocalError('请输入换算后为整数 MB 的容量（最小 256 MB）。');return mb}"
+"function updateKvTargetState(){if(!kvEnabled||!Number.isSafeInteger(currentKvBudgetBytes)){text('kvTargetState','当前运行时容量不可用');return}let target;try{target=budgetMB()*1048576}catch(e){text('kvTargetState',kvTargetTouched?'目标容量尚无效':'等待有效目标容量');return}text('kvTargetState',target===currentKvBudgetBytes?'目标容量与当前运行时一致':'尚未应用到当前运行时')}"
+"async function admin(mode,mb,revision){const payload={mode,budget_mb:mb};if(mode==='apply')payload.revision=String(revision);const response=await fetch('/ds4/admin/kv-cache',{method:'POST',headers:{'Content-Type':'application/json','X-DS4-Admin':'1'},body:JSON.stringify(payload)});if(response.status===403){adminLocal=false;setKvState(kvState);throw kvLocalError('KV 容量设置仅可从本机管理。','forbidden')}let body;try{body=await response.json()}catch(e){throw kvLocalError('操作失败：服务器返回了无法读取的结果。','unreadable')}if(!body.ok&&!(mode==='persist'&&body.persistent&&body.persistent.committed)){const error=new Error('server error');error.code=body.error&&body.error.code;error.body=body;throw error}return body}"
+"function runtimeMessage(r){const evicted=r.before_entries-r.after_entries;return '运行时：'+bytes(r.before_bytes)+' → '+bytes(r.after_bytes)+'，条目 '+r.before_entries+' → '+r.after_entries+'（清理 '+evicted+' 条）；上限 '+bytes(r.old_budget_bytes)+' → '+bytes(r.new_budget_bytes)+'。'}"
+"function persistentMessage(body){const p=body.persistent||{};if(!p.attempted)return '未尝试持久化。';if(p.ok&&p.committed&&p.durable)return '已保存供下次启动使用：已提交并完成持久化。';if(p.committed&&!p.durable)return '已保存供下次启动使用：已提交，但尚未确认持久化。';return '未能提交下次启动设置。'}"
+"function setKvMessage(message,bad){$('adminNotice').className=bad?'notice bad':'notice';text('adminNotice',message)}"
+"function kvErrorMessage(error){if(error&&error.code==='kv_state_changed')return 'KV 状态持续变化，请等待活动缓存操作结束后重试。';if(error&&error.safe)return error.message;return '操作失败：请检查输入、权限或服务器状态。'}"
+"function focusKvTrigger(){if(kvTrigger&&!kvTrigger.disabled)kvTrigger.focus();else $('kvCapacity').focus()}"
+"function finishKvSuccess(message){kvReview=null;setKvInvalid(false);setKvState('success');setKvMessage(message,false);focusKvTrigger()}"
+"function finishKvError(error){kvReview=null;setKvState('error');setKvMessage(kvErrorMessage(error),true);focusKvTrigger()}"
+"function reviewFingerprint(r){return JSON.stringify([r.old_budget_bytes,r.new_budget_bytes,r.before_bytes,r.before_entries,r.after_bytes,r.after_entries,r.eviction_required])}"
+"function reviewFact(label,value){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value;$('kvReviewFacts').append(dt,dd)}"
+"function showKvReview(runtime,mb){const facts=$('kvReviewFacts');facts.replaceChildren();reviewFact('容量',bytes(runtime.old_budget_bytes)+' → '+bytes(runtime.new_budget_bytes));reviewFact('修改前使用量',bytes(runtime.before_bytes)+' / '+num(runtime.before_entries).toLocaleString()+' 条');reviewFact('需要清理',runtime.eviction_required?'是':'否');reviewFact('预计清理',Math.max(0,num(runtime.before_entries)-num(runtime.after_entries)).toLocaleString()+' 条');reviewFact('预计释放',bytes(Math.max(0,num(runtime.before_bytes)-num(runtime.after_bytes))));kvReview={runtime,mb,fingerprint:reviewFingerprint(runtime)};setKvState('review');setKvMessage(runtime.eviction_required?'请确认清理影响后再立即应用。':'请确认运行时影响后再立即应用。',runtime.eviction_required);$('kvReview').focus()}"
+"function normalizeRuntime(body,expectedTargetBytes,requireApplied){const r=body&&body.runtime,invalid=()=>{throw kvLocalError('操作失败：服务器返回的运行时结果无法读取。','unreadable_runtime')};if(!Number.isSafeInteger(expectedTargetBytes)||expectedTargetBytes<0||!r||typeof r!=='object'||Array.isArray(r)||r.attempted!==true||r.ok!==true||r.applied!==requireApplied||typeof r.eviction_required!=='boolean'||typeof r.revision!=='string'||!/^(0|[1-9][0-9]*)$/.test(r.revision))invalid();const normalized={ok:true,applied:r.applied,revision:r.revision,eviction_required:r.eviction_required};for(const field of ['old_budget_bytes','new_budget_bytes','before_bytes','after_bytes','before_entries','after_entries']){if(typeof r[field]!=='number'||!Number.isSafeInteger(r[field])||r[field]<0)invalid();normalized[field]=r[field]}const eviction=normalized.before_bytes>expectedTargetBytes;if(normalized.new_budget_bytes!==expectedTargetBytes||normalized.after_bytes>expectedTargetBytes||normalized.eviction_required!==eviction||normalized.after_bytes>normalized.before_bytes||normalized.after_entries>normalized.before_entries)invalid();if(eviction&&(normalized.after_bytes>=normalized.before_bytes||normalized.after_entries>=normalized.before_entries))invalid();if(!eviction&&(normalized.after_bytes!==normalized.before_bytes||normalized.after_entries!==normalized.before_entries))invalid();return normalized}"
+"async function checkKvImpact(){if(!online||!adminLocal||!kvEnabled||['checking','review','applying','saving'].includes(kvState)){setKvState(kvState);return}kvTrigger=$('kvApplyNow');let mb;try{mb=budgetMB();setKvInvalid(false)}catch(e){setKvInvalid(true);finishKvError(e);return}setKvState('checking');setKvMessage('正在检查清理压力…',false);try{showKvReview(normalizeRuntime(await admin('dry-run',mb),mb*1048576,false),mb)}catch(e){finishKvError(e)}}"
+"async function confirmKvApply(){if(kvState!=='review'||!kvReview||!online||!adminLocal||!kvEnabled){setKvState(kvState);return}const reviewed=kvReview,targetBytes=reviewed.mb*1048576;setKvState('applying');setKvMessage('正在应用已审阅的运行时上限…',false);try{let applied;try{applied=normalizeRuntime(await admin('apply',reviewed.mb,String(reviewed.runtime.revision)),targetBytes,true)}catch(e){if(e.code!=='kv_state_changed')throw e;setKvMessage('KV 状态已变化，正在重新检查影响…',false);const refreshed=normalizeRuntime(await admin('dry-run',reviewed.mb),targetBytes,false),fingerprint=reviewFingerprint(refreshed);if(fingerprint!==reviewed.fingerprint){showKvReview(refreshed,reviewed.mb);return}try{applied=normalizeRuntime(await admin('apply',reviewed.mb,String(refreshed.revision)),targetBytes,true)}catch(retry){if(retry.code==='kv_state_changed')throw kvLocalError('KV 状态持续变化，请等待活动缓存操作结束后重试。','kv_state_changed');throw retry}}finishKvSuccess(runtimeMessage(applied))}catch(e){finishKvError(e)}}"
+"function cancelKvApply(){if(kvState!=='review')return;kvReview=null;setKvState('idle');setKvMessage('已取消应用；运行时容量未改变。',false);focusKvTrigger()}"
+"async function persistKvBudget(){if(!online||!adminLocal||!kvEnabled||['checking','review','applying','saving'].includes(kvState)){setKvState(kvState);return}kvTrigger=$('kvSaveRestart');let mb;try{mb=budgetMB();setKvInvalid(false)}catch(e){setKvInvalid(true);finishKvError(e);return}setKvState('saving');setKvMessage('正在保存下次启动上限…',false);try{const saved=await admin('persist',mb),p=saved.persistent||{};if(!p.committed)throw kvLocalError('服务器未提交下次启动设置。');if(!p.ok||!p.durable){kvReview=null;setKvState('error');setKvMessage(persistentMessage(saved),true);focusKvTrigger();return}finishKvSuccess(persistentMessage(saved))}catch(e){finishKvError(e)}}"
+"function contextNotice(message,bad){$('contextNotice').className=bad?'notice bad':'notice';text('contextNotice',message)}async function saveContext(){if(contextBusy||!online||!contextLocal){contextControls();return}const value=Number($('contextNextInput').value);if(!Number.isInteger(value)||value<4096||value>2147483647){$('contextNextInput').setAttribute('aria-invalid','true');contextNotice('请输入 4,096 到 2,147,483,647 之间的整数 token 上限。',true);return}$('contextNextInput').setAttribute('aria-invalid','false');contextBusy=true;contextNotice('正在保存下次启动设置…',false);contextControls();try{const response=await fetch('/ds4/admin/context',{method:'POST',headers:{'Content-Type':'application/json','X-DS4-Admin':'1'},body:JSON.stringify({context_tokens:value})});let body;try{body=await response.json()}catch(e){throw new Error('服务器返回了无法读取的上下文设置结果。')}if(response.status===403){contextLocal=false;throw new Error('上下文设置仅可从本机管理。')}if(!body.ok&&!(body.persistent&&body.persistent.committed))throw new Error('上下文设置失败，请检查数值后重试。');const p=body.persistent||{};contextNotice(p.committed&&p.durable?'已保存：下次启动生效，需要重启；当前运行值未改变。':p.committed?'已提交，但尚未确认已持久化；下次启动生效，需要重启；当前运行值未改变。':'未能提交下次启动设置。',!p.committed||!p.durable)}catch(e){contextNotice(e.message,true)}finally{contextBusy=false;contextControls()}}"
+"const themeMedia=matchMedia('(prefers-color-scheme: dark)');function setTheme(value){const preference=['system','dark','light'].includes(value)?value:'system',resolved=preference==='system'?(themeMedia.matches?'dark':'light'):preference;document.documentElement.dataset.theme=resolved;document.documentElement.dataset.themePreference=preference;dash.dataset.themePreference=preference;try{localStorage.setItem('ds4-dashboard-theme',preference)}catch(e){}document.querySelectorAll('[data-theme-choice]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.themeChoice===preference)))}"
+"function setStale(flag){const stale=!!flag;dash.classList.toggle('stale',stale);document.body.classList.toggle('dashboard-stale',stale);document.querySelectorAll('.light-field,.light-shadow').forEach(light=>light.style.animationPlayState=stale?'paused':'running');if(stale){clearFreshness();clearMetricMotion()}}function setMode(value){const mode=['management','monitor','usage'].includes(value)?value:'monitor';dash.dataset.mode=mode;for(const name of ['management','monitor','usage']){const root=$(name+'Layout'),active=name===mode;root.hidden=!active;root.setAttribute('aria-hidden',String(!active))}try{localStorage.setItem('ds4-dashboard-mode',mode)}catch(e){}document.querySelectorAll('[data-mode-choice]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.modeChoice===mode)))}const filterLabels={callFilterCaller:'调用方',callFilterClient:'服务',callFilterApi:'API',callFilterStatus:'结果'};for(const [id,labelText] of Object.entries(filterLabels)){const control=$(id),field=document.createElement('div'),label=document.createElement('label');field.className='filter-field';label.className='eyebrow';label.htmlFor=id;label.textContent=labelText;control.before(field);field.append(label,control)}try{setMode(localStorage.getItem('ds4-dashboard-mode'));setTheme(localStorage.getItem('ds4-dashboard-theme'))}catch(e){setMode('monitor');setTheme('system')}document.querySelectorAll('[data-mode-choice]').forEach(b=>b.addEventListener('click',()=>setMode(b.dataset.modeChoice)));document.querySelectorAll('[data-theme-choice]').forEach(b=>b.addEventListener('click',()=>setTheme(b.dataset.themeChoice)));const syncSystemTheme=()=>{if(document.documentElement.dataset.themePreference==='system')setTheme('system')};if(themeMedia.addEventListener)themeMedia.addEventListener('change',syncSystemTheme);else if(themeMedia.addListener)themeMedia.addListener(syncSystemTheme);const touchKvTarget=()=>{kvTargetTouched=true;setKvInvalid(false);updateKvTargetState()};$('kvBudgetInput').addEventListener('input',touchKvTarget);$('kvBudgetUnit').addEventListener('input',touchKvTarget);$('kvBudgetUnit').addEventListener('change',touchKvTarget);$('contextNextInput').addEventListener('input',()=>{contextTargetTouched=true;$('contextNextInput').setAttribute('aria-invalid','false')});['callFilterCaller','callFilterClient','callFilterApi','callFilterStatus'].forEach(id=>$(id).addEventListener('input',()=>{const s=lastSnapshot||{};paintCalls(s.calls,s.request,s.active===true)}));"
+"const STATUS_TIMEOUT_MS=2000;/* Bound a status request without overlapping client polls. */async function tick(){const generation=++pollGeneration,controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),STATUS_TIMEOUT_MS);try{const response=await fetch('/ds4/status',{cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error('status '+response.status);const snapshot=await response.json();if(generation===pollGeneration){pollFailures=0;paint(snapshot)}}catch(e){if(generation===pollGeneration){pollFailures++;online=false;setStale(true);text('health',lastSnapshot?'数据已过期':'不可用');text('updatedAt',freshnessLabel(true));setKvState(kvState);contextControls()}}finally{clearTimeout(timeout);if(generation===pollGeneration)if(pollFailures)setTimeout(tick,Math.min(5000,1000*pollFailures));else setTimeout(tick,1000)}}$('kvApplyNow').addEventListener('click',checkKvImpact);$('kvSaveRestart').addEventListener('click',persistKvBudget);$('kvConfirmApply').addEventListener('click',confirmKvApply);$('kvCancelApply').addEventListener('click',cancelKvApply);$('contextSaveRestart').addEventListener('click',saveContext);setInterval(()=>text('updatedAt',freshnessLabel(!online)),1000);setKvState(kvState);contextControls();tick();"
+"const ds4UnknownClient=value=>{const text=String(value==null?'':value).trim();return !text||text==='未标识服务'||text==='—'};const ds4StableClient=(record,records)=>{const raw=String(record&&record.client!=null?record.client:'').trim();if(!ds4UnknownClient(raw))return raw;const caller=String(record&&record.caller!=null?record.caller:'').trim();if(!caller||ds4AmbiguousClients.has(caller))return raw||'未标识服务';const known=[...new Set((records||[]).filter(item=>String(item&&item.caller!=null?item.caller:'').trim()===caller).map(item=>String(item&&item.client!=null?item.client:'').trim()).filter(item=>!ds4UnknownClient(item)))];return known.length===1?known[0]:raw||'未标识服务'};const ds4StableCalls=calls=>{const source=Array.isArray(calls&&calls.records)?calls.records:[],records=source.map(record=>({...record,client:ds4StableClient(record,source)}));return {...(calls||{}),records}};const rawPaintCalls=paintCalls;paintCalls=function(calls,request,snapshotActive){return rawPaintCalls(ds4StableCalls(calls),request,snapshotActive)};const rawPaintRecentCalls=paintRecentCalls;paintRecentCalls=function(calls,request,snapshotActive){return rawPaintRecentCalls(ds4StableCalls(calls),request,snapshotActive)};const rawPaintMonitor=paintMonitor;paintMonitor=function(snapshot){const stable={...snapshot,calls:ds4StableCalls(snapshot&&snapshot.calls)};rawPaintMonitor(stable);const calls=stable.calls||{},currentId=stable.active===true?activeId(calls.active_request_id):null,current=(calls.records||[]).find(record=>currentId&&String(record.request_id)===currentId),prefill=stable.prefill||{},decode=stable.decode||{},active=stable.active===true&&!!current,showPrefill=active&&['prefill','decode'].includes(stable.phase)&&finite(prefill.current)&&finite(prefill.total)&&prefill.total>0,showDecode=active&&stable.phase==='decode'&&finite(decode.generated)&&finite(decode.max_tokens)&&decode.max_tokens>0;const setProgress=(id,show,value,total)=>{const node=$(id);if(node)node.style.width=(show?Math.max(0,Math.min(100,value/total*100)):0)+'%'};setProgress('monitorPrefillBar',showPrefill,num(prefill.current),num(prefill.total));setProgress('monitorDecodeBar',showDecode,num(decode.generated),num(decode.max_tokens))};const metricCells=[...document.querySelectorAll('#monitorMetrics>div')];[[1,'monitorPrefillBar'],[2,'monitorDecodeBar']].forEach(([index,id])=>{const cell=metricCells[index];if(!cell)return;cell.classList.add('metric-primary');let bar=cell.querySelector('.metric-bar');if(!bar){bar=document.createElement('div');bar.className='metric-bar';bar.setAttribute('aria-hidden','true');const span=document.createElement('span');span.id=id;bar.append(span);cell.append(bar)}});document.querySelectorAll('[data-mode-choice]').forEach(button=>button.addEventListener('click',()=>{const activeLayout=document.querySelector('.mode-layout:not([hidden])');if(activeLayout){activeLayout.classList.remove('mode-enter');void activeLayout.offsetWidth;activeLayout.classList.add('mode-enter')}}))"
+";const ds4ClientMemoryKey='ds4-dashboard-client-map',ds4AmbiguousMemoryKey='ds4-dashboard-client-ambiguous',ds4KnownClients=(()=>{try{const raw=JSON.parse(localStorage.getItem(ds4ClientMemoryKey)||'{}');return new Map(Object.entries(raw).filter(([caller,client])=>caller&&client&&caller.length<=160&&client.length<=160).slice(-128))}catch(e){return new Map()}})(),ds4AmbiguousClients=(()=>{try{const raw=JSON.parse(localStorage.getItem(ds4AmbiguousMemoryKey)||'[]');return new Set((Array.isArray(raw)?raw:[]).filter(caller=>typeof caller==='string'&&caller&&caller.length<=160).slice(-128))}catch(e){return new Set()}})(),ds4PersistClients=()=>{try{const known=[...ds4KnownClients].filter(([caller])=>!ds4AmbiguousClients.has(caller)).slice(-128);localStorage.setItem(ds4ClientMemoryKey,JSON.stringify(Object.fromEntries(known)));localStorage.setItem(ds4AmbiguousMemoryKey,JSON.stringify([...ds4AmbiguousClients].slice(-128)))}catch(e){}};const ds4StableCallsPersistent=calls=>{const source=Array.isArray(calls&&calls.records)?calls.records:[],snapshotClients=new Map();source.forEach(record=>{const caller=String(record&&record.caller!=null?record.caller:'').trim(),client=String(record&&record.client!=null?record.client:'').trim();if(!caller||ds4UnknownClient(client))return;let clients=snapshotClients.get(caller);if(!clients){clients=new Set();snapshotClients.set(caller,clients)}clients.add(client)});let clientsChanged=false;snapshotClients.forEach((clients,caller)=>{if(clients.size!==1){if(!ds4AmbiguousClients.has(caller)){ds4AmbiguousClients.add(caller);clientsChanged=true}if(ds4KnownClients.delete(caller))clientsChanged=true;return}const client=clients.values().next().value,known=ds4KnownClients.get(caller);if(ds4AmbiguousClients.has(caller)){if(ds4KnownClients.delete(caller))clientsChanged=true}else if(known&&known!==client){ds4KnownClients.delete(caller);ds4AmbiguousClients.add(caller);clientsChanged=true}else if(known!==client){ds4KnownClients.set(caller,client);clientsChanged=true}});const records=source.map(record=>{const raw=String(record&&record.client!=null?record.client:'').trim();if(!ds4UnknownClient(raw))return record;const caller=String(record&&record.caller!=null?record.caller:'').trim(),clients=snapshotClients.get(caller),mapped=caller&&!ds4AmbiguousClients.has(caller)?clients&&clients.size===1?clients.values().next().value:clients&&clients.size>1?null:ds4KnownClients.get(caller):null;return {...record,client:mapped||raw||'未标识服务'}});if(clientsChanged)ds4PersistClients();return {...(calls||{}),records}};const ds4PaintCallsWithMemory=paintCalls;paintCalls=function(calls,request,snapshotActive){return ds4PaintCallsWithMemory(ds4StableCallsPersistent(calls),request,snapshotActive)};const ds4PaintRecentWithMemory=paintRecentCalls;paintRecentCalls=function(calls,request,snapshotActive){return ds4PaintRecentWithMemory(ds4StableCallsPersistent(calls),request,snapshotActive)};const ds4PaintTimelineWithMemory=paintTimeline;paintTimeline=function(snapshot){return ds4PaintTimelineWithMemory({...snapshot,calls:ds4StableCallsPersistent(snapshot&&snapshot.calls)})};const ds4MetricCells=[...document.querySelectorAll('#monitorMetrics>div')],ds4MetricMeta=(index,id,label,klass)=>{const cell=ds4MetricCells[index];if(!cell)return;const eyebrow=cell.querySelector('.eyebrow');if(eyebrow)eyebrow.textContent=label;let node=$(id);if(!node){node=document.createElement('span');node.id=id;node.className=klass||'metric-subvalue';node.textContent='—';cell.append(node)}};ds4MetricMeta(0,'monitorPhaseMeta','CURRENT PHASE','metric-phase-meta');ds4MetricMeta(1,'monitorPrefillMeta','PREFILL');ds4MetricMeta(2,'monitorDecodeMeta','LIVE DECODE');const ds4FormatProgress=(value,total)=>finite(value)&&finite(total)&&total>0?num(value).toLocaleString()+' / '+num(total).toLocaleString()+' token · '+Math.min(100,value/total*100).toFixed(1)+'%':'不可用';const ds4PaintMonitorWithMemory=paintMonitor;paintMonitor=function(snapshot){const stable={...snapshot,calls:ds4StableCallsPersistent(snapshot&&snapshot.calls)};ds4PaintMonitorWithMemory(stable);const phase=$('monitorPhase'),phaseMeta=$('monitorPhaseMeta'),phaseParts=String(phase&&phase.textContent||'').split(' · ');if(phase&&phaseMeta){phase.textContent=phaseParts.length>2?phaseParts.slice(0,2).join(' · '):phaseParts.join(' · ');phaseMeta.textContent='服务 · '+(phaseParts.length>2?phaseParts.slice(2).join(' · '):'—')}const p=stable.prefill||{},d=stable.decode||{},prefillMeta=$('monitorPrefillMeta'),decodeMeta=$('monitorDecodeMeta');if(prefillMeta)prefillMeta.textContent=ds4FormatProgress(p.current,p.total);if(decodeMeta)decodeMeta.textContent=ds4FormatProgress(d.generated,d.max_tokens)};"
+"</script></body></html>\n";
+
+static bool send_dashboard_page(int fd, bool enable_cors) {
+    return http_response(fd, enable_cors, 200,
+                         "text/html; charset=utf-8",
+                         dashboard_html);
+}
+
+static const char *call_status_name(ds4_call_status status) {
+	return status == DS4_CALL_ACTIVE ? "active" :
+		status == DS4_CALL_COMPLETED ? "completed" :
+		status == DS4_CALL_CANCELLED ? "cancelled" : "failed";
+}
+
+static void append_status_calls_json(buf *b, const ds4_call_history_snapshot *calls,
+							 size_t capacity, uint64_t active_request_id) {
+	buf_printf(b, ",\"calls\":{\"capacity\":%llu,\"active_request_id\":\"%llu\",\"records\":[",
+		(unsigned long long)capacity, (unsigned long long)active_request_id);
+	for (size_t i = 0; calls && i < calls->records_len; i++) {
+		const ds4_call_record *r = &calls->records[i];
+		if (i) buf_putc(b, ',');
+		buf_puts(b, "{\"request_id\":");
+		buf_printf(b, "\"%llu\",\"caller\":", (unsigned long long)r->request_id);
+		json_escape(b, r->caller); buf_puts(b, ",\"client\":"); json_escape(b, r->client);
+		buf_puts(b, ",\"api\":"); json_escape(b, r->api);
+		buf_puts(b, ",\"kind\":"); json_escape(b, r->kind);
+		buf_printf(b, ",\"stream\":%s,\"tools\":%s,\"status\":",
+			r->stream ? "true" : "false", r->has_tools ? "true" : "false");
+		json_escape(b, call_status_name(r->status));
+		buf_printf(b, ",\"started_at\":%.3f,\"finished_at\":%.3f,\"prompt_tokens\":%d,\"cached_tokens\":%d,\"cache_write_tokens\":%d,\"output_tokens\":%d,\"cache_source\":",
+			r->started_at, r->finished_at, r->prompt_tokens, r->cached_tokens,
+			r->cache_write_tokens, r->output_tokens);
+		json_escape(b, r->cache_source); buf_puts(b, ",\"finish\":");
+		json_escape(b, r->finish); buf_puts(b, ",\"error\":");
+		json_escape(b, r->error); buf_putc(b, '}');
+	}
+	buf_puts(b, "],\"callers\":[");
+	for (size_t i = 0; calls && i < calls->callers_len; i++) {
+		const ds4_call_caller *c = &calls->callers[i];
+		if (i) buf_putc(b, ',');
+		buf_puts(b, "{\"caller\":"); json_escape(b, c->caller);
+		buf_puts(b, ",\"client\":"); json_escape(b, c->client);
+		buf_printf(b, ",\"calls\":%llu,\"failed\":%llu,\"prompt_tokens\":%llu,\"cached_tokens\":%llu,\"average_duration_sec\":%.3f,\"recent_at\":%.3f}",
+			(unsigned long long)c->calls, (unsigned long long)c->failures,
+			(unsigned long long)c->prompt_tokens, (unsigned long long)c->cached_tokens,
+			c->average_terminal_duration, c->recent_activity);
+	}
+	buf_puts(b, "]}");
+}
+
+static void append_token_usage_json(
+	buf *b, const ds4_token_history_snapshot *usage) {
+	const ds4_token_history_snapshot empty = {0};
+	if (!usage) usage = &empty;
+	const uint64_t total = status_sat_add(
+		usage->prompt_tokens, usage->output_tokens);
+	buf_printf(b, ",\"token_usage\":{\"persistent\":%s,"
+		"\"retention\":\"unlimited\",\"window_days\":%d,"
+		"\"prompt_tokens\":%llu,"
+		"\"output_tokens\":%llu,\"total_tokens\":%llu,"
+		"\"requests\":%llu,\"active_days\":%llu,"
+		"\"peak_tokens\":%llu,\"peak_day_start\":%lld,"
+		"\"current_streak\":%llu,\"longest_streak\":%llu,"
+		"\"first_day_start\":%lld,\"last_day_start\":%lld,\"days\":[",
+		usage->persistent ? "true" : "false",
+		DS4_TOKEN_HISTORY_WINDOW_DAYS,
+		(unsigned long long)usage->prompt_tokens,
+		(unsigned long long)usage->output_tokens,
+		(unsigned long long)total,
+		(unsigned long long)usage->requests,
+		(unsigned long long)usage->active_days,
+		(unsigned long long)usage->peak_tokens,
+		(long long)(usage->peak_day * 86400),
+		(unsigned long long)usage->current_streak,
+		(unsigned long long)usage->longest_streak,
+		(long long)(usage->first_day * 86400),
+		(long long)(usage->last_day * 86400));
+	for (size_t i = 0; i < usage->len; i++) {
+		const ds4_token_history_day *day = &usage->days[i];
+		const uint64_t day_total = status_sat_add(
+			day->prompt_tokens, day->output_tokens);
+		if (i) buf_putc(b, ',');
+		buf_printf(b, "{\"day_start\":%lld,\"prompt_tokens\":%llu,"
+			"\"output_tokens\":%llu,\"total_tokens\":%llu,"
+			"\"requests\":%llu}",
+			(long long)(day->day * 86400),
+			(unsigned long long)day->prompt_tokens,
+			(unsigned long long)day->output_tokens,
+			(unsigned long long)day_total,
+			(unsigned long long)day->requests);
+	}
+	buf_puts(b, "]}");
+}
+
+static void append_status_json(buf *b, const server_status *st,
+                               const ds4_kvstore_stats *kv,
+							 const ds4_host_metrics *host,
+							 const ds4_call_history_snapshot *calls,
+							 size_t calls_capacity, uint64_t active_request_id,
+							 const ds4_token_history_snapshot *usage) {
+    double uptime_sec = st->server_started_t > 0.0 ?
+        now_sec() - st->server_started_t : 0.0;
+    if (uptime_sec < 0.0) uptime_sec = 0.0;
+    double prefill_percent = st->prefill_total > 0 ?
+        100.0 * (double)st->prefill_current / (double)st->prefill_total : 100.0;
+    if (prefill_percent < 0.0) prefill_percent = 0.0;
+    if (prefill_percent > 100.0) prefill_percent = 100.0;
+    buf_puts(b, "{\"phase\":");
+    json_escape(b, st->phase);
+    buf_printf(b, ",\"active\":%s,\"uptime_sec\":%.3f,\"queue_depth\":%d,\"clients\":%d",
+               st->active ? "true" : "false",
+               uptime_sec,
+               st->queue_depth,
+               st->clients);
+    buf_puts(b, ",\"model\":{\"name\":");
+    json_escape(b, st->model_name);
+    buf_puts(b, ",\"backend\":");
+    json_escape(b, st->backend_name);
+    buf_printf(b, ",\"context_length\":%d,\"session_pos\":%d,\"default_tokens\":%d}",
+               st->ctx_size,
+               st->session_pos,
+               st->default_tokens);
+    buf_puts(b, ",\"request\":{\"kind\":");
+    json_escape(b, st->request_kind);
+    buf_puts(b, ",\"api\":");
+    json_escape(b, st->api);
+    buf_printf(b, ",\"stream\":%s,\"tools\":%s,\"prompt_tokens\":%d,"
+                  "\"cached_tokens\":%d,\"cache_write_tokens\":%d,"
+                  "\"elapsed_sec\":%.3f,\"started_sec\":%.3f,"
+                  "\"cache_source\":",
+               st->stream ? "true" : "false",
+               st->has_tools ? "true" : "false",
+               st->prompt_tokens,
+               st->cached_tokens,
+               st->cache_write_tokens,
+               st->active ? now_sec() - st->request_started_t : 0.0,
+               st->request_started_t);
+    json_escape(b, st->cache_source);
+    buf_puts(b, ",\"finish\":");
+    json_escape(b, st->finish);
+    buf_puts(b, ",\"last_error\":");
+    json_escape(b, st->last_error);
+    buf_putc(b, '}');
+    buf_printf(b, ",\"prefill\":{\"current\":%d,\"total\":%d,"
+                  "\"percent\":%.3f,\"avg_tps\":%.3f,\"chunk_tps\":%.3f,"
+                  "\"elapsed_sec\":%.3f,\"eta_sec\":%.3f}",
+               st->prefill_current,
+               st->prefill_total,
+               prefill_percent,
+               st->prefill_avg_tps,
+               st->prefill_chunk_tps,
+               st->prefill_elapsed_s,
+               st->prefill_eta_s > 0.0 ? st->prefill_eta_s : 0.0);
+    buf_printf(b, ",\"decode\":{\"generated\":%d,\"max_tokens\":%d,"
+                  "\"avg_tps\":%.3f,\"chunk_tps\":%.3f,\"elapsed_sec\":%.3f}",
+               st->decode_generated,
+               st->decode_max_tokens,
+               st->decode_avg_tps,
+               st->decode_chunk_tps,
+               st->decode_elapsed_s);
+    buf_printf(b, ",\"totals\":{\"requests\":%llu,\"completed\":%llu,\"failed\":%llu,"
+				  "\"cancelled\":%llu,"
+                  "\"cache\":{\"prompt_tokens\":%llu,\"cached_tokens\":%llu,"
+                  "\"prompt_requests\":%llu,\"hit_requests\":%llu}}",
+               (unsigned long long)st->total_requests,
+               (unsigned long long)st->completed_requests,
+               (unsigned long long)st->failed_requests,
+			   (unsigned long long)st->cancelled_requests,
+               (unsigned long long)st->total_prompt_tokens,
+               (unsigned long long)st->total_cached_tokens,
+               (unsigned long long)st->prompt_requests,
+               (unsigned long long)st->cache_hit_requests);
+	append_token_usage_json(b, usage);
+    const bool kv_enabled = kv && kv->enabled;
+    buf_printf(b, ",\"kv_cache\":{\"enabled\":%s,\"budget_bytes\":%llu,"
+                  "\"used_bytes\":%llu,\"entries\":%llu,\"revision\":\"%llu\"}",
+               kv_enabled ? "true" : "false",
+               (unsigned long long)(kv_enabled ? kv->budget_bytes : 0),
+               (unsigned long long)(kv_enabled ? kv->used_bytes : 0),
+               (unsigned long long)(kv_enabled ? kv->entries : 0),
+               (unsigned long long)(kv ? kv->revision : 0));
+	int limit = st->ctx_size > 0 ? st->ctx_size : 0;
+	int current = limit > 0 && st->session_pos > 0 ? st->session_pos : 0;
+	if (current > limit) current = limit;
+	int remaining = limit > current ? limit - current : 0;
+	double utilization = limit > 0 ? (double)current / (double)limit : 0.0;
+	int next_limit = st->next_ctx_size > 0 ? st->next_ctx_size : limit;
+	buf_printf(b, ",\"context\":{\"current_tokens\":%d,\"limit_tokens\":%d,\"next_limit_tokens\":%d,\"remaining\":%d,\"utilization\":%.3f}",
+		current, limit, next_limit, remaining, utilization);
+	const ds4_host_metrics unavailable = { .pressure = DS4_HOST_PRESSURE_UNKNOWN };
+	if (!host) host = &unavailable;
+	buf_printf(b, ",\"host\":{\"available\":%s,\"memory_total_bytes\":%llu,\"memory_used_bytes\":%llu,\"memory_available_bytes\":%llu,\"memory_pressure\":",
+		host->available ? "true" : "false", (unsigned long long)host->memory_total_bytes,
+		(unsigned long long)host->memory_used_bytes, (unsigned long long)host->memory_available_bytes);
+	json_escape(b, ds4_host_pressure_name(host->pressure));
+	buf_printf(b, ",\"swap_total_bytes\":%llu,\"swap_used_bytes\":%llu,\"process_rss_bytes\":%llu,\"sampled_at\":%.3f}",
+		(unsigned long long)host->swap_total_bytes, (unsigned long long)host->swap_used_bytes,
+		(unsigned long long)host->process_rss_bytes, host->sampled_at);
+	append_status_calls_json(b, calls, calls_capacity, active_request_id);
+    buf_puts(b, "}\n");
+}
+
+static bool send_status_json(server *s, int fd) {
+    server_status snapshot;
+    ds4_kvstore_stats kv = {0};
+	ds4_host_metrics host = {0};
+	ds4_call_history_snapshot calls = {0};
+	ds4_token_history_snapshot usage = {0};
+	size_t calls_capacity = 0;
+	uint64_t active_request_id = 0;
+    memset(&snapshot, 0, sizeof(snapshot));
+    if (s) {
+        pthread_mutex_lock(&s->status_mu);
+        snapshot = s->status;
+        pthread_mutex_unlock(&s->status_mu);
+		/* KV stats are the last completed wrapper snapshot.  Active disk I/O
+		 * may make them briefly stale, but status never waits for kv_mu. */
+		kv = server_kv_get_published_stats(s);
+		host = server_host_get_snapshot(s);
+		pthread_mutex_lock(&s->call_history_mu);
+		calls = ds4_call_history_snapshot_take(&s->call_history, ds4_wall_time_sec());
+		calls_capacity = s->call_history.capacity;
+		active_request_id = s->worker_active_call_request_id;
+		pthread_mutex_unlock(&s->call_history_mu);
+		usage = server_token_history_snapshot_take(s);
+    }
+    buf b = {0};
+	append_status_json(&b, &snapshot, &kv, &host, &calls, calls_capacity,
+		active_request_id, &usage);
+    bool ok = http_response(fd, s ? s->enable_cors : false, 200,
+                            "application/json", b.ptr);
+    buf_free(&b);
+	ds4_call_history_snapshot_free(&calls);
+    return ok;
+}
+
 static void server_finish_cancelled_active(server *s, server_slot *slot,
 	job *j,
 	int output_tokens, const char *cache_source, const char *reason) {
@@ -10854,6 +11095,7 @@ typedef struct {
     int old_pos;
     int prompt_len;
     int common;
+    int rewind_to;
     int start;
     int count;
     int live_id[TRACE_CACHE_WINDOW];
@@ -10869,6 +11111,7 @@ static void trace_cache_capture(
 {
     memset(d, 0, sizeof(*d));
     d->valid = true;
+    d->rewind_to = -1;
     d->old_pos = old_pos;
     d->prompt_len = prompt ? prompt->len : 0;
     d->common = common;
@@ -10895,9 +11138,17 @@ static void trace_cache_capture(
 static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
     if (!d || !d->valid) return "unknown";
     if (d->old_pos == 0) return "no-live-checkpoint";
+    if (d->rewind_to >= 0) return "live-prefix-rewind";
     if (d->common != d->old_pos) return "token-mismatch";
     if (d->prompt_len < d->old_pos) return "incoming-prompt-shorter-than-live-checkpoint";
     return "live-prefix-match";
+}
+
+static bool trace_cache_memory_reusable(const trace_cache_diag *d) {
+    return d && d->valid &&
+           (d->rewind_to >= 0 ||
+            (d->old_pos > 0 && d->common == d->old_pos &&
+             d->prompt_len >= d->old_pos));
 }
 
 static void trace_write_escaped_bytes(FILE *fp, const char *p, size_t len) {
@@ -10960,8 +11211,7 @@ static void trace_write_cache_diag(
             d && d->valid ? d->old_pos : 0,
             d && d->valid ? d->prompt_len : 0,
             d && d->valid ? d->common : 0,
-            d && d->valid && d->old_pos > 0 &&
-                d->common == d->old_pos && d->prompt_len >= d->old_pos ? 1 : 0,
+            trace_cache_memory_reusable(d) ? 1 : 0,
             trace_cache_miss_reason(d),
             tool_replay ? tool_replay->mem : 0,
             tool_replay ? tool_replay->disk : 0,
@@ -10973,7 +11223,7 @@ static void trace_write_cache_diag(
     if (disk_path && disk_path[0]) fprintf(s->trace, "disk_cache_file: %s\n", disk_path);
 
     if (!d || !d->valid || d->old_pos == 0 ||
-        (d->common == d->old_pos && d->prompt_len >= d->old_pos))
+        trace_cache_memory_reusable(d))
     {
         return;
     }
@@ -10999,6 +11249,13 @@ static void trace_write_cache_diag(
         trace_write_token(s->trace, s->engine, prompt);
         fputc('\n', s->trace);
     }
+}
+
+static int live_prefix_rewind_target(bool backend_can_rewind,
+                                     int old_pos, int prompt_len, int common) {
+    if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
+    if (common != prompt_len) return -1;
+    return prompt_len - 1;
 }
 
 static void trace_time(FILE *fp) {
@@ -11157,6 +11414,7 @@ typedef struct {
     bool headers_sent;
     bool stream_failed;
     double last_keepalive;
+    job *request_job;
 } server_prefill_progress;
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
@@ -11249,80 +11507,25 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
-/* Live recovery for a tool call started inside an unclosed <think> block.
- *
- * The model sometimes opens a DSML stanza without closing its thinking first.
- * Waiting for a </think> that never comes stalls the turn: the marker is never
- * scanned as executable and the block is dropped at parse time.  Instead of
- * rewriting sampled context, recover forward: force-feed "</think>" plus a
- * blank line and let the model continue.  Measured on the real model, that
- * position predicts a fresh stanza opening so strongly that the model
- * restarts the call cleanly on the executable side of the close.  Re-emitting
- * the stanza opening ourselves was tried and is counterproductive: with the
- * dangling opening right before the close and a forced copy right after it,
- * the model reads the call as already made and ends the turn.  The dangling
- * opening stays harmlessly inside reasoning.
- *
- * Detection works on accumulated text, so the tokenization of the marker does
- * not matter, and it triggers only on a complete stanza opening: a lone "<"
- * or a partial marker keeps decoding untouched, while *scan_from holds back
- * far enough that an opening split across future tokens is still seen from
- * its first byte.  The forced text is tokenized with the rendered-chat
- * tokenizer so </think> maps to its special token.
- *
- * Returns 1 when an injection was performed (text extended, thinking closed),
- * 0 when there is nothing to do or no budget, -1 on eval failure. */
+/* A completed tool block inside unclosed reasoning can be recovered without
+ * predicting what the model will emit after an injected close marker. Keep a
+ * short overlap until the opening appears, then wait for its matching end. */
+static bool complete_tool_call_inside_thinking(const char *text, size_t len,
+                                               size_t *scan_from) {
+    if (!text || !scan_from) return false;
+    if (*scan_from > len) *scan_from = len;
+    const char *start = find_any_tool_start(text + *scan_from);
+    if (!start) {
+        const size_t hold = 80;
+        *scan_from = len > hold ? len - hold : 0;
+        return false;
+    }
+    *scan_from = (size_t)(start - text);
+    return find_any_tool_end(start) != NULL;
+}
+
 static int server_eval_token(server *s, server_slot *slot, int token,
                              char *err, size_t errlen);
-
-static int chat_think_tool_recovery(server *s,
-                                    server_slot *slot,
-                                    buf *text,
-                                    thinking_state *thinking,
-                                    size_t *scan_from,
-                                    int *completion,
-                                    int max_tokens,
-                                    char *err,
-                                    size_t errlen) {
-    if (!thinking->inside || !text->ptr) return 0;
-    if (*scan_from > text->len) *scan_from = text->len;
-    if (!find_any_tool_start(text->ptr + *scan_from)) {
-        const size_t hold = 80; /* > longest stanza opening */
-        *scan_from = text->len > hold ? text->len - hold : 0;
-        return 0;
-    }
-
-    const char *inject = "</think>\n\n";
-    const size_t inject_len = strlen(inject);
-    ds4_tokens toks = {0};
-    ds4_tokenize_rendered_chat(s->engine, inject, &toks);
-
-    const int room = ds4_session_ctx(slot->session) -
-                     ds4_session_pos(slot->session);
-    if (toks.len <= 0 ||
-        toks.len >= room ||
-        *completion + toks.len >= max_tokens) {
-        /* Not enough budget to recover; leave the stream as generated and let
-         * the parse-time fallback deal with it.  Skip past this marker so the
-         * scan does not retry it every token. */
-        ds4_tokens_free(&toks);
-        *scan_from = text->len;
-        return 0;
-    }
-
-    for (int i = 0; i < toks.len; i++) {
-        if (server_eval_token(s, slot, toks.v[i], err, errlen) != 0) {
-            ds4_tokens_free(&toks);
-            return -1;
-        }
-        (*completion)++;
-    }
-    buf_append(text, inject, inject_len);
-    thinking_state_feed(thinking, inject, inject_len);
-    *scan_from = text->len;
-    ds4_tokens_free(&toks);
-    return 1;
-}
 
 static char *rendered_chat_system_region(const char *prompt_text) {
     if (!prompt_text) return xstrdup("");
@@ -11427,22 +11630,27 @@ static int server_next_prefill_slot_locked(const server *s) {
 }
 
 static bool server_prefill_enter(server *s, server_slot *slot) {
-    if (!s || !slot) return false;
+    if (!s || !slot || slot_job_cancelled(slot)) return false;
     if (!s->batched_mode) {
         pthread_mutex_lock(&s->inference_mu);
+        if (slot_job_cancelled(slot)) {
+            pthread_mutex_unlock(&s->inference_mu);
+            return false;
+        }
         return true;
     }
 
     pthread_mutex_lock(&s->model_mu);
     slot->prefill_waiting = true;
     pthread_cond_broadcast(&s->model_cv);
-    while (!g_stop_requested &&
+    while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (s->model_busy || s->decode_pending > 0 ||
             server_next_prefill_slot_locked(s) != slot->id)) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
-    if (g_stop_requested) {
+    if (g_stop_requested || slot_job_cancelled(slot)) {
         slot->prefill_waiting = false;
+        pthread_cond_broadcast(&s->model_cv);
         pthread_mutex_unlock(&s->model_mu);
         return false;
     }
@@ -11464,26 +11672,16 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
-static int server_prefill_quantum_for(bool generation_active) {
-    int quantum = generation_active ? 128 : 2048;
-    const char *env = getenv(generation_active ?
-                             "DS4_SERVER_MIXED_PREFILL_QUANTUM" :
-                             "DS4_SERVER_PREFILL_QUANTUM");
-    if (env && env[0]) {
-        char *end = NULL;
-        long v = strtol(env, &end, 10);
-        if (end != env && *end == '\0' && v > 0 && v <= INT_MAX) {
-            quantum = (int)v;
-        }
-    }
-    return quantum;
+static int server_prefill_quantum_for(const server *s,
+                                      bool generation_active) {
+    return generation_active ? s->mixed_prefill_quantum : 2048;
 }
 
 static int server_prefill_quantum(server *s) {
     pthread_mutex_lock(&s->model_mu);
     bool generation_active = s->active_generations > 0;
     pthread_mutex_unlock(&s->model_mu);
-    return server_prefill_quantum_for(generation_active);
+    return server_prefill_quantum_for(s, generation_active);
 }
 
 /* Synchronize one resident slot without monopolizing the model executor.  A
@@ -11508,7 +11706,8 @@ static int server_session_sync(server *s, server_slot *slot,
     int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
 
-    while (!g_stop_requested && (!called || done < prompt->len)) {
+    while (!g_stop_requested && !slot_job_cancelled(slot) &&
+           (!called || done < prompt->len)) {
         int quantum = server_prefill_quantum(s);
         int target = done + quantum;
         if (target > prompt->len || target < done) target = prompt->len;
@@ -11528,7 +11727,8 @@ static int server_session_sync(server *s, server_slot *slot,
             return 1;
         }
     }
-    return g_stop_requested ? DS4_SESSION_SYNC_INTERRUPTED : 0;
+    return (g_stop_requested || slot_job_cancelled(slot)) ?
+           DS4_SESSION_SYNC_INTERRUPTED : 0;
 }
 
 static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
@@ -11608,7 +11808,7 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
 
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
-    if (!p || !event) return;
+    if (!p || !event || job_cancelled(p->request_job)) return;
     const bool is_chunk = strcmp(event, "prefill_chunk") == 0;
     const bool is_display = strcmp(event, "prefill_display") == 0;
     if (!is_chunk && !is_display) return;
@@ -11617,9 +11817,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
      * response headers the first time the callback fires and then emit a
      * comment line (`:` prefix, ignored by SSE clients) every few seconds.
-     * Best-effort: if the client has already gone away, the writes fail
-     * silently and the outer code will discover the closed socket the next
-     * time it tries to stream a real event. */
+     * A failed write marks the job cancelled; the session callback then stops
+     * prefill at the next backend-safe boundary. */
     if (p->stream && p->fd >= 0 && !p->stream_failed) {
         if (!p->headers_sent) {
             p->headers_sent = true;
@@ -11627,6 +11826,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                 p->last_keepalive = now;
             } else {
                 p->stream_failed = true;
+                job_mark_cancelled(p->request_job);
+                return;
             }
         } else if (now - p->last_keepalive >= 5.0) {
             static const char ka[] = ": prefill\n\n";
@@ -11634,6 +11835,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                 p->last_keepalive = now;
             } else {
                 p->stream_failed = true;
+                job_mark_cancelled(p->request_job);
+                return;
             }
         }
     }
@@ -11817,7 +12020,7 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
  * renderer still builds valid DSML from JSON, and this function either rewrites
  * the short suffix in place or reloads an older disk checkpoint before replay. */
 static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
-                                         const job *j, const char *ctx,
+                                         job *j, const char *ctx,
                                          uint64_t trace_id, const char *content,
                                          const char *reasoning, const tool_calls *calls) {
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
@@ -11923,6 +12126,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
             .fd = j->fd,
             .stream = j->req.stream,
             .enable_cors = s->enable_cors,
+            .request_job = j,
             /* Tool checkpoint rebuild only runs after the response stream is
              * already in flight, so the SSE headers were sent long ago.
              * Pre-arm the flag so the progress callback only emits keepalive
@@ -12002,10 +12206,30 @@ static void server_generation_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
+/* model_mu must be held. An in-flight batch owns the session until it
+ * completes, but a pending token can be withdrawn without touching backend
+ * state. */
+static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
+    if (!s || !slot || !slot->decode_pending || slot->decode_in_flight) return false;
+    slot->decode_pending = false;
+    s->decode_pending--;
+    slot->decode_rc = DS4_SESSION_SYNC_INTERRUPTED;
+    snprintf(slot->decode_err, sizeof(slot->decode_err), "client disconnected");
+    slot->decode_done = true;
+    pthread_cond_broadcast(&s->model_cv);
+    return true;
+}
+
 static int server_eval_token(server *s, server_slot *slot, int token,
                              char *err, size_t errlen) {
     if (!s || !slot) return 1;
     if (!s->batched_mode) {
+        if (g_stop_requested || slot_job_cancelled(slot)) {
+            if (err && errlen) snprintf(err, errlen, "%s",
+                                        g_stop_requested ? "shutdown requested" :
+                                                           "client disconnected");
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
         pthread_mutex_lock(&s->inference_mu);
         int rc = ds4_session_eval(slot->session, token, err, errlen);
         pthread_mutex_unlock(&s->inference_mu);
@@ -12013,6 +12237,13 @@ static int server_eval_token(server *s, server_slot *slot, int token,
     }
 
     pthread_mutex_lock(&s->model_mu);
+    if (g_stop_requested || slot_job_cancelled(slot)) {
+        pthread_mutex_unlock(&s->model_mu);
+        if (err && errlen) snprintf(err, errlen, "%s",
+                                    g_stop_requested ? "shutdown requested" :
+                                                       "client disconnected");
+        return DS4_SESSION_SYNC_INTERRUPTED;
+    }
     if (slot->decode_pending || slot->decode_in_flight) {
         pthread_mutex_unlock(&s->model_mu);
         if (err && errlen) snprintf(err, errlen, "session already has a decode in flight");
@@ -12025,13 +12256,27 @@ static int server_eval_token(server *s, server_slot *slot, int token,
     slot->decode_pending = true;
     s->decode_pending++;
     pthread_cond_broadcast(&s->model_cv);
-    while (!slot->decode_done && !g_stop_requested) {
+    while (!slot->decode_done) {
+        const bool client_cancelled = slot_job_cancelled(slot);
+        if ((client_cancelled || g_stop_requested) &&
+            server_cancel_pending_decode_locked(s, slot)) {
+            if (!client_cancelled) {
+                snprintf(slot->decode_err, sizeof(slot->decode_err),
+                         "shutdown requested");
+            }
+            break;
+        }
+        /* An in-flight backend call still owns the session. Even during
+         * shutdown or client cancellation, wait for that safe boundary before
+         * the stack-owned job and its cancellation callback can be released. */
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
-    int rc = slot->decode_done ? slot->decode_rc : 1;
+    int rc = slot->decode_rc;
+    if (g_stop_requested && rc == 0) rc = DS4_SESSION_SYNC_INTERRUPTED;
     if (rc != 0 && err && errlen) {
         snprintf(err, errlen, "%s",
-                 slot->decode_err[0] ? slot->decode_err : "decode interrupted");
+                 g_stop_requested ? "shutdown requested" :
+                 (slot->decode_err[0] ? slot->decode_err : "decode interrupted"));
     }
     slot->decode_done = false;
     pthread_mutex_unlock(&s->model_mu);
@@ -12158,7 +12403,7 @@ static uint64_t server_next_sequence(server *s) {
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
-static void generate_job(server *s, server_slot *slot, job *j) {
+static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
     const int old_pos = ds4_session_pos(slot->session);
@@ -12236,8 +12481,23 @@ static void generate_job(server *s, server_slot *slot, job *j) {
 			"Anthropic continuation state is not available");
         return;
     } else if (cached == 0) {
-        cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
-        cache_source = cached > 0 ? "memory-token" : "none";
+        const int rewind_to = live_prefix_rewind_target(
+            ds4_engine_is_glm_dsa(s->engine), old_pos,
+            j->req.prompt.len, common);
+        if (rewind_to >= 0) {
+            pthread_mutex_lock(&s->inference_mu);
+            ds4_session_rewind(slot->session, rewind_to);
+            pthread_mutex_unlock(&s->inference_mu);
+            cached = rewind_to;
+            cache_source = "memory-rewind";
+            cache_diag.rewind_to = rewind_to;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
+                       old_pos, rewind_to);
+        } else {
+            cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
+            cache_source = cached > 0 ? "memory-token" : "none";
+        }
     }
     if (cached == 0) {
         int thinking_cached =
@@ -12322,6 +12582,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         .fd = j->fd,
         .stream = j->req.stream,
         .enable_cors = s->enable_cors,
+        .request_job = j,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];
@@ -12425,6 +12686,11 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                                              cold_store_len);
             kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
             free(disk_cache_path);
+            if (job_cancelled(j)) {
+                request_live_state_clear(s, slot);
+                trace_event(s, trace_id, "cancelled during prefill");
+                return;
+            }
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
 			server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error", err);
@@ -12471,6 +12737,11 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                                          cold_store_len);
         kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
         free(disk_cache_path);
+        if (job_cancelled(j)) {
+            request_live_state_clear(s, slot);
+            trace_event(s, trace_id, "cancelled during prefill");
+            return;
+        }
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
 		server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error", err);
@@ -12478,6 +12749,14 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         return;
     }
     free(disk_cache_path);
+    if (job_cancelled(j)) {
+        ds4_session_set_progress(slot->session, NULL, NULL);
+        ds4_session_set_display_progress(slot->session, NULL, NULL);
+        request_live_state_clear(s, slot);
+        trace_event(s, trace_id, "cancelled after prefill");
+        ds4_tokens_free(&effective_prompt);
+        return;
+    }
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s, slot);
@@ -12524,6 +12803,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
+            request_live_state_clear(s, slot);
             ds4_tokens_free(&effective_prompt);
 			server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error",
 							 "stream closed during prefill");
@@ -12534,12 +12814,14 @@ static void generate_job(server *s, server_slot *slot, job *j) {
          * to keep the connection alive during a long prefill. Only emit them
          * here when prefill never fired (e.g. fully cached prompt). */
         if (!progress.headers_sent && !sse_headers(j->fd, s->enable_cors)) {
+            job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s sse headers failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
+            request_live_state_clear(s, slot);
             ds4_tokens_free(&effective_prompt);
 			server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error",
 							 "sse headers failed");
@@ -12550,7 +12832,9 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         if (j->req.api == API_ANTHROPIC &&
             !anthropic_sse_start_live(j->fd, &j->req, id,
                                       prompt_tokens, &anthropic_live)) {
+            job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
+            request_live_state_clear(s, slot);
             ds4_tokens_free(&effective_prompt);
 			server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error",
 							 "anthropic stream start failed");
@@ -12559,7 +12843,9 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
+            job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
+            request_live_state_clear(s, slot);
             ds4_tokens_free(&effective_prompt);
 			server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error",
 							 "openai stream start failed");
@@ -12571,12 +12857,14 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             responses_stream_init(&j->req, &responses_live);
             responses_live.active = true;
             if (!responses_sse_created(j->fd, &j->req, &responses_live, responses_created_at)) {
+                job_mark_cancelled(j);
                 server_log(DS4_LOG_GENERATION,
                            "ds4-server: chat ctx=%s%s%s responses created event failed",
                            ctx_span,
                            req_flags[0] ? " " : "",
                            req_flags);
                 responses_stream_free(&responses_live);
+                request_live_state_clear(s, slot);
                 ds4_tokens_free(&effective_prompt);
 				server_call_history_finish(s, j, DS4_CALL_FAILED, 0, cache_source, "error",
 								 "responses stream start failed");
@@ -12621,13 +12909,11 @@ decode_again:
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
     size_t think_recovery_scan_from = 0;
-    const bool think_tool_recovery_enabled =
-        getenv("DS4_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
     server_generation_enter(s);
-    while (!g_stop_requested && completion < max_tokens &&
+    while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
 		if (server_job_client_disconnected(j)) {
 			finish = "cancelled";
@@ -12669,18 +12955,16 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        if (!s->batched_mode && temperature <= 0.0f &&
+        if (!s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
-            ntok = ds4_session_eval_speculative_argmax(slot->session,
-                                                       token,
-                                                       max_tokens - completion,
-                                                       ds4_token_eos(s->engine),
-                                                       toks,
-                                                       (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
-                                                       sizeof(err));
+            ntok = ds4_session_eval_speculative(
+                slot->session, token, max_tokens - completion,
+                ds4_token_eos(s->engine), temperature, top_k,
+                top_p, min_p, &rng,
+                toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                err, sizeof(err));
             if (ntok < 0) {
 				if (server_job_client_disconnected(j)) {
 					finish = "cancelled";
@@ -12694,24 +12978,15 @@ decode_again:
         } else if (!s->batched_mode && temperature > 0.0f &&
                    ds4_engine_has_dspark(s->engine) &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
-            const ds4_sampling_options sampling = {
-                .temperature = temperature,
-                .top_k = top_k,
-                .top_p = top_p,
-                .min_p = min_p,
-            };
-            ntok = ds4_session_eval_speculative_sample(
+            ntok = ds4_session_eval_speculative(
                 slot->session,
                 token,
                 max_tokens - completion,
                 ds4_token_eos(s->engine),
-                &sampling,
+                temperature, top_k, top_p, min_p,
                 &draft_rng,
-                &accept_rng,
-                toks,
-                (int)(sizeof(toks) / sizeof(toks[0])),
-                err,
-                sizeof(err));
+                toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                err, sizeof(err));
             if (ntok < 0) {
                 if (server_job_client_disconnected(j)) {
                     finish = "cancelled";
@@ -12745,13 +13020,10 @@ decode_again:
 
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
-			if (server_job_client_disconnected(j)) {
-				finish = "cancelled";
-				snprintf(err, sizeof(err),
-					"client disconnected during decode");
-				stop_decode = true;
-				break;
-			}
+            if (job_cancelled(j)) {
+                stop_decode = true;
+                break;
+            }
             token = toks[ti];
             if (ds4_token_is_stop_for_think_mode(s->engine,
                                                  token,
@@ -12792,6 +13064,7 @@ decode_again:
                 bool ok = sse_chunk(j->fd, &j->req, id, delta, NULL);
                 free(delta);
                 if (!ok) {
+                    job_mark_cancelled(j);
                     finish = "error";
                     snprintf(err, sizeof(err), "client stream write failed");
                     free(piece);
@@ -12804,6 +13077,7 @@ decode_again:
                 !anthropic_sse_stream_update(j->fd, s, &j->req, id,
                                              &anthropic_live, text.ptr, stream_len,
                                              false)) {
+                job_mark_cancelled(j);
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
@@ -12814,6 +13088,7 @@ decode_again:
                 !openai_sse_stream_update(j->fd, s, &j->req, id,
                                           &openai_live, text.ptr, stream_len,
                                           false)) {
+                job_mark_cancelled(j);
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
@@ -12824,6 +13099,7 @@ decode_again:
                 !responses_sse_stream_update(j->fd, &j->req,
                                              &responses_live, text.ptr, stream_len,
                                              false)) {
+                job_mark_cancelled(j);
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
@@ -12834,40 +13110,29 @@ decode_again:
 
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 if (thinking_gates_tool_markers && thinking.inside) {
-                    /* A DSML block inside reasoning is not executable.  This is
-                     * the live guard: do not let a quoted or mistaken marker in
-                     * <think> stop decoding as a real tool call.  A complete
-                     * stanza opening, however, almost always means the model
-                     * forgot to close its thinking; recover by forcing the
-                     * close so the model restarts the call on the executable
-                     * side. */
-                    const int recovered = think_tool_recovery_enabled ?
-                        chat_think_tool_recovery(s, slot, &text, &thinking,
-                                                 &think_recovery_scan_from,
-                                                 &completion, max_tokens,
-                                                 err, sizeof(err)) : 0;
-                    if (recovered < 0) {
-                        finish = "error";
+                    /* Do not act on an opening marker alone: it can be quoted
+                     * protocol text. A complete block is unambiguous enough to
+                     * recover without asking the model to restart it after an
+                     * injected close marker. */
+                    if (complete_tool_call_inside_thinking(
+                            text.ptr, text.len, &think_recovery_scan_from)) {
+                        saw_tool_start = true;
+                        saw_tool_end = true;
+                        finish = "tool_calls";
                         stop_decode = true;
-                        break;
-                    }
-                    if (recovered) {
                         server_log(DS4_LOG_WARNING,
-                                   "ds4-server: chat ctx=%s%s%s tool call inside unclosed <think>; "
-                                   "forced </think> after %d generated tokens",
+                                   "ds4-server: chat ctx=%s%s%s recovered a complete tool call from unclosed reasoning after %d generated tokens",
                                    ctx_span,
                                    req_flags[0] ? " " : "",
                                    req_flags,
                                    completion);
                         trace_event(s, trace_id,
-                                    "think tool recovery after %d generated tokens",
+                                    "recovered complete tool call from unclosed reasoning after %d generated tokens",
                                     completion);
-                        dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
-                        tool_scan_waiting_for_think_close = true;
-                    } else {
-                        tool_scan_waiting_for_think_close = true;
-                        tool_scan_from = text.len;
+                        break;
                     }
+                    tool_scan_waiting_for_think_close = true;
+                    tool_scan_from = text.len;
                 } else {
                     if (tool_scan_waiting_for_think_close) {
                         const char *think_end = find_last_substr(text.ptr, "</think>");
@@ -12950,8 +13215,18 @@ decode_again:
 		snprintf(err, sizeof(err), "client disconnected during decode");
 	}
 
-    if (g_stop_requested && strcmp(finish, "error") != 0 &&
-		strcmp(finish, "cancelled") != 0) {
+    if (job_cancelled(j)) {
+        request_live_state_clear(s, slot);
+        trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
+        anthropic_stream_free(&anthropic_live);
+        openai_stream_free(&openai_live);
+        responses_stream_free(&responses_live);
+        buf_free(&text);
+        ds4_tokens_free(&effective_prompt);
+        return;
+    }
+
+    if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
         snprintf(err, sizeof(err), "shutdown requested");
     }
@@ -13063,8 +13338,21 @@ decode_again:
 
     if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
         char *tail = xstrndup(text.ptr + plain_stream_pos, text.len - plain_stream_pos);
-        if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) finish = "error";
+        if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) {
+            job_mark_cancelled(j);
+            finish = "error";
+        }
         free(tail);
+    }
+    if (job_cancelled(j)) {
+        request_live_state_clear(s, slot);
+        trace_event(s, trace_id, "cancelled while flushing generation");
+        anthropic_stream_free(&anthropic_live);
+        openai_stream_free(&openai_live);
+        responses_stream_free(&responses_live);
+        buf_free(&text);
+        ds4_tokens_free(&effective_prompt);
+        return;
     }
 
     tool_calls parsed_calls = {0};
@@ -13180,12 +13468,20 @@ decode_again:
                             final_finish);
             }
         }
-		if (server_job_client_disconnected(j)) {
-			final_finish = "cancelled";
-			snprintf(err, sizeof(err),
-				"client disconnected during decode");
-		}
-		if (strcmp(final_finish, "cancelled") && parsed_calls.len) {
+        if (job_cancelled(j)) {
+            request_live_state_clear(s, slot);
+            trace_event(s, trace_id, "cancelled during response parsing");
+            free(parsed_content);
+            free(parsed_reasoning);
+            tool_calls_free(&parsed_calls);
+            anthropic_stream_free(&anthropic_live);
+            openai_stream_free(&openai_live);
+            responses_stream_free(&responses_live);
+            buf_free(&text);
+            ds4_tokens_free(&effective_prompt);
+            return;
+        }
+        if (parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
             if (j->req.api == API_ANTHROPIC && j->req.stream)
                 apply_anthropic_stream_tool_ids(&parsed_calls, &anthropic_live);
@@ -13197,24 +13493,21 @@ decode_again:
             responses_live_clear(s, slot);
         }
     }
-	if (server_job_client_disconnected(j)) {
-		final_finish = "cancelled";
-		snprintf(err, sizeof(err), "client disconnected during decode");
-	}
-	if (strcmp(final_finish, "cancelled")) {
-		log_tool_calls_summary(ctx_span, &parsed_calls,
-			responses_protocol);
-		trace_finish(s, trace_id, &j->req, final_finish, completion,
-			saw_tool_start, saw_tool_end,
-			parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-			parsed_reasoning, &parsed_calls, now_sec() - t0);
-	} else {
-		tool_calls cancelled_calls = {0};
-		trace_event(s, trace_id,
-			"request cancelled: client disconnected during decode");
-		trace_finish(s, trace_id, &j->req, final_finish, completion,
-			false, false, "", NULL, &cancelled_calls, now_sec() - t0);
-	}
+    if (job_cancelled(j)) {
+        request_live_state_clear(s, slot);
+        trace_event(s, trace_id, "cancelled before publishing response state");
+        free(parsed_content);
+        free(parsed_reasoning);
+        tool_calls_free(&parsed_calls);
+        anthropic_stream_free(&anthropic_live);
+        openai_stream_free(&openai_live);
+        responses_stream_free(&responses_live);
+        buf_free(&text);
+        ds4_tokens_free(&effective_prompt);
+        return;
+    }
+    log_tool_calls_summary(ctx_span, &parsed_calls,
+                           responses_protocol);
 
 	if (strcmp(final_finish, "cancelled") &&
 		j->req.api == API_RESPONSES) {
@@ -13276,18 +13569,8 @@ decode_again:
     }
 	}
 
-	if (server_job_client_disconnected(j)) {
-		if (strcmp(final_finish, "cancelled")) {
-			trace_event(s, trace_id,
-				"request cancelled before final response: client disconnected during decode");
-		}
-		final_finish = "cancelled";
-		snprintf(err, sizeof(err), "client disconnected during decode");
-	}
-    bool response_ok = true;
-	if (!strcmp(final_finish, "cancelled")) {
-		server_discard_cancelled_live_state(s, slot);
-	} else if (j->req.stream) {
+    bool response_ok = !job_cancelled(j);
+    if (response_ok && j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
@@ -13320,31 +13603,37 @@ decode_again:
             response_ok = sse_chunk(j->fd, &j->req, id, NULL, final_finish) &&
                           sse_done(j->fd, &j->req, id, prompt_tokens, completion);
         }
-        if (!response_ok) {
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: %s ctx=%s%s%s final stream failed",
-                       j->req.kind == REQ_CHAT ? "chat" : "completion",
-                       ctx_span,
-                       req_flags[0] ? " " : "",
-                       req_flags);
-        }
-    } else if (j->req.api == API_ANTHROPIC) {
-		response_ok = anthropic_final_response(j->fd, s->enable_cors,
-			&j->req, id,
-			parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-			parsed_reasoning, &parsed_calls, final_finish,
-			prompt_tokens, completion);
-    } else if (j->req.api == API_RESPONSES) {
-		response_ok = responses_final_response(j->fd, s->enable_cors,
-			&j->req, id,
-			parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-			parsed_reasoning, &parsed_calls, final_finish,
-			prompt_tokens, completion);
-    } else {
-		response_ok = final_response(j->fd, s->enable_cors, &j->req, id,
-			parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-			parsed_reasoning, &parsed_calls, final_finish,
-			prompt_tokens, completion);
+    } else if (response_ok && j->req.api == API_ANTHROPIC) {
+        response_ok = anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
+                                               parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                               parsed_reasoning,
+                                               &parsed_calls, final_finish,
+                                               prompt_tokens, completion);
+    } else if (response_ok && j->req.api == API_RESPONSES) {
+        response_ok = responses_final_response(j->fd, s->enable_cors, &j->req, id,
+                                               parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                               parsed_reasoning,
+                                               &parsed_calls, final_finish,
+                                               prompt_tokens, completion);
+    } else if (response_ok) {
+        response_ok = final_response(j->fd, s->enable_cors, &j->req, id,
+                                     parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                     parsed_reasoning,
+                                     &parsed_calls, final_finish,
+                                     prompt_tokens, completion);
+    }
+    if (job_cancelled(j)) response_ok = false;
+    if (!response_ok) {
+        job_mark_cancelled(j);
+        final_finish = "error";
+        snprintf(err, sizeof(err), "client disconnected");
+        request_live_state_clear(s, slot);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: %s ctx=%s%s%s client disconnected",
+                   j->req.kind == REQ_CHAT ? "chat" : "completion",
+                   ctx_span,
+                   req_flags[0] ? " " : "",
+                   req_flags);
     }
 	server_finalize_call_history(s, j, completion, cache_source, &final_finish,
 								 err, sizeof(err), response_ok);
@@ -13422,6 +13711,34 @@ decode_again:
     responses_stream_free(&responses_live);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
+}
+
+/* Keep cancellation installed for the entire request, including every early
+ * return in the large protocol/generation path. The callback is cleared before
+ * the client thread can destroy its stack-owned job. */
+static void server_job_run_begin(server *s, server_slot *slot, job *j) {
+	pthread_mutex_lock(&s->model_mu);
+	slot->running = j;
+	pthread_mutex_unlock(&s->model_mu);
+	server_worker_active_call_set(s, j->call_request_id);
+}
+
+static void server_job_run_end(server *s, server_slot *slot, job *j) {
+	server_worker_active_call_clear(s, j->call_request_id);
+	pthread_mutex_lock(&s->model_mu);
+	if (slot->running == j) slot->running = NULL;
+	pthread_cond_broadcast(&s->model_cv);
+	pthread_mutex_unlock(&s->model_mu);
+}
+
+static void generate_job(server *s, server_slot *slot, job *j) {
+	server_job_run_begin(s, slot, j);
+
+    ds4_session_set_cancel(slot->session, job_cancelled, j);
+    if (!job_cancelled(j)) generate_job_inner(s, slot, j);
+    ds4_session_set_cancel(slot->session, NULL, NULL);
+
+	server_job_run_end(s, slot, j);
 }
 
 static bool live_state_contains_all(const live_tool_state *state,
@@ -13544,21 +13861,11 @@ static job *dequeue(server *s) {
 
 static void *worker_main(void *arg) {
     server *s = arg;
-	for (;;) {
-		job *j = dequeue(s);
-		if (!j) break;
-		if (!server_drop_disconnected_queued_job(s, j)) {
-			server_worker_active_call_set(s, j->call_request_id);
-			if (!j->req.stream)
-				ds4_session_set_cancel(s->slots[0].session, server_job_cancel_cb, j);
-			generate_job(s, &s->slots[0], j);
-			ds4_session_set_cancel(s->slots[0].session, NULL, NULL);
-			server_worker_active_call_clear(s, j->call_request_id);
-		}
-        pthread_mutex_lock(&j->mu);
-        j->done = true;
-        pthread_cond_signal(&j->cv);
-        pthread_mutex_unlock(&j->mu);
+    for (;;) {
+        job *j = dequeue(s);
+        if (!j) break;
+        generate_job(s, &s->slots[0], j);
+        job_complete(j);
     }
     return NULL;
 }
@@ -13579,18 +13886,8 @@ static void *slot_worker_main(void *arg) {
         slot->assigned = NULL;
         pthread_mutex_unlock(&s->mu);
 
-		if (!server_drop_disconnected_queued_job(s, j)) {
-			server_worker_active_call_set(s, j->call_request_id);
-			if (!j->req.stream)
-				ds4_session_set_cancel(slot->session, server_job_cancel_cb, j);
-			generate_job(s, slot, j);
-			ds4_session_set_cancel(slot->session, NULL, NULL);
-			server_worker_active_call_clear(s, j->call_request_id);
-		}
-        pthread_mutex_lock(&j->mu);
-        j->done = true;
-        pthread_cond_signal(&j->cv);
-        pthread_mutex_unlock(&j->mu);
+        generate_job(s, slot, j);
+        job_complete(j);
 
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
@@ -14453,18 +14750,98 @@ static void client_done(server *s) {
 
 static void set_client_socket_nonblocking(int fd);
 
-static bool kv_admin_origin_is_local(const char *origin) {
-    if (!origin || !origin[0]) return true;
-    const char *host = strstr(origin, "://");
-    if (!host) return false;
-    host += 3;
-    if (!strncmp(host, "127.0.0.1", 9) &&
-        (host[9] == '\0' || host[9] == ':' || host[9] == '/')) return true;
-    if (!strncmp(host, "localhost", 9) &&
-        (host[9] == '\0' || host[9] == ':' || host[9] == '/')) return true;
-    if (!strncmp(host, "[::1]", 5) &&
-        (host[5] == '\0' || host[5] == ':' || host[5] == '/')) return true;
-    return false;
+static bool client_poll_revents_disconnected(short revents) {
+    return (revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+}
+
+static bool client_recv_errno_disconnected(int err) {
+    return err != EINTR && err != EAGAIN && err != EWOULDBLOCK;
+}
+
+/* The request body has already been consumed and this one-request server sends
+ * Connection: close, so EOF is cancellation. Discard unsupported pipelined
+ * bytes nonblockingly: otherwise they can hide the FIN behind readable data. */
+static bool client_socket_disconnected(int fd) {
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int rc;
+    do {
+        rc = poll(&pfd, 1, 0);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) return client_recv_errno_disconnected(errno);
+    if (rc == 0) return false;
+    if (client_poll_revents_disconnected(pfd.revents)) return true;
+    if (!(pfd.revents & POLLIN)) return false;
+
+    char discard[256];
+    for (;;) {
+        ssize_t n = recv(fd, discard, sizeof(discard), 0);
+        if (n > 0) continue;
+        if (n == 0) return true;
+        if (errno == EINTR) continue;
+        return client_recv_errno_disconnected(errno);
+    }
+}
+
+/* Mark first, then detach only work that no worker owns yet. No job mutex is
+ * held while entering either server scheduler mutex. */
+static void server_cancel_job(server *s, job *j) {
+    job_mark_cancelled(j);
+
+    bool detached = false;
+    pthread_mutex_lock(&s->mu);
+    job *prev = NULL;
+    for (job *it = s->head; it; prev = it, it = it->next) {
+        if (it != j) continue;
+        if (prev) prev->next = it->next;
+        else s->head = it->next;
+        if (s->tail == it) s->tail = prev;
+        it->next = NULL;
+        detached = true;
+        break;
+    }
+    if (!detached && s->batched_mode) {
+        for (int i = 0; i < s->slot_count; i++) {
+            server_slot *slot = &s->slots[i];
+            if (slot->assigned != j) continue;
+            slot->assigned = NULL;
+            slot->busy = false;
+            detached = true;
+            dispatch_jobs_locked(s);
+            break;
+        }
+    }
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+
+    pthread_mutex_lock(&s->model_mu);
+    for (int i = 0; i < s->slot_count; i++) {
+        server_slot *slot = &s->slots[i];
+        if (slot->running == j) {
+            (void)server_cancel_pending_decode_locked(s, slot);
+            break;
+        }
+    }
+    pthread_cond_broadcast(&s->model_cv);
+    pthread_mutex_unlock(&s->model_mu);
+
+    if (detached) job_complete(j);
+}
+
+static void wait_for_job_or_disconnect(server *s, job *j) {
+    pthread_mutex_lock(&j->mu);
+    while (!j->done) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        timespec_add_us(&deadline, 100000);
+        (void)pthread_cond_timedwait(&j->cv, &j->mu, &deadline);
+        bool done = j->done;
+        pthread_mutex_unlock(&j->mu);
+        if (!done && client_socket_disconnected(j->fd)) {
+            server_cancel_job(s, j);
+        }
+        pthread_mutex_lock(&j->mu);
+    }
+    pthread_mutex_unlock(&j->mu);
 }
 
 static void *client_main(void *arg) {
@@ -14648,9 +15025,7 @@ static void *client_main(void *arg) {
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
-    pthread_mutex_lock(&j.mu);
     if (!enqueue(s, &j)) {
-        pthread_mutex_unlock(&j.mu);
         http_error(fd, s->enable_cors, 503, "server shutting down");
 		server_call_history_finish(s, &j, DS4_CALL_FAILED, 0, "none", "error",
 						   "server shutting down");
@@ -14659,8 +15034,7 @@ static void *client_main(void *arg) {
         request_free(&j.req);
         goto done;
     }
-    while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
-    pthread_mutex_unlock(&j.mu);
+    wait_for_job_or_disconnect(s, &j);
 
     pthread_cond_destroy(&j.cv);
     pthread_mutex_destroy(&j.mu);
@@ -14732,6 +15106,7 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     int batched_sessions;
+    int mixed_prefill_quantum;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -14879,6 +15254,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .mixed_prefill_quantum = 128,
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -14931,6 +15307,9 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dspark-strict")) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
+        } else if (!strcmp(arg, "--mtp-exact-sampling")) {
+            c.engine.dspark = true;
+            c.engine.dspark_exact_sampling = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -14949,6 +15328,9 @@ static server_config parse_options(int argc, char **argv) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
+            c.mixed_prefill_quantum =
+                parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -15110,6 +15492,8 @@ int main(int argc, char **argv) {
 
     cfg.engine.context_size = cfg.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.ctx_size;
+    cfg.engine.placement_session_count_hint =
+        cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
     cfg.engine.share_session_prefill_workspace = cfg.batched_sessions > 0;
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
@@ -15163,6 +15547,7 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
+    s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
@@ -15222,8 +15607,8 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: batched mode enabled resident_sessions=%d prefill_quantum=%d mixed_prefill_quantum=%d decode_coalesce_us=%ld",
                    s.slot_count,
-                   server_prefill_quantum_for(false),
-                   server_prefill_quantum_for(true),
+                   server_prefill_quantum_for(&s, false),
+                   server_prefill_quantum_for(&s, true),
                    server_decode_coalesce_us());
         if (ds4_engine_has_mtp(engine)) {
             server_log(DS4_LOG_DEFAULT,
@@ -15439,6 +15824,24 @@ static void test_batched_enqueue_status_reflects_dispatched_queue(void) {
     pthread_mutex_destroy(&s.status_mu);
     pthread_mutex_destroy(&s.tool_mu);
     pthread_mutex_destroy(&s.mu);
+}
+
+static void test_mixed_prefill_quantum_option(void) {
+    char *default_argv[] = {"ds4-server"};
+    server_config defaults = parse_options(1, default_argv);
+    TEST_ASSERT(defaults.mixed_prefill_quantum == 128);
+
+    char *custom_argv[] = {
+        "ds4-server", "--mixed-prefill-quantum", "2048"
+    };
+    server_config custom = parse_options(3, custom_argv);
+    TEST_ASSERT(custom.mixed_prefill_quantum == 2048);
+
+    server s = {.mixed_prefill_quantum = custom.mixed_prefill_quantum};
+    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 2048);
+    TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
+    s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
+    TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
 }
 
 static void test_batched_live_continuation_slot_binding(void) {
@@ -17687,12 +18090,16 @@ static void test_call_history_snapshot_owns_copies(void) {
 
 static void test_status_worker_active_call_is_not_newest_queued_call(void) {
 	server s = {0};
+	server_slot slot = { .srv = &s };
+	job running = {0};
 	pthread_mutex_init(&s.call_history_mu, NULL);
+	pthread_mutex_init(&s.model_mu, NULL);
 	ds4_call_history_init(&s.call_history);
 	uint64_t a = ds4_call_history_begin(&s.call_history, "a", NULL, "openai", "chat", false, false, 1.0);
 	uint64_t b = ds4_call_history_begin(&s.call_history, "b", NULL, "openai", "chat", false, false, 2.0);
 	uint64_t c = ds4_call_history_begin(&s.call_history, "c", NULL, "openai", "chat", false, false, 3.0);
-	server_worker_active_call_set(&s, a);
+	running.call_request_id = a;
+	server_job_run_begin(&s, &slot, &running);
 	pthread_mutex_lock(&s.call_history_mu);
 	TEST_ASSERT(s.worker_active_call_request_id == a);
 	ds4_call_history_snapshot calls = ds4_call_history_snapshot_take(&s.call_history, 4.0);
@@ -17706,16 +18113,21 @@ static void test_status_worker_active_call_is_not_newest_queued_call(void) {
 	TEST_ASSERT(strstr(json.ptr, "\"active_request_id\":\"3\"") == NULL);
 	buf_free(&json);
 	ds4_call_history_snapshot_free(&calls);
-	server_worker_active_call_clear(&s, a);
+	TEST_ASSERT(slot.running == &running);
+	server_job_run_end(&s, &slot, &running);
 	pthread_mutex_lock(&s.call_history_mu);
 	TEST_ASSERT(s.worker_active_call_request_id == 0);
 	pthread_mutex_unlock(&s.call_history_mu);
-	server_worker_active_call_set(&s, b);
+	TEST_ASSERT(slot.running == NULL);
+	running.call_request_id = b;
+	server_job_run_begin(&s, &slot, &running);
 	pthread_mutex_lock(&s.call_history_mu);
 	TEST_ASSERT(s.worker_active_call_request_id == b);
 	TEST_ASSERT(s.worker_active_call_request_id != c);
 	pthread_mutex_unlock(&s.call_history_mu);
+	server_job_run_end(&s, &slot, &running);
 	ds4_call_history_free(&s.call_history);
+	pthread_mutex_destroy(&s.model_mu);
 	pthread_mutex_destroy(&s.call_history_mu);
 }
 
@@ -17992,6 +18404,43 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     close(sv[1]);
 }
 
+static void test_anthropic_stream_reroutes_second_reasoning_pass(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_second_think", 5, &st));
+    const char *partial = "first pass</think>escaped draft";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_second_think",
+                                            &st, partial, strlen(partial), false));
+    const char *complete = "first pass</think>escaped draft</think>final answer";
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_second_think",
+                                          &st, complete, strlen(complete), NULL,
+                                          "stop", 9));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"thinking\":\"first pass\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"thinking\":\"escaped draft\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"text\":\"final answer\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"text\":\"escaped draft") == NULL);
+    TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    anthropic_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -18180,6 +18629,44 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
 
     free(out);
     tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_stream_reroutes_second_reasoning_pass(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *partial = "<think>first pass</think>escaped draft";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_second_think",
+                                         &st, partial, strlen(partial), false));
+    const char *complete =
+        "<think>first pass</think>escaped draft</think>final answer";
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_second_think",
+                                       &st, complete, strlen(complete), NULL,
+                                       "stop", 5, 9));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"first pass\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"escaped draft\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"final answer\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"escaped draft") == NULL);
+    TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -20455,6 +20942,67 @@ static void test_json_skip_has_nesting_limit(void) {
     free(bad);
 }
 
+static void test_request_parsers_reject_malformed_duplicate_owned_fields(void) {
+    const char *p =
+        "{\"name\":\"ok\",\"name\":\"bad\\q\",\"arguments\":\"{}\"}";
+    tool_call tc = {0};
+    TEST_ASSERT(!parse_function_call(&p, &tc));
+    tool_call_free(&tc);
+
+    p =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
+        "\"text\":\"hello\",\"text\":\"bad\\q\"}]}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(!parse_anthropic_messages(&p, &msgs));
+    chat_msgs_free(&msgs);
+
+    p =
+        "[{\"type\":\"message\",\"role\":\"user\","
+        "\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}],"
+        "\"content\":[{\"type\":\"input_text\",\"text\":\"bad\\q\"}]}]";
+    msgs = (chat_msgs){0};
+    TEST_ASSERT(!parse_responses_input(&p, &msgs, NULL, NULL));
+    chat_msgs_free(&msgs);
+
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"ok\",\"name\":\"bad\\q\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{}}}");
+    TEST_ASSERT(orders.len == 0);
+    tool_schema_orders_free(&orders);
+
+    char err[128];
+    request r;
+    bool ok = parse_anthropic_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"max_tokens\":1,"
+        "\"system\":\"ok\",\"system\":\"bad\\q\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+        1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    if (ok) request_free(&r);
+
+    ok = parse_chat_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"model\":\"bad\\q\","
+        "\"max_tokens\":1,\"messages\":[{\"role\":\"user\","
+        "\"content\":\"hello\"}]}",
+        1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    if (ok) request_free(&r);
+
+    ok = parse_responses_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"model\":\"bad\\q\","
+        "\"max_output_tokens\":1,\"input\":\"hello\"}",
+        1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    if (ok) request_free(&r);
+
+    ok = parse_completion_request(NULL,
+        "{\"prompt\":\"hello\",\"prompt\":\"bad\\q\",\"max_tokens\":1}",
+        1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    if (ok) request_free(&r);
+}
+
 static void append_tool_heavy_schema(buf *b, int idx) {
     if (idx) buf_putc(b, ',');
     buf_puts(b, "{\"type\":\"function\",\"function\":{\"name\":");
@@ -20583,6 +21131,66 @@ static void test_json_string_handles_surrogates(void) {
     free(s);
 }
 
+static void test_json_int_handles_non_finite_values(void) {
+    const char *p = "NaN";
+    int value = -1;
+    TEST_ASSERT(json_int(&p, &value));
+    TEST_ASSERT(value == 0);
+
+    p = "Infinity";
+    TEST_ASSERT(json_int(&p, &value));
+    TEST_ASSERT(value == INT_MAX);
+
+    p = "-Infinity";
+    TEST_ASSERT(json_int(&p, &value));
+    TEST_ASSERT(value == 0);
+}
+
+static void test_tool_history_validation_handles_large_replays(void) {
+    chat_msgs responses = {0};
+    chat_msgs anthropic = {0};
+    for (int i = 0; i < 4096; i++) {
+        char id[48];
+        snprintf(id, sizeof(id), "call_%d", i);
+
+        chat_msg ra = {.role = xstrdup("assistant"),
+                       .reasoning = xstrdup("checked")};
+        tool_call rtc = {.id = xstrdup(id), .name = xstrdup("run"),
+                         .arguments = xstrdup("{}")};
+        tool_calls_push(&ra.calls, rtc);
+        chat_msgs_push(&responses, ra);
+        chat_msg rt = {.role = xstrdup("tool"),
+                       .tool_call_id = xstrdup(id),
+                       .content = xstrdup("ok")};
+        chat_msgs_push(&responses, rt);
+
+        chat_msg aa = {.role = xstrdup("assistant")};
+        tool_call atc = {.id = xstrdup(id), .name = xstrdup("run"),
+                         .arguments = xstrdup("{}")};
+        tool_calls_push(&aa.calls, atc);
+        chat_msgs_push(&anthropic, aa);
+        chat_msg at = {.role = xstrdup("user"),
+                       .tool_call_id = xstrdup(id),
+                       .content = xstrdup("ok")};
+        chat_msgs_push(&anthropic, at);
+    }
+
+    char err[160] = {0};
+    bool needs_live = false;
+    bool needs_reasoning = false;
+    TEST_ASSERT(responses_validate_tool_outputs(
+        NULL, &responses, DS4_THINK_HIGH, &needs_live, &needs_reasoning,
+        err, sizeof(err)));
+    TEST_ASSERT(!needs_live);
+    TEST_ASSERT(!needs_reasoning);
+    TEST_ASSERT(anthropic_validate_tool_results(
+        NULL, &anthropic, &needs_live, err, sizeof(err)));
+    TEST_ASSERT(!needs_live);
+
+    chat_msgs_free(&responses);
+    chat_msgs_free(&anthropic);
+}
+
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
@@ -20602,8 +21210,17 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_live_prefix_rewind_target(void) {
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
+    TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
+    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
+}
+
 static void test_client_socket_nonblocking_flag(void) {
-    int sv[2];
+    int sv[2] = {-1, -1};
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
     set_client_socket_nonblocking(sv[0]);
@@ -20612,6 +21229,255 @@ static void test_client_socket_nonblocking_flag(void) {
     TEST_ASSERT((flags & O_NONBLOCK) != 0);
     close(sv[0]);
     close(sv[1]);
+}
+
+static void test_client_disconnect_probe(void) {
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    set_client_socket_nonblocking(sv[0]);
+
+    TEST_ASSERT(!client_socket_disconnected(sv[0]));
+    TEST_ASSERT(write(sv[1], "x", 1) == 1);
+    TEST_ASSERT(!client_socket_disconnected(sv[0]));
+    char byte = '\0';
+    TEST_ASSERT(recv(sv[0], &byte, 1, 0) < 0);
+    TEST_ASSERT(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    close(sv[1]);
+    sv[1] = -1;
+    TEST_ASSERT(client_socket_disconnected(sv[0]));
+    close(sv[0]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    set_client_socket_nonblocking(sv[0]);
+
+    /* Unsupported pipelined input must not hide the FIN behind readable data. */
+    TEST_ASSERT(write(sv[1], "extra", 5) == 5);
+    close(sv[1]);
+    sv[1] = -1;
+    TEST_ASSERT(client_socket_disconnected(sv[0]));
+    close(sv[0]);
+
+    TEST_ASSERT(client_poll_revents_disconnected(POLLERR));
+    TEST_ASSERT(client_poll_revents_disconnected(POLLHUP));
+    TEST_ASSERT(client_poll_revents_disconnected(POLLNVAL));
+    TEST_ASSERT(!client_poll_revents_disconnected(POLLIN | POLLOUT));
+    TEST_ASSERT(client_recv_errno_disconnected(ECONNRESET));
+    TEST_ASSERT(client_recv_errno_disconnected(EPIPE));
+    TEST_ASSERT(!client_recv_errno_disconnected(EINTR));
+    TEST_ASSERT(!client_recv_errno_disconnected(EAGAIN));
+    TEST_ASSERT(!client_recv_errno_disconnected(EWOULDBLOCK));
+}
+
+static void test_cancel_job_init(job *j) {
+    memset(j, 0, sizeof(*j));
+    j->fd = -1;
+    pthread_mutex_init(&j->mu, NULL);
+    pthread_cond_init(&j->cv, NULL);
+}
+
+static void test_cancel_job_destroy(job *j) {
+    pthread_cond_destroy(&j->cv);
+    pthread_mutex_destroy(&j->mu);
+}
+
+static void test_cancelled_progress_callback_is_inert(void) {
+    job j;
+    test_cancel_job_init(&j);
+    job_mark_cancelled(&j);
+    server_prefill_progress progress = {
+        .request_job = &j,
+        .prompt_tokens = 100,
+        .cached_tokens = 10,
+    };
+    server_progress_cb(&progress, "prefill_chunk", 50, 100);
+    TEST_ASSERT(!progress.seen);
+    TEST_ASSERT(progress.last_current == 0);
+    test_cancel_job_destroy(&j);
+}
+
+static void test_cancel_server_init(server *s) {
+    memset(s, 0, sizeof(*s));
+    pthread_mutex_init(&s->mu, NULL);
+    pthread_cond_init(&s->cv, NULL);
+    pthread_mutex_init(&s->model_mu, NULL);
+    pthread_cond_init(&s->model_cv, NULL);
+    pthread_mutex_init(&s->tool_mu, NULL);
+}
+
+static void test_cancel_server_destroy(server *s) {
+    pthread_mutex_destroy(&s->tool_mu);
+    pthread_cond_destroy(&s->model_cv);
+    pthread_mutex_destroy(&s->model_mu);
+    pthread_cond_destroy(&s->cv);
+    pthread_mutex_destroy(&s->mu);
+}
+
+typedef struct {
+    server *srv;
+    job *request_job;
+} test_cancel_wait_arg;
+
+static void *test_wait_for_disconnect_main(void *ud) {
+    test_cancel_wait_arg *arg = ud;
+    wait_for_job_or_disconnect(arg->srv, arg->request_job);
+    return NULL;
+}
+
+static void test_waiting_job_cancels_on_client_close(void) {
+    server s;
+    job j;
+    int sv[2] = {-1, -1};
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&j);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        test_cancel_job_destroy(&j);
+        test_cancel_server_destroy(&s);
+        return;
+    }
+    set_client_socket_nonblocking(sv[0]);
+    j.fd = sv[0];
+    s.head = s.tail = &j;
+
+    test_cancel_wait_arg arg = {.srv = &s, .request_job = &j};
+    pthread_t waiter;
+    int thread_rc = pthread_create(&waiter, NULL, test_wait_for_disconnect_main, &arg);
+    TEST_ASSERT(thread_rc == 0);
+    if (thread_rc == 0) {
+        TEST_ASSERT(write(sv[1], "pipelined", 9) == 9);
+        close(sv[1]);
+        sv[1] = -1;
+        TEST_ASSERT(pthread_join(waiter, NULL) == 0);
+        TEST_ASSERT(job_cancelled(&j));
+        TEST_ASSERT(j.done);
+        TEST_ASSERT(s.head == NULL);
+        TEST_ASSERT(s.tail == NULL);
+    }
+
+    close(sv[0]);
+    if (sv[1] >= 0) close(sv[1]);
+    test_cancel_job_destroy(&j);
+    test_cancel_server_destroy(&s);
+}
+
+static void test_cancel_unlinks_queued_jobs(void) {
+    server s;
+    job head, middle, tail;
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&head);
+    test_cancel_job_init(&middle);
+    test_cancel_job_init(&tail);
+    head.next = &middle;
+    middle.next = &tail;
+    s.head = &head;
+    s.tail = &tail;
+
+    server_cancel_job(&s, &middle);
+    TEST_ASSERT(job_cancelled(&middle));
+    TEST_ASSERT(middle.done);
+    TEST_ASSERT(s.head == &head);
+    TEST_ASSERT(head.next == &tail);
+    TEST_ASSERT(s.tail == &tail);
+
+    server_cancel_job(&s, &head);
+    TEST_ASSERT(job_cancelled(&head));
+    TEST_ASSERT(head.done);
+    TEST_ASSERT(s.head == &tail);
+    TEST_ASSERT(s.tail == &tail);
+
+    server_cancel_job(&s, &tail);
+    TEST_ASSERT(job_cancelled(&tail));
+    TEST_ASSERT(tail.done);
+    TEST_ASSERT(s.head == NULL);
+    TEST_ASSERT(s.tail == NULL);
+
+    test_cancel_job_destroy(&tail);
+    test_cancel_job_destroy(&middle);
+    test_cancel_job_destroy(&head);
+    test_cancel_server_destroy(&s);
+}
+
+static void test_cancel_detaches_assigned_job(void) {
+    server s;
+    server_slot slot = {0};
+    job j;
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&j);
+    s.batched_mode = true;
+    test_server_bind_slot(&s, &slot);
+    slot.assigned = &j;
+    slot.busy = true;
+
+    server_cancel_job(&s, &j);
+    TEST_ASSERT(job_cancelled(&j));
+    TEST_ASSERT(j.done);
+    TEST_ASSERT(slot.assigned == NULL);
+    TEST_ASSERT(!slot.busy);
+
+    test_cancel_job_destroy(&j);
+    test_cancel_server_destroy(&s);
+}
+
+static void test_cancel_running_job_keeps_worker_ownership(void) {
+    server s;
+    server_slot slot = {0};
+    job j;
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&j);
+    test_server_bind_slot(&s, &slot);
+    slot.running = &j;
+
+    server_cancel_job(&s, &j);
+    TEST_ASSERT(job_cancelled(&j));
+    TEST_ASSERT(!j.done);
+    TEST_ASSERT(slot.running == &j);
+
+    slot.running = NULL;
+    job_complete(&j);
+    TEST_ASSERT(j.done);
+    test_cancel_job_destroy(&j);
+    test_cancel_server_destroy(&s);
+}
+
+static void test_cancel_withdraws_only_pending_decode(void) {
+    server s;
+    server_slot slot = {0};
+    job pending, in_flight;
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&pending);
+    test_cancel_job_init(&in_flight);
+    s.batched_mode = true;
+    test_server_bind_slot(&s, &slot);
+
+    slot.running = &pending;
+    slot.decode_pending = true;
+    s.decode_pending = 1;
+    server_cancel_job(&s, &pending);
+    TEST_ASSERT(job_cancelled(&pending));
+    TEST_ASSERT(!pending.done);
+    TEST_ASSERT(!slot.decode_pending);
+    TEST_ASSERT(slot.decode_done);
+    TEST_ASSERT(slot.decode_rc == DS4_SESSION_SYNC_INTERRUPTED);
+    TEST_ASSERT(s.decode_pending == 0);
+
+    slot.running = &in_flight;
+    slot.decode_done = false;
+    slot.decode_pending = false;
+    slot.decode_in_flight = true;
+    s.decode_pending = 0;
+    server_cancel_job(&s, &in_flight);
+    TEST_ASSERT(job_cancelled(&in_flight));
+    TEST_ASSERT(!in_flight.done);
+    TEST_ASSERT(slot.decode_in_flight);
+    TEST_ASSERT(!slot.decode_done);
+    TEST_ASSERT(s.decode_pending == 0);
+
+    test_cancel_job_destroy(&in_flight);
+    test_cancel_job_destroy(&pending);
+    test_cancel_server_destroy(&s);
 }
 
 static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
@@ -22255,6 +23121,7 @@ static void test_host_metrics_contract(void) {
 static void ds4_server_unit_tests_run(void) {
 	test_host_metrics_contract();
     test_batched_prefill_round_robin();
+    test_mixed_prefill_quantum_option();
     test_batched_enqueue_status_reflects_dispatched_queue();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
@@ -22308,9 +23175,11 @@ static void ds4_server_unit_tests_run(void) {
 	test_worker_drops_disconnected_nonstream_job();
     test_peer_caller_formats_direct_addresses();
     test_anthropic_live_stream_sends_incremental_blocks();
+    test_anthropic_stream_reroutes_second_reasoning_pass();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
+    test_openai_stream_reroutes_second_reasoning_pass();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
@@ -22360,10 +23229,21 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_parses_all_sequences();
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
+    test_request_parsers_reject_malformed_duplicate_owned_fields();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
+    test_json_int_handles_non_finite_values();
+    test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
+    test_client_disconnect_probe();
+    test_cancelled_progress_callback_is_inert();
+    test_waiting_job_cancels_on_client_close();
+    test_cancel_unlinks_queued_jobs();
+    test_cancel_detaches_assigned_job();
+    test_cancel_running_job_keeps_worker_ownership();
+    test_cancel_withdraws_only_pending_decode();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();

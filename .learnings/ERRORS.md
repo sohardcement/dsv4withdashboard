@@ -32,6 +32,38 @@ Timed out running CDP command "Page.captureScreenshot"
 
 ---
 
+## [ERR-20260827-001] zsh_readonly_status_variable
+
+**Logged**: 2026-08-27T00:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+诊断脚本误用 zsh 只读特殊变量 `status` 保存退出码，导致断言命令自身失败。
+
+### Error
+```text
+zsh:4: read-only variable: status
+```
+
+### Context
+- 对 `/ds4/status` 的 dashboard 状态同步断言需要保存 `jq` 的退出码。
+- 当前执行 shell 是 zsh，`status` 不能作为普通脚本变量赋值。
+
+### Suggested Fix
+在 zsh 兼容脚本中使用任务专属变量名，例如 `sync_rc`，不要复用 shell 特殊变量。
+
+### Metadata
+- Reproducible: yes
+- Related Files: `tests/run_dashboard_ui_test.sh`
+
+### Resolution
+- **Resolved**: 2026-08-27T00:00:00+08:00
+- **Notes**: 后续诊断命令改用 `sync_rc`。
+
+---
+
 ## [ERR-20260817-001] in-app-browser-mlxfast-details
 
 **Logged**: 2026-08-17T09:01:46+08:00
