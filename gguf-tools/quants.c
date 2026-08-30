@@ -50,7 +50,7 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_Q4_K]    = { "q4_K",  QK_K, 144, true,  false },
     [DS4Q_TYPE_Q5_K]    = { "q5_K",  QK_K, 176, false, false },
     [DS4Q_TYPE_Q6_K]    = { "q6_K",  QK_K, 210, false, false },
-    [DS4Q_TYPE_Q8_K]    = { "q8_K",  QK_K, 292, false, false },
+    [DS4Q_TYPE_Q8_K]    = { "q8_K",  QK_K, 292, true,  false },
     [DS4Q_TYPE_IQ2_XXS] = { "iq2_xxs", QK_K,  66, true,  true  },
     [DS4Q_TYPE_IQ2_XS]  = { "iq2_xs",  QK_K,  74, false, true  },
     [DS4Q_TYPE_IQ3_XXS] = { "iq3_xxs", QK_K,  98, false, false },
@@ -151,6 +151,7 @@ static float ds4q_make_qkx2_quants(int n, int nmax, const float *x, const float 
         return scale;
     }
     for (int is = 0; is <= nstep; is++) {
+        if (max <= min) break;
         iscale = (rmin + rdelta * is + nmax) / (max - min);
         float sum_l = 0, sum_l2 = 0, sum_xl = 0;
         for (int i = 0; i < n; i++) {
@@ -224,6 +225,7 @@ static float ds4q_make_qkx3_quants(int n, int nmax, const float *x, const float 
         return scale;
     }
     for (int is = 0; is <= nstep; is++) {
+        if (max <= min) break;
         iscale = (rmin + rdelta * is + nmax) / (max - min);
         float sum_l = 0, sum_l2 = 0, sum_xl = 0;
         for (int i = 0; i < n; i++) {
@@ -362,6 +364,63 @@ static size_t ds4q_quantize_q8_0(const float *src, void *dst, int64_t start,
         int8_t *qs = (int8_t *)(out + sizeof(hd));
         for (int j = 0; j < qk; j++) qs[j] = (int8_t)roundf(x[j] * id);
         out += sizeof(hd) + qk;
+    }
+    return (size_t)nrows * row_size;
+}
+
+static void ds4q_write_q8_k_block(const float *x, uint8_t *y) {
+    enum { d_off = 0, qs_off = 4, bsums_off = 260 };
+    int8_t qs[QK_K];
+    int16_t bsums[QK_K / 16];
+
+    float max = 0.0f;
+    float amax = 0.0f;
+    for (int j = 0; j < QK_K; j++) {
+        const float ax = fabsf(x[j]);
+        if (ax > amax) {
+            amax = ax;
+            max = x[j];
+        }
+    }
+
+    if (amax == 0.0f) {
+        memset(y, 0, ds4q_type_traits[DS4Q_TYPE_Q8_K].type_size);
+        return;
+    }
+
+    const float iscale = -127.0f / max;
+    for (int j = 0; j < QK_K; j++) {
+        int v = (int)lrintf(iscale * x[j]);
+        if (v > 127) v = 127;
+        if (v < -128) v = -128;
+        qs[j] = (int8_t)v;
+    }
+    for (int j = 0; j < QK_K / 16; j++) {
+        int sum = 0;
+        for (int i = 0; i < 16; i++) sum += qs[j * 16 + i];
+        bsums[j] = (int16_t)sum;
+    }
+
+    const float d = 1.0f / iscale;
+    memcpy(y + d_off, &d, sizeof(d));
+    memcpy(y + qs_off, qs, sizeof(qs));
+    memcpy(y + bsums_off, bsums, sizeof(bsums));
+}
+
+static size_t ds4q_quantize_q8_k(const float *src, void *dst, int64_t start,
+                                 int64_t nrows, int64_t ncols) {
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q8_K, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t blocks_per_row = ncols / QK_K;
+
+    for (int64_t row = 0; row < nrows; row++) {
+        const float *xrow = src + start + (size_t)row * (size_t)ncols;
+        for (int64_t b = 0; b < blocks_per_row; b++) {
+            uint8_t *block = out + (size_t)row * row_size +
+                             (size_t)b * ds4q_type_traits[DS4Q_TYPE_Q8_K].type_size;
+            ds4q_write_q8_k_block(xrow + (size_t)b * QK_K, block);
+        }
     }
     return (size_t)nrows * row_size;
 }
@@ -1054,6 +1113,10 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
         (void)imatrix;
         return ds4q_quantize_q8_0(src, dst, start, nrows, ncols);
     }
+    if (type == DS4Q_TYPE_Q8_K) {
+        (void)imatrix;
+        return ds4q_quantize_q8_k(src, dst, start, nrows, ncols);
+    }
     if (type == DS4Q_TYPE_Q2_K) {
         return ds4q_quantize_q2_k(src, dst, start, nrows, ncols, imatrix);
     }
@@ -1091,6 +1154,42 @@ float ds4q_f16_to_f32(uint16_t bits) {
 
 float ds4q_bf16_to_f32(uint16_t bits) {
     return ds4q_f32_from_bits((uint32_t)bits << 16);
+}
+
+void ds4q_q8_0_to_f32_row(const uint8_t *src, float *dst, int64_t n) {
+    assert(n % 32 == 0);
+    for (int64_t block = 0; block < n / 32; block++) {
+        const uint8_t *b = src + (size_t)block * 34;
+        const uint16_t d_bits = (uint16_t)b[0] | (uint16_t)((uint16_t)b[1] << 8);
+        const float d = ds4q_f16_to_f32(d_bits);
+        for (int j = 0; j < 32; j++) {
+            dst[block * 32 + j] = d * (float)(int8_t)b[2 + j];
+        }
+    }
+}
+
+static float ds4q_e8m0_to_f32_half(uint8_t exponent) {
+    const uint32_t bits = exponent < 2
+        ? UINT32_C(0x00200000) << exponent
+        : (uint32_t)(exponent - 1) << 23;
+    return ds4q_f32_from_bits(bits);
+}
+
+void ds4q_mxfp4_to_f32_row(const uint8_t *src, float *dst, int64_t n) {
+    static const int8_t e2m1_twice[16] = {
+        0, 1, 2, 3, 4, 6, 8, 12,
+        0, -1, -2, -3, -4, -6, -8, -12,
+    };
+    assert(n % 32 == 0);
+    for (int64_t block = 0; block < n / 32; block++) {
+        const uint8_t *b = src + (size_t)block * 17;
+        const float d = ds4q_e8m0_to_f32_half(b[0]);
+        float *out = dst + block * 32;
+        for (int j = 0; j < 16; j++) {
+            out[j] = d * (float)e2m1_twice[b[1 + j] & 0x0f];
+            out[j + 16] = d * (float)e2m1_twice[b[1 + j] >> 4];
+        }
+    }
 }
 
 void ds4q_f32_to_f16_row(const float *src, uint16_t *dst, int64_t n) {

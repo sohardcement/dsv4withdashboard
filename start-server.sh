@@ -6,8 +6,11 @@ cd "$(dirname "$0")"
 # Profiles:
 #   agent        Default for Claude Code / Codex / Hermes-style clients with
 #                sampled generation, large prompts, tools, and long sessions.
-#   greedy       Agent settings plus MTP for temperature-zero generation.
-#   conservative Smaller cache footprint for occasional API use.
+#   greedy       Compatibility alias for temperature-zero clients; target-only.
+#   conservative Same target runtime with a smaller disk-cache footprint.
+#
+# These profiles cover non-thinking and normal thinking (low through xhigh).
+# Think Max remains an explicit experiment and requires DS4_CTX >= 393216.
 PROFILE=${DS4_PROFILE:-agent}
 HOST=${DS4_HOST:-127.0.0.1}
 PORT=${DS4_PORT:-8077}
@@ -20,8 +23,10 @@ else
     DEFAULT_CONFIG_SNAPSHOT=
 fi
 CONFIG_SNAPSHOT=${DS4_CONFIG_SNAPSHOT-$DEFAULT_CONFIG_SNAPSHOT}
+TOKEN_HISTORY_FILE=${DS4_TOKEN_HISTORY_FILE-$HOME/.ds4/token-usage.tsv}
 EXTRA_SSD_STREAMING=0
 EXTRA_MTP=0
+EXTRA_DSPARK=0
 
 for arg in "$@"; do
     case "$arg" in
@@ -31,13 +36,16 @@ for arg in "$@"; do
         --mtp)
             EXTRA_MTP=1
             ;;
+        --dspark)
+            EXTRA_DSPARK=1
+            ;;
     esac
 done
 
 case "$PROFILE" in
     agent|greedy)
-        DEFAULT_MODEL="/Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF/Huihui-DeepSeek-V4-Flash-BF16-abliterated-ds4-Q2.gguf"
-        DEFAULT_CTX=51200
+        DEFAULT_MODEL="/Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/DeepSeek-V4-Flash-Q2-0731.gguf"
+        DEFAULT_CTX=110592
         DEFAULT_THREADS=8
         # Matched M3 Max runs at a >16K context allocation favored 5120 over
         # 4096 for long prefill without the short-frontier regression of 6144.
@@ -53,17 +61,14 @@ case "$PROFILE" in
         DEFAULT_BOUNDARY_ALIGN=2048
         DEFAULT_TOOL_MEMORY_MAX=200000
         DEFAULT_MTP_PATH=
-        if [ "$PROFILE" = greedy ]; then
-            DEFAULT_MTP_PATH="gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
-        fi
         DEFAULT_MTP_DRAFT=2
         DEFAULT_MTP_MARGIN=3.0
         ;;
     conservative)
-        DEFAULT_MODEL="/Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF/Huihui-DeepSeek-V4-Flash-BF16-abliterated-ds4-Q2.gguf"
-        DEFAULT_CTX=100000
+        DEFAULT_MODEL="/Users/shc/.lmstudio/models/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/DeepSeek-V4-Flash-Q2-0731.gguf"
+        DEFAULT_CTX=110592
         DEFAULT_THREADS=8
-        DEFAULT_PREFILL_CHUNK=0
+        DEFAULT_PREFILL_CHUNK=5120
         DEFAULT_KV_DIR="$HOME/.ds4/server-kv"
         DEFAULT_KV_SPACE=8192
         DEFAULT_COLD_MAX=50000
@@ -173,6 +178,10 @@ CACHE_MIN=${DS4_CACHE_MIN:-$DEFAULT_CACHE_MIN}
 BOUNDARY_TRIM=${DS4_BOUNDARY_TRIM:-$DEFAULT_BOUNDARY_TRIM}
 BOUNDARY_ALIGN=${DS4_BOUNDARY_ALIGN:-$DEFAULT_BOUNDARY_ALIGN}
 TOOL_MEMORY_MAX=${DS4_TOOL_MEMORY_MAX:-$DEFAULT_TOOL_MEMORY_MAX}
+BATCHED_SESSION=${DS4_BATCHED_SESSION-}
+GPU_VRAM=${DS4_GPU_VRAM-}
+GPU_DEVICES=${DS4_GPU_DEVICES-}
+CUDA_TENSOR_PARALLEL=${DS4_CUDA_TENSOR_PARALLEL:-0}
 if [ "$HOST" = "0.0.0.0" ] || [ "$HOST" = "::" ]; then
     DASHBOARD_HOST=127.0.0.1
 else
@@ -223,12 +232,24 @@ args=(
     --tool-memory-max-ids "$TOOL_MEMORY_MAX"
 )
 
-if [ -n "$PREFILL_CHUNK" ] && [ "$PREFILL_CHUNK" != 0 ]; then
-    args+=(--prefill-chunk "$PREFILL_CHUNK")
+append_value_arg() {
+    local flag=$1 value=$2
+    if [ -n "$value" ]; then
+        args+=("$flag" "$value")
+    fi
+}
+
+if [ "$PREFILL_CHUNK" != 0 ]; then
+    append_value_arg --prefill-chunk "$PREFILL_CHUNK"
 fi
 
-if [ -n "$MODEL" ]; then
-    args+=(--model "$MODEL")
+append_value_arg --model "$MODEL"
+append_value_arg --batched-session "$BATCHED_SESSION"
+append_value_arg --gpu-vram "$GPU_VRAM"
+append_value_arg --gpu-devices "$GPU_DEVICES"
+
+if [ "$CUDA_TENSOR_PARALLEL" != 0 ]; then
+    args+=(--cuda-tensor-parallel)
 fi
 
 if [ -n "$MTP_PATH" ]; then
@@ -265,12 +286,13 @@ if [ -n "$CONFIG_SNAPSHOT" ]; then
         printf 'profile=%s\n' "$PROFILE"
         printf 'model=%s\n' "$MODEL"
         printf 'ctx=%s\n' "$CTX"
-		printf 'ctx_file=%s\n' "$CTX_FILE"
+        printf 'ctx_file=%s\n' "$CTX_FILE"
         printf 'threads=%s\n' "$THREADS"
         printf 'host=%s\n' "$HOST"
         printf 'port=%s\n' "$PORT"
         printf 'dashboard_url=%s\n' "$DASHBOARD_URL"
         printf 'trace=%s\n' "$TRACE"
+        printf 'token_history_file=%s\n' "$TOKEN_HISTORY_FILE"
         printf 'server_log=%s\n' "$SERVER_LOG"
         printf 'kv_dir=%s\n' "$KV_DIR"
         printf 'kv_space_file=%s\n' "$KV_SPACE_FILE"
@@ -282,7 +304,12 @@ if [ -n "$CONFIG_SNAPSHOT" ]; then
         printf 'boundary_align=%s\n' "$BOUNDARY_ALIGN"
         printf 'tool_memory_max_ids=%s\n' "$TOOL_MEMORY_MAX"
         printf 'prefill_chunk=%s\n' "$PREFILL_CHUNK"
+        printf 'batched_session=%s\n' "$BATCHED_SESSION"
+        printf 'gpu_vram=%s\n' "$GPU_VRAM"
+        printf 'gpu_devices=%s\n' "$GPU_DEVICES"
+        printf 'cuda_tensor_parallel=%s\n' "$CUDA_TENSOR_PARALLEL"
         printf 'mtp_path=%s\n' "$MTP_PATH"
+        printf 'dspark=%s\n' "$EXTRA_DSPARK"
         printf 'mtp_draft=%s\n' "$MTP_DRAFT"
         printf 'mtp_margin=%s\n' "$MTP_MARGIN"
         printf 'mtp_metrics=%s\n' "$MTP_METRICS"

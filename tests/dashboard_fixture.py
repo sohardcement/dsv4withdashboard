@@ -31,6 +31,16 @@ def status():
       "prefill":{"current":8192,"total":8192,"percent":100,"avg_tps":1850.4,"chunk_tps":2011.2,"elapsed_sec":4.4,"eta_sec":0},
       "decode":{"generated":814,"max_tokens":4096,"avg_tps":52.7,"chunk_tps":55.1,"elapsed_sec":14},
       "totals":{"requests":48,"completed":45,"failed":2,"cache":{"prompt_tokens":1264000,"cached_tokens":782000,"prompt_requests":47,"hit_requests":31}},
+      "token_usage":{"persistent":True,"retention":"unlimited","window_days":371,"prompt_tokens":1264000,"output_tokens":45600,"total_tokens":1309600,"requests":48,
+          "active_days":7,"peak_tokens":215100,"peak_day_start":1727568000,"current_streak":7,"longest_streak":7,
+          "first_day_start":1727481600,"last_day_start":1728000000,"days":[
+          {"day_start":1727481600,"prompt_tokens":124000,"output_tokens":4200,"total_tokens":128200,"requests":5},
+          {"day_start":1727568000,"prompt_tokens":208000,"output_tokens":7100,"total_tokens":215100,"requests":8},
+          {"day_start":1727654400,"prompt_tokens":156000,"output_tokens":5300,"total_tokens":161300,"requests":6},
+          {"day_start":1727740800,"prompt_tokens":192000,"output_tokens":6800,"total_tokens":198800,"requests":7},
+          {"day_start":1727827200,"prompt_tokens":180000,"output_tokens":6500,"total_tokens":186500,"requests":7},
+          {"day_start":1727913600,"prompt_tokens":204000,"output_tokens":7200,"total_tokens":211200,"requests":8},
+          {"day_start":1728000000,"prompt_tokens":200000,"output_tokens":8500,"total_tokens":208500,"requests":7}]},
       "kv_cache":dict(state["kv"]), "context":dict(state["context"]),
       "host":{"available":state["host_available"],"memory_total_bytes":128<<30,"memory_used_bytes":96<<30,"memory_available_bytes":32<<30,"memory_pressure":"warning","swap_total_bytes":16<<30,"swap_used_bytes":2<<30,"process_rss_bytes":12<<30},
       "calls":dict(state["calls"])}

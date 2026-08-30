@@ -137,8 +137,9 @@ async page => {
   assert(await page.locator('#dashboard').getAttribute('data-mode')==='monitor','monitor must be the default mode');
   assert(await page.locator('#monitorLayout').isVisible(),'monitor layout must be visible by default');
   assert(await page.locator('#managementLayout').getAttribute('hidden')===''&&await page.locator('#managementLayout').getAttribute('aria-hidden')==='true','management layout must be hidden by default');
+  assert(await page.locator('#usageLayout').getAttribute('hidden')===''&&await page.locator('#usageLayout').getAttribute('aria-hidden')==='true','usage layout must be hidden by default');
   assert(await page.locator('[data-mode-choice="monitor"]').getAttribute('aria-pressed')==='true','monitor mode button must be pressed by default');
-  assert((await page.getByRole('navigation',{name:'Dashboard 模式'}).locator('[data-mode-choice]').allInnerTexts()).join('/')==='管理/监控','mode choices must place management before monitor');
+  assert((await page.getByRole('navigation',{name:'Dashboard 模式'}).locator('[data-mode-choice]').allInnerTexts()).join('/')==='管理/监控/用量','mode choices must place usage after monitor');
   await cfg({reset:true});
   await page.evaluate(()=>{
     localStorage.removeItem('ds4-dashboard-mode');
@@ -189,10 +190,10 @@ async page => {
   await page.locator('[data-mode-choice="management"]').click();
   assert(await page.locator('.glass-column:visible').count()===1,'management mode must expose exactly one primary glass column');
   const legacyLayoutSelector=['paper','terminal','calm'].map(name=>'#'+name+'Layout').join(','); assert(await page.locator(legacyLayoutSelector).count()===0,'legacy theme roots must be absent');
-  const headings=page.locator('h1'); assert(await headings.count()===2&&await page.locator('h1:visible').count()===1&&(await page.locator('h1:visible').innerText())==='运行与容量','management mode must expose exactly one visible page heading');
+  const headings=page.locator('h1'); assert(await headings.count()===3&&await page.locator('h1:visible').count()===1&&(await page.locator('h1:visible').innerText())==='运行与容量','management mode must expose exactly one visible page heading');
   const brand=page.locator('.brand a[href="#managementSummary"]');
   assert(await brand.count()===1&&await brand.locator('[aria-hidden="true"]').count()===1,'brand anchor or status glyph is missing');
-  assert(await page.getByRole('navigation',{name:'Dashboard 模式'}).locator('[data-mode-choice]').count()===2,'labeled mode navigation is missing');
+  assert(await page.getByRole('navigation',{name:'Dashboard 模式'}).locator('[data-mode-choice]').count()===3,'labeled mode navigation is missing');
   assert(await page.locator('#connectionState>#connectionPulse[aria-hidden="true"]').count()===1&&await page.locator('#connectionState>#health').count()===1&&await page.locator('#connectionState>#updatedAt').count()===1,'connection signal scaffold is incomplete');
   assert(await page.locator('label[for="kvBudgetUnit"]').isVisible()&&await page.locator('label[for="callFilterCaller"],label[for="callFilterClient"],label[for="callFilterApi"],label[for="callFilterStatus"]').count()===4,'compact visible unit or monitor filter labels are missing');
   assert((await page.locator('#kvBudgetInput').getAttribute('aria-describedby'))==='budgetHelp kvTargetState adminNotice'&&(await page.locator('#kvBudgetUnit').getAttribute('aria-describedby'))==='budgetHelp kvTargetState adminNotice'&&(await page.locator('#contextNextInput').getAttribute('aria-describedby'))==='contextEffect contextNotice','administration controls are not associated with help and result text');
@@ -202,7 +203,7 @@ async page => {
   assert(shortControls.length===0,'management mode has controls shorter than 44px: '+shortControls.join(','));
   assert(await page.locator('#managementSummary').count()===1,'management summary anchor target is missing');
   await page.locator('[data-mode-choice="management"]').click(); await page.evaluate(()=>document.activeElement.blur());
-  for (const expected of ['brand','management','monitor']) {
+  for (const expected of ['brand','management','monitor','usage']) {
     const focusTarget=expected==='brand'?'.brand a':`[data-mode-choice="${expected}"]`; await page.locator(focusTarget).focus();
     const focused=await page.evaluate(()=>{const e=document.activeElement,s=getComputedStyle(e);return {brand:e.matches('.brand a[href="#managementSummary"]'),choice:e.dataset.modeChoice||'',style:s.outlineStyle,width:parseFloat(s.outlineWidth)}});
     assert((expected==='brand'?focused.brand:focused.choice===expected),'focus target is not reachable at '+expected);
@@ -226,6 +227,18 @@ async page => {
   assert(await page.locator('#dashboard').getAttribute('data-mode')==='monitor','monitor mode did not persist');
   assert(await page.locator('#monitorLayout').getAttribute('hidden')===null&&await page.locator('#monitorLayout').getAttribute('aria-hidden')==='false','persisted monitor root state is wrong');
   const monitorMetricsText=await page.locator('#monitorMetrics').innerText(); assert(monitorMetricsText.includes('52.7 t/s')&&monitorMetricsText.includes('75.0%')&&monitorMetricsText.includes('解码中 · 运行中')&&monitorMetricsText.includes('hanako-agent'),'monitor metrics are missing decode speed, request KV hit, activity, or service');
+  assert((await page.locator('#topTotalTokens').innerText())==='1,309,600','lifetime total token count is missing from the persistent header');
+  await page.locator('[data-mode-choice="usage"]').click();
+  assert(await page.locator('#usageLayout').isVisible()&&await page.locator('#monitorLayout').getAttribute('hidden')===''&&await page.locator('#usageLayout').getAttribute('aria-hidden')==='false'&&await page.locator('[data-mode-choice="usage"]').getAttribute('aria-pressed')==='true','usage mode did not expose or select its own page');
+  const usageText=await page.locator('#usageLayout').innerText();
+  assert(['Token 用量','1,309,600','累计 Token 数','215,100','单日峰值','48','请求总数','7 天','当前连续','永久累计'].every(value=>usageText.includes(value)),'lifetime token summary or permanence copy is missing');
+  assert(await page.locator('#usageHeatmap [data-usage-day]').count()===371,'usage heatmap must render a complete 53-week activity year');
+  assert(await page.locator('#usageHeatmap [data-level]:not([data-level="0"])').count()===7,'usage heatmap did not render every active fixture day');
+  assert((await page.locator('#usageHeatmap').getAttribute('aria-label')).includes('永久累计 1,309,600 token'),'usage heatmap is missing its accessible lifetime summary');
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth&&document.querySelector('.usage-shell').getBoundingClientRect().width<=innerWidth),'usage page overflows the desktop viewport');
+  await wait(300);
+  await page.screenshot({path:'output/playwright/dashboard-usage-desktop.png',fullPage:true});
+  await page.locator('[data-mode-choice="monitor"]').click();
   assert(await page.locator('.wall-mirror').count()===0&&await page.locator('[data-mirror]').count()===0,'wall mirror wallpaper must be removed from the monitor metrics');
   const colorContract=await page.evaluate(()=>{
     const primaries=[...document.querySelectorAll('button.primary')];
@@ -462,6 +475,10 @@ async page => {
   assert(!mobileLumen.overflow&&mobileLumen.light==='none'&&mobileLumen.shadow==='none','mobile wall overflows or keeps a continuous signal animation');
   const mobileBlur=parseFloat((mobileLumen.blur.match(/blur\(([^p]+)px\)/)||[])[1]||'0');
   assert(mobileBlur<=12,'mobile glass blur exceeds 12px');
+  await page.locator('[data-mode-choice="usage"]').click();
+  assert(await page.locator('[data-mode-choice="usage"]').getAttribute('aria-pressed')==='true'&&await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth&&document.getElementById('usageLayout').getBoundingClientRect().width<=innerWidth),'mobile usage page is not selected or overflows the viewport');
+  await wait(300);
+  await page.screenshot({path:'output/playwright/dashboard-usage-mobile.png',fullPage:true});
   await page.setViewportSize({width:390,height:844}); await page.locator('[data-mode-choice="management"]').click();
   await page.waitForFunction(()=>document.getElementById('dashboard').dataset.mode==='management'&&!document.getElementById('managementLayout').hidden&&document.documentElement.scrollWidth<=innerWidth&&document.querySelectorAll('#managementRecentCalls tr[data-call-id]').length===3);
   await page.screenshot({path:'output/playwright/dashboard-management-mobile.png',fullPage:true});

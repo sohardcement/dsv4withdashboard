@@ -69,6 +69,8 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
 
 float ds4q_f16_to_f32(uint16_t bits);
 float ds4q_bf16_to_f32(uint16_t bits);
+void ds4q_q8_0_to_f32_row(const uint8_t *src, float *dst, int64_t n);
+void ds4q_mxfp4_to_f32_row(const uint8_t *src, float *dst, int64_t n);
 void ds4q_f32_to_f16_row(const float *src, uint16_t *dst, int64_t n);
 void ds4q_f32_to_bf16_row(const float *src, uint16_t *dst, int64_t n);
 
