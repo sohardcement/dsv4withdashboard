@@ -53,6 +53,33 @@ static char *test_save_env(const char *name) {
     return copy;
 }
 
+static void test_repetition_penalty_math(void) {
+    /* Pure-function check: frequency scales with count, presence is binary,
+     * and out-of-range ids in the window are ignored. */
+    enum { NV = 8 };
+    float logits[NV];
+    for (int i = 0; i < NV; i++) logits[i] = 0.0f;
+    logits[3] = 5.0f;   /* argmax, appears twice in the window */
+    logits[5] = 4.0f;   /* runner-up, appears once */
+    const int recent[4] = {3, 3, 5, 99 /* out of range */};
+    ds4_logits_apply_repetition_penalty(logits, NV, recent, 4,
+                                        1.0f, 0.0f);
+    /* id 3: 5.0 - 1.0*2 = 3.0 ; id 5: 4.0 - 1.0*1 = 3.0 */
+    TEST_ASSERT(logits[3] == 3.0f);
+    TEST_ASSERT(logits[5] == 3.0f);
+    TEST_ASSERT(logits[7] == 0.0f);
+
+    for (int i = 0; i < NV; i++) logits[i] = 0.0f;
+    logits[2] = 2.0f;
+    const int once[2] = {2, 6};
+    ds4_logits_apply_repetition_penalty(logits, NV, once, 2,
+                                        0.0f, 0.5f);
+    /* presence applies the same flat shift to every seen id */
+    TEST_ASSERT(logits[2] == 1.5f);
+    TEST_ASSERT(logits[6] == -0.5f);
+    TEST_ASSERT(logits[1] == 0.0f);
+}
+
 static void test_restore_env(const char *name, char *saved) {
     if (saved) {
         setenv(name, saved, 1);
@@ -4947,7 +4974,7 @@ static void test_long_story_fact_recall(void) {
     int generated = 0;
     bool decode_ok = true;
     for (; generated < 350; generated++) {
-        int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+        int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, 0.0f, 0.0f, &rng);
         if (token == ds4_token_eos(engine)) break;
 
         size_t piece_len = 0;
@@ -6167,7 +6194,7 @@ static bool test_generate_chat_turn(ds4_engine *engine, ds4_session *session,
 
     for (int i = 0; i < r->max_tokens; i++) {
         int token = ds4_session_sample(session, r->temperature, r->top_k,
-                                       r->top_p, r->min_p, &rng);
+                                       r->top_p, r->min_p, 0.0f, 0.0f, &rng);
         if (ds4_token_is_stop_for_think_mode(engine, token, r->think_mode)) {
             finish = "stop";
             break;
@@ -6737,6 +6764,7 @@ typedef struct {
 } ds4_test_entry;
 
 static const ds4_test_entry test_entries[] = {
+    {"--repetition-penalty", "repetition-penalty", "frequency/presence penalty math", test_repetition_penalty_math},
 #ifndef DS4_NO_GPU
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},

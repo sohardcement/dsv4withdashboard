@@ -397,7 +397,13 @@ void ds4_speculative_rng_init(uint64_t seed,
                               uint64_t *target_rng,
                               uint64_t *draft_rng,
                               uint64_t *accept_rng);
-int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p,
+                       float min_p, float frequency_penalty,
+                       float presence_penalty, uint64_t *rng);
+void ds4_logits_apply_repetition_penalty(float *logits, int n_vocab,
+                                         const int *recent, int recent_n,
+                                         float frequency_penalty,
+                                         float presence_penalty);
 #ifdef DS4_TEST_HOOKS
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,

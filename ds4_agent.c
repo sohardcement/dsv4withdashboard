@@ -8610,6 +8610,7 @@ static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
                               0,
                               greedy ? 1.0f : cfg->gen.top_p,
                               greedy ? 0.0f : cfg->gen.min_p,
+                              0.0f, 0.0f,
                               rng);
 }
 
@@ -9108,6 +9109,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
                                        0,
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
+                                       0.0f, 0.0f,
                                        &rng);
         if (ds4_token_is_stop(w->engine, token)) break;
 

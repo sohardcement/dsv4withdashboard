@@ -595,7 +595,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             have_greedy_next = false;
         } else {
             token = ds4_session_sample(session, cfg->gen.temperature, 0,
-                                       cfg->gen.top_p, cfg->gen.min_p, &rng);
+                                       cfg->gen.top_p, cfg->gen.min_p,
+                                       0.0f, 0.0f, &rng);
         }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
 
@@ -1522,6 +1523,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        0,
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
+                                       0.0f, 0.0f,
                                        &rng);
         }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;

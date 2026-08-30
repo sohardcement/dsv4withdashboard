@@ -52733,6 +52733,12 @@ struct ds4_session {
     bool dspark_last_confidence0_valid;
     ds4_dspark_spec_stats dspark_stats;
 #endif
+    /* Anti-repetition sampling state: ring of recently sampled token ids
+     * used by OpenAI-style frequency/presence penalties. */
+#define DS4_SAMPLE_PENALTY_WINDOW 64
+    int sample_repeat_ring[DS4_SAMPLE_PENALTY_WINDOW];
+    int sample_repeat_ring_len;
+    int sample_repeat_ring_head;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
     ds4_session_progress_fn progress;
@@ -65362,9 +65368,68 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
     return token;
 }
 
-int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
-    return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
-                              top_p, min_p, rng, s->sample_probs);
+/* Apply OpenAI-style repetition penalties to a logits row using the ids in
+ * the recent-token window.  frequency_penalty subtracts proportionally to
+ * the occurrence count; presence_penalty subtracts once for any occurrence.
+ * Positive values discourage repetition; the useful range is [-2, 2]. */
+void ds4_logits_apply_repetition_penalty(float *logits,
+                                         int n_vocab,
+                                         const int *recent,
+                                         int recent_n,
+                                         float frequency_penalty,
+                                         float presence_penalty) {
+    if (!logits || !recent || n_vocab <= 0 || recent_n <= 0) return;
+    if (frequency_penalty == 0.0f && presence_penalty == 0.0f) return;
+    for (int i = 0; i < recent_n; i++) {
+        const int t = recent[i];
+        if (t < 0 || t >= n_vocab) continue;
+        bool seen_earlier = false;
+        for (int j = 0; j < i; j++) {
+            if (recent[j] == t) {
+                seen_earlier = true;
+                break;
+            }
+        }
+        if (seen_earlier) continue;
+        int count = 0;
+        for (int j = 0; j < recent_n; j++) {
+            if (recent[j] == t) count++;
+        }
+        logits[t] -= frequency_penalty * (float)count +
+                     presence_penalty * (count > 0 ? 1.0f : 0.0f);
+    }
+}
+
+int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p,
+                       float min_p, float frequency_penalty,
+                       float presence_penalty, uint64_t *rng) {
+    if (s && s->sample_repeat_ring_len > 0 &&
+        (frequency_penalty != 0.0f || presence_penalty != 0.0f)) {
+        int window[DS4_SAMPLE_PENALTY_WINDOW];
+        const int n = s->sample_repeat_ring_len;
+        for (int i = 0; i < n; i++) {
+            const int idx = (s->sample_repeat_ring_head - n + i +
+                             DS4_SAMPLE_PENALTY_WINDOW * 2) %
+                            DS4_SAMPLE_PENALTY_WINDOW;
+            window[i] = s->sample_repeat_ring[idx];
+        }
+        ds4_logits_apply_repetition_penalty(s->logits, (int)DS4_N_VOCAB,
+                                            window, n,
+                                            frequency_penalty,
+                                            presence_penalty);
+    }
+    const int token = sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature,
+                                         top_k, top_p, min_p, rng,
+                                         s->sample_probs);
+    if (s && token >= 0) {
+        s->sample_repeat_ring[s->sample_repeat_ring_head] = token;
+        s->sample_repeat_ring_head = (s->sample_repeat_ring_head + 1) %
+                                     DS4_SAMPLE_PENALTY_WINDOW;
+        if (s->sample_repeat_ring_len < DS4_SAMPLE_PENALTY_WINDOW) {
+            s->sample_repeat_ring_len++;
+        }
+    }
+    return token;
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {

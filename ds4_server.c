@@ -667,6 +667,12 @@ typedef struct {
     bool top_p_set;
     bool min_p_set;
     bool top_k_set;
+    /* OpenAI-style anti-repetition penalties; a per-request value overrides
+     * the server-wide --frequency-penalty / --presence-penalty defaults. */
+    float frequency_penalty;
+    float presence_penalty;
+    bool frequency_penalty_set;
+    bool presence_penalty_set;
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
@@ -826,6 +832,8 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
+    r->frequency_penalty = 0.0f;
+    r->presence_penalty = 0.0f;
     r->think_mode = DS4_THINK_HIGH;
 }
 
@@ -3187,6 +3195,19 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
             r->min_p = (float)v;
             r->min_p_set = true;
+        } else if (!strcmp(key, "frequency_penalty") || !strcmp(key, "presence_penalty")) {
+            double v = 0.0;
+            if (!json_number(&p, &v) || v < -2.0 || v > 2.0) {
+                free(key);
+                goto bad;
+            }
+            if (key[0] == 'f') {
+                r->frequency_penalty = (float)v;
+                r->frequency_penalty_set = true;
+            } else {
+                r->presence_penalty = (float)v;
+                r->presence_penalty_set = true;
+            }
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
@@ -3397,6 +3418,19 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
             r->top_p = (float)v;
             r->top_p_set = true;
+        } else if (!strcmp(key, "frequency_penalty") || !strcmp(key, "presence_penalty")) {
+            double v = 0.0;
+            if (!json_number(&p, &v) || v < -2.0 || v > 2.0) {
+                free(key);
+                goto bad;
+            }
+            if (key[0] == 'f') {
+                r->frequency_penalty = (float)v;
+                r->frequency_penalty_set = true;
+            } else {
+                r->presence_penalty = (float)v;
+                r->presence_penalty_set = true;
+            }
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
@@ -4297,6 +4331,19 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             }
             r->top_p = (float)v;
             r->top_p_set = true;
+        } else if (!strcmp(key, "frequency_penalty") || !strcmp(key, "presence_penalty")) {
+            double v = 0.0;
+            if (!json_number(&p, &v) || v < -2.0 || v > 2.0) {
+                free(key);
+                goto bad;
+            }
+            if (key[0] == 'f') {
+                r->frequency_penalty = (float)v;
+                r->frequency_penalty_set = true;
+            } else {
+                r->presence_penalty = (float)v;
+                r->presence_penalty_set = true;
+            }
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -4529,6 +4576,19 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             }
             r->min_p = (float)v;
             r->min_p_set = true;
+        } else if (!strcmp(key, "frequency_penalty") || !strcmp(key, "presence_penalty")) {
+            double v = 0.0;
+            if (!json_number(&p, &v) || v < -2.0 || v > 2.0) {
+                free(key);
+                goto bad;
+            }
+            if (key[0] == 'f') {
+                r->frequency_penalty = (float)v;
+                r->frequency_penalty_set = true;
+            } else {
+                r->presence_penalty = (float)v;
+                r->presence_penalty_set = true;
+            }
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
@@ -8670,6 +8730,8 @@ struct server {
     int decode_pending;
     int active_generations;
     int mixed_prefill_quantum;
+    float frequency_penalty;
+    float presence_penalty;
     int last_prefill_slot;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -13074,8 +13136,13 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
+        float frequency_penalty = j->req.frequency_penalty_set ?
+            j->req.frequency_penalty : s->frequency_penalty;
+        float presence_penalty = j->req.presence_penalty_set ?
+            j->req.presence_penalty : s->presence_penalty;
         int token = ds4_session_sample(slot->session, temperature, top_k,
-                                       top_p, min_p, &rng);
+                                       top_p, min_p, frequency_penalty,
+                                       presence_penalty, &rng);
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
@@ -15237,6 +15304,8 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    float frequency_penalty;
+    float presence_penalty;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -15385,6 +15454,8 @@ static server_config parse_options(int argc, char **argv) {
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
         .mixed_prefill_quantum = 128,
+        .frequency_penalty = 0.0f,
+        .presence_penalty = 0.0f,
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -15460,6 +15531,12 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--frequency-penalty")) {
+            c.frequency_penalty =
+                parse_float_arg(need_arg(&i, argc, argv, arg), arg, -2.0f, 2.0f);
+        } else if (!strcmp(arg, "--presence-penalty")) {
+            c.presence_penalty =
+                parse_float_arg(need_arg(&i, argc, argv, arg), arg, -2.0f, 2.0f);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -15677,6 +15754,8 @@ int main(int argc, char **argv) {
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
+    s.frequency_penalty = cfg.frequency_penalty;
+    s.presence_penalty = cfg.presence_penalty;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;

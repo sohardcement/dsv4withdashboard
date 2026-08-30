@@ -3872,7 +3872,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         }
         if (token < 0)
             token = ds4_session_sample(session, cfg->temperature, 0,
-                                       cfg->top_p, cfg->min_p, rng);
+                                       cfg->top_p, cfg->min_p,
+                                       0.0f, 0.0f, rng);
         if (ds4_token_is_stop(engine, token)) break;
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {

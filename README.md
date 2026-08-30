@@ -1314,6 +1314,14 @@ but sampling parameters set explicitly in the request always win: a
 `temperature=0` request is greedy through the whole reasoning phase, so
 benchmark harnesses get deterministic thinking-mode output.
 
+All three endpoints accept OpenAI-style `frequency_penalty` and
+`presence_penalty` (range -2..2, default 0). They are applied over a window of
+the last 64 generated tokens, including reasoning tokens, and are the
+recommended defense against degenerate repetition loops on aggressively
+quantized checkpoints. A server-wide default can be set with
+`--frequency-penalty` / `--presence-penalty`; an explicit request value
+overrides it.
+
 The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
 mode, reasoning is streamed in the native API shape instead of being mixed into
 final text. OpenAI chat streaming
